@@ -1,10 +1,19 @@
 //! notatlas sandbox entry point. M2 raymarched water + atmospheric sky.
 //! `data/waves/storm.yaml` drives the deterministic wave kernel;
 //! `data/ocean.yaml` drives shading/foam/fog. Single-process; no networking.
+//!
+//! M2.6: data and shader files are watched live. Editing
+//! `data/ocean.yaml`, `data/waves/storm.yaml`, or any shader under
+//! `assets/shaders/` reloads the relevant resource without restarting.
 
 const std = @import("std");
 const notatlas = @import("notatlas");
 const render = @import("render/render.zig");
+
+const wave_config_path = "data/waves/storm.yaml";
+const ocean_config_path = "data/ocean.yaml";
+const vert_shader_path = "assets/shaders/fullscreen.vert";
+const frag_shader_path = "assets/shaders/water.frag";
 
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -27,11 +36,20 @@ pub fn main() !void {
     var ocean = try render.Ocean.init(gpa, &gpu, frame.render_pass, .{});
     defer ocean.deinit();
 
-    const wave_params = try loadWaves(gpa, "data/waves/storm.yaml");
+    const wave_params = try loadWaves(gpa, wave_config_path);
     ocean.setWaveParams(wave_params);
 
-    const ocean_params = try loadOcean(gpa, "data/ocean.yaml");
+    const ocean_params = try loadOcean(gpa, ocean_config_path);
     ocean.setOceanParams(ocean_params);
+
+    var watcher = try render.file_watch.Watcher.init(.{
+        .wave_basename = std.fs.path.basename(wave_config_path),
+    });
+    defer watcher.deinit();
+    std.log.info("hot-reload watching {s}, {s}, assets/shaders/*", .{
+        ocean_config_path,
+        wave_config_path,
+    });
 
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
@@ -49,6 +67,9 @@ pub fn main() !void {
             size = window.framebufferSize();
         }
         if (window.shouldClose()) break;
+
+        const events = watcher.poll();
+        if (events.any()) handleReload(gpa, &ocean, frame.render_pass, events);
 
         const dt: f32 = @as(f32, @floatFromInt(timer.lap())) / @as(f32, std.time.ns_per_s);
         t += dt;
@@ -86,6 +107,49 @@ fn loadOcean(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.ocean_param
     const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
     defer gpa.free(abs);
     return notatlas.yaml_loader.loadOceanFromFile(gpa, abs);
+}
+
+/// Apply whatever the watcher flagged. Errors are logged and swallowed —
+/// a typo in YAML or a broken shader must not kill the running sandbox;
+/// the user fixes the file and saves again.
+fn handleReload(
+    gpa: std.mem.Allocator,
+    ocean: *render.Ocean,
+    render_pass: render.types.vk.VkRenderPass,
+    events: render.file_watch.Events,
+) void {
+    var timer = std.time.Timer.start() catch return;
+
+    if (events.ocean) {
+        if (loadOcean(gpa, ocean_config_path)) |p| {
+            ocean.setOceanParams(p);
+            std.log.info("reload {s} ({d} ms)", .{ ocean_config_path, timer.lap() / std.time.ns_per_ms });
+        } else |err| {
+            std.log.err("reload {s}: {s}", .{ ocean_config_path, @errorName(err) });
+        }
+    }
+
+    if (events.wave) {
+        if (loadWaves(gpa, wave_config_path)) |p| {
+            ocean.setWaveParams(p);
+            std.log.info("reload {s} ({d} ms)", .{ wave_config_path, timer.lap() / std.time.ns_per_ms });
+        } else |err| {
+            std.log.err("reload {s}: {s}", .{ wave_config_path, @errorName(err) });
+        }
+    }
+
+    if (events.shader) {
+        const vert_spv = render.shader_compile.compileGlsl(gpa, vert_shader_path, "fullscreen.vert") catch return;
+        defer gpa.free(vert_spv);
+        const frag_spv = render.shader_compile.compileGlsl(gpa, frag_shader_path, "water.frag") catch return;
+        defer gpa.free(frag_spv);
+
+        ocean.reloadShaders(render_pass, vert_spv, frag_spv) catch |err| {
+            std.log.err("reload shaders: {s}", .{@errorName(err)});
+            return;
+        };
+        std.log.info("reload shaders ({d} ms)", .{timer.lap() / std.time.ns_per_ms});
+    }
 }
 
 fn recordOcean(

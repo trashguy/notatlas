@@ -148,6 +148,40 @@ pub const Ocean = struct {
         self.ocean_ubo.upload(std.mem.asBytes(&ubo));
     }
 
+    /// Hot-reload entry point for `assets/shaders/*`. Builds a new
+    /// pipeline against the existing layout, waits for the GPU to drain,
+    /// then swaps `pipeline.handle`. Descriptor pool and set are reused —
+    /// the bindings layout never changes at runtime.
+    ///
+    /// Caller hands in fresh SPIR-V bytes (already 4-byte aligned) for
+    /// both stages; even a frag-only edit recompiles vert too because
+    /// we have no per-stage tracking and the vert is small.
+    pub fn reloadShaders(
+        self: *Ocean,
+        render_pass: vk.VkRenderPass,
+        vert_spv: []align(4) const u8,
+        frag_spv: []align(4) const u8,
+    ) !void {
+        const new_vert = try shader_mod.fromSpv(self.device, vert_spv);
+        defer vk.vkDestroyShaderModule(self.device, new_vert, null);
+        const new_frag = try shader_mod.fromSpv(self.device, frag_spv);
+        defer vk.vkDestroyShaderModule(self.device, new_frag, null);
+
+        const new_handle = try pipeline_mod.createHandle(
+            self.device,
+            render_pass,
+            self.pipeline.pipeline_layout,
+            new_vert,
+            new_frag,
+        );
+
+        // Old pipeline may still be referenced by an in-flight command
+        // buffer; drain before destroying.
+        _ = vk.vkDeviceWaitIdle(self.device);
+        vk.vkDestroyPipeline(self.device, self.pipeline.handle, null);
+        self.pipeline.handle = new_handle;
+    }
+
     pub fn record(self: *Ocean, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void {
         vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline.handle);
 

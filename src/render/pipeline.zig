@@ -55,6 +55,27 @@ pub fn create(
     );
     errdefer vk.vkDestroyPipelineLayout(device, pipeline_layout, null);
 
+    const handle = try createHandle(device, render_pass, pipeline_layout, vert_module, frag_module);
+
+    return .{
+        .descriptor_set_layout = set_layout,
+        .pipeline_layout = pipeline_layout,
+        .handle = handle,
+        .device = device,
+    };
+}
+
+/// Build a `VkPipeline` against an existing layout + render pass, used by
+/// hot-reload to swap shader code without rebuilding descriptor set
+/// layouts (which would invalidate the descriptor pool/set the renderer
+/// already wrote into).
+pub fn createHandle(
+    device: vk.VkDevice,
+    render_pass: vk.VkRenderPass,
+    pipeline_layout: vk.VkPipelineLayout,
+    vert_module: vk.VkShaderModule,
+    frag_module: vk.VkShaderModule,
+) !vk.VkPipeline {
     const stages = [_]vk.VkPipelineShaderStageCreateInfo{
         .{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -213,13 +234,7 @@ pub fn create(
         vk.vkCreateGraphicsPipelines(device, null, 1, &ci, null, &handle),
         VulkanError.PipelineCreationFailed,
     );
-
-    return .{
-        .descriptor_set_layout = set_layout,
-        .pipeline_layout = pipeline_layout,
-        .handle = handle,
-        .device = device,
-    };
+    return handle;
 }
 
 fn createSetLayout(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
