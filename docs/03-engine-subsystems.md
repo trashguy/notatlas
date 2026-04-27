@@ -48,7 +48,7 @@ pub fn waveNormal(params: WaveParams, x: f32, z: f32, t: f32) Vec3;
 pub fn waveDisplacement(params: WaveParams, x: f32, z: f32, t: f32) Vec3;
 ```
 
-**Data:** `data/waves/<biome>.toml` — Gerstner component sets per biome
+**Data:** `data/waves/<biome>.yaml` — Gerstner component sets per biome
 (calm, choppy, storm).
 
 **NATS:** none directly. Consumed by ocean-render (client) and buoyancy
@@ -72,7 +72,7 @@ later.
 - `ocean.render(cmd_buffer, camera, time) void`
 - `ocean.params_set(params) void` (hot-reload from data file)
 
-**Data:** `data/ocean.toml` — mesh resolution, foam thresholds, water
+**Data:** `data/ocean.yaml` — mesh resolution, foam thresholds, water
 albedo, scatter parameters.
 
 **Milestone gate (M2):** beautiful Gerstner ocean visible in the sandbox
@@ -101,7 +101,7 @@ pub fn registerHull(jolt_body: JoltBodyId, samples: []const Vec3) BuoyancyId;
 pub fn step(dt: f32, t: f32, wave_params: WaveParams) void;
 ```
 
-**Data:** `data/ships/<hull>.toml` — hull sample point list per ship type.
+**Data:** `data/ships/<hull>.yaml` — hull sample point list per ship type.
 
 **Milestone gate (M3):** a box (no rendering of ship, just a Jolt body)
 floats correctly on the wave surface in the sandbox. Pitches and rolls
@@ -123,7 +123,7 @@ Implementation: low-resolution global wind direction (per-cell or per-
 region) with smooth interpolation, plus storm cells as perturbations
 that travel across the world.
 
-**Data:** `data/wind.toml` — global rotation period, gust frequency,
+**Data:** `data/wind.yaml` — global rotation period, gust frequency,
 storm cell spawn parameters.
 
 **NATS:** env service publishes `env.cell.<x>_<y>.wind` JetStream KV
@@ -189,7 +189,7 @@ const ShipState = struct {
 subscriber, computes effective tier based on distance to entity; emits
 deltas for fields at that tier or below.
 
-**Data:** `data/tier_distances.toml` — distance thresholds per tier.
+**Data:** `data/tier_distances.yaml` — distance thresholds per tier.
 
 **Milestone gate (M6):** synthetic test — 100 entities, 50 subscribers at
 varied distances. Verify each subscriber receives the correct tier set.
@@ -241,7 +241,7 @@ pub fn resolveHit(event: FireEvent) ?HitInfo;         // server
 Reuses the wave-query for splash effects and the spatial index for
 hit-target search.
 
-**Data:** `data/ammo/<type>.toml` — mass, drag, splash damage profile.
+**Data:** `data/ammo/<type>.yaml` — mass, drag, splash damage profile.
 
 **Milestone gate (M8):** synthetic test — fire 1000 cannons; verify
 client predicted trajectory matches server resolved trajectory within

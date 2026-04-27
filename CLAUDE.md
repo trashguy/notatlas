@@ -44,7 +44,7 @@ project). NATS client is `~/Projects/nats-zig`.
 
 ## Engineering principles
 
-- Data-driven for content / balance / config (TOML + Lua), code for
+- Data-driven for content / balance / config (YAML + Lua), code for
   systems. See `docs/05-data-model.md`.
 - Service decomposition: 8 services. gateway + auth from fallen-runes;
   ship-sim, cell-mgr, spatial-index, env, persistence-writer, voice-sfu

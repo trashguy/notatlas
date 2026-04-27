@@ -11,16 +11,16 @@ wipe boundaries.
 
 | Cap | v0 value | Lives in |
 |---|---|---|
-| Wipe cadence | 10 weeks | `data/cycle.toml` |
-| Disciplines | 4-5: Sailing, Combat, Survival, Crafting, ?Captaineering | `data/disciplines/*.toml` |
-| Players per cell | 200 | `data/cell_caps.toml` |
-| Ship tiers v1 | 3: Sloop, Schooner, Brigantine | `data/ships/*.toml` |
-| Resource families | ~15 (Atlas count) | `data/resources/*.toml` |
-| Sub-types per family | 4-7 | per-family TOML |
-| Structures per anchorage | 500 | `data/anchorage_caps.toml` |
+| Wipe cadence | 10 weeks | `data/cycle.yaml` |
+| Disciplines | 4-5: Sailing, Combat, Survival, Crafting, ?Captaineering | `data/disciplines/*.yaml` |
+| Players per cell | 200 | `data/cell_caps.yaml` |
+| Ship tiers v1 | 3: Sloop, Schooner, Brigantine | `data/ships/*.yaml` |
+| Resource families | ~15 (Atlas count) | `data/resources/*.yaml` |
+| Sub-types per family | 4-7 | per-family YAML |
+| Structures per anchorage | 500 | `data/anchorage_caps.yaml` |
 | Recipe ingredient count | ≤6 per recipe | recipe Lua schema |
-| Quality tiers | 6: Common, Fine, Journeyman, Masterwork, Legendary, Mythical | `data/quality.toml` |
-| Replication tiers | 4: 0/1/2/3 (always / visual / close-combat / boarded) | code (mechanism) + `data/tier_distances.toml` (thresholds) |
+| Quality tiers | 6: Common, Fine, Journeyman, Masterwork, Legendary, Mythical | `data/quality.yaml` |
+| Replication tiers | 4: 0/1/2/3 (always / visual / close-combat / boarded) | code (mechanism) + `data/tier_distances.yaml` (thresholds) |
 | Dynamic light cap (client) | 32 | engine config |
 | Particle cap (client) | 100 k global | engine config |
 
@@ -99,8 +99,8 @@ on player ambition.
 Wood, Stone, Fiber, Thatch, Flint, Metal, Gems, Crystal, Coal/Sulfur,
 Oil, Salt, Sap/Sugar, Hide, Keratinoid, Coral.
 
-Each with 4-7 sub-types defined per-family in TOML. Sub-type → biome
-distribution defined in `data/biomes/<biome>.toml`.
+Each with 4-7 sub-types defined per-family in YAML. Sub-type → biome
+distribution defined in `data/biomes/<biome>.yaml`.
 
 ## Replication tier distance thresholds
 

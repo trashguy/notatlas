@@ -44,7 +44,7 @@ plus integration with fallen-runes' gateway / ship-sim service decomp.
 - 50 simulated clients subscribed via the actual gateway / NATS path
 - Verify per-client BW ≤1 Mbps, server tick stable at 60 Hz, NATS
   throughput within target
-- Tune tier-replication thresholds in `data/tier_distances.toml`
+- Tune tier-replication thresholds in `data/tier_distances.yaml`
 - **If this fails, fix before content lands.**
 
 **End-of-phase deliverable:** 4 friends + you on a sloop, fighting an AI

@@ -158,7 +158,7 @@ projectile observation.
 | 2 (close combat) | <150 m | On change | Per-plank damage, cannon orientations, visible crew |
 | 3 (boarded) | aboard same ship | On change | Below-deck contents, individual crew animations |
 
-Mechanism in code; thresholds in `data/tier_distances.toml`. First-pass
+Mechanism in code; thresholds in `data/tier_distances.yaml`. First-pass
 thresholds — tune from milestone-1.5 stress test.
 
 ### 10. Voice transport — LiveKit SFU
