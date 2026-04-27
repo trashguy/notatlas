@@ -138,6 +138,16 @@ float waveHeight(vec2 world_xz, uint iterations) {
 
 // March from a high water plane down to a low water plane until we hit the
 // surface. Plane bracket = ±amplitude_m so we always cross the heightfield.
+//
+// Two-phase intersect:
+//   1. Linear march with `pos += dir * (pos.y - h)`. This heuristic
+//      accelerates over flat water and slows near the surface, but its
+//      effective per-pixel step count varies with ray slope, which
+//      produces visible level-curves on midground waves at the horizon.
+//   2. Once a crossing is bracketed (last `prev` strictly above, current
+//      `pos` at-or-below), 6 bisection steps refine the hit. The final
+//      hit position becomes independent of how many linear steps the ray
+//      took to find the bracket — kills the banding.
 float raymarchWater(vec3 origin, vec3 ray, float amp) {
     // Intersect against y = +amp (entry) and y = -amp (exit). For rays
     // pointing down (ray.y < 0) we enter at the high plane.
@@ -150,24 +160,37 @@ float raymarchWater(vec3 origin, vec3 ray, float amp) {
     vec3 start = origin + ray * t_start;
     vec3 end = origin + ray * t_end;
 
+    vec3 prev = start;
     vec3 pos = start;
     vec3 dir = normalize(end - start);
     float total_dist = distance(start, end);
 
     uint iterations = uint(waves.c.y);
-    uint steps = 64u;
-    for (uint i = 0u; i < steps; ++i) {
+    bool hit = false;
+    for (uint i = 0u; i < 64u; ++i) {
         float h = waveHeight(pos.xz, iterations);
         if (h + 0.01 > pos.y) {
-            return distance(pos, origin);
+            hit = true;
+            break;
         }
+        prev = pos;
         // Step proportional to vertical mismatch — accelerates over flat
         // water, slows near the surface.
-        float advance = pos.y - h;
-        pos += dir * advance;
+        pos += dir * (pos.y - h);
         if (distance(start, pos) > total_dist) break;
     }
-    return distance(start, origin); // miss; clamp to high plane for stability
+    if (!hit) return distance(start, origin); // miss; clamp to high plane for stability
+
+    // Bisection refinement on the bracket [prev (above), pos (at-or-below)].
+    // Discriminant is signed vertical mismatch `mid.y - h(mid.xz)`. Six
+    // halvings reduce the residual to ~1.5% of one linear-march step,
+    // enough to make the hit-distance independent of step-count parity.
+    for (uint i = 0u; i < 6u; ++i) {
+        vec3 mid = 0.5 * (prev + pos);
+        float h = waveHeight(mid.xz, iterations);
+        if (mid.y - h > 0.0) prev = mid; else pos = mid;
+    }
+    return distance(0.5 * (prev + pos), origin);
 }
 
 vec3 waveNormal(vec2 world_xz, float eps_m, uint iterations) {

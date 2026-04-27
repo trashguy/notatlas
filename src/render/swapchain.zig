@@ -233,6 +233,10 @@ fn pickPresentMode(
     _ = vk.vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &n, modes.ptr);
 
     for (modes) |m| if (m == requested) return requested;
+    std.log.warn("present mode {d} not supported; falling back to FIFO. supported modes: {any}", .{
+        requested,
+        modes,
+    });
     return vk.VK_PRESENT_MODE_FIFO_KHR;
 }
 

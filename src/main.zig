@@ -20,6 +20,8 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    const cli = try parseCli(gpa);
+
     var window = try render.Window.init(.{});
     defer window.deinit();
 
@@ -27,7 +29,15 @@ pub fn main() !void {
     defer gpu.deinit();
     gpu.printCapabilities();
 
-    var swapchain = try render.Swapchain.init(gpa, &gpu, window.framebufferSize(), .{});
+    // MAILBOX keeps the CPU/GPU loop unthrottled by display refresh
+    // while still presenting tearing-free — the right "uncapped" mode
+    // on Wayland, which never advertises IMMEDIATE.
+    var swapchain = try render.Swapchain.init(gpa, &gpu, window.framebufferSize(), .{
+        .present_mode = if (cli.uncap)
+            render.types.vk.VK_PRESENT_MODE_MAILBOX_KHR
+        else
+            render.types.vk.VK_PRESENT_MODE_FIFO_KHR,
+    });
     defer swapchain.deinit();
 
     var frame = try render.Frame.init(gpa, &gpu, &swapchain);
@@ -50,9 +60,15 @@ pub fn main() !void {
         ocean_config_path,
         wave_config_path,
     });
+    std.log.info("present mode = {s}", .{if (cli.uncap) "MAILBOX (uncapped)" else "FIFO (vsync)"});
 
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
+
+    // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
+    // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
+    // first frame because it bundles loop-preamble + Vulkan warm-up.
+    var perf: PerfWindow = .{};
 
     // Clear color is irrelevant — the fullscreen water/sky shader paints
     // every pixel.  Keep it black so any unrendered area is obvious.
@@ -71,8 +87,10 @@ pub fn main() !void {
         const events = watcher.poll();
         if (events.any()) handleReload(gpa, &ocean, frame.render_pass, events);
 
-        const dt: f32 = @as(f32, @floatFromInt(timer.lap())) / @as(f32, std.time.ns_per_s);
+        const frame_ns = timer.lap();
+        const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
         t += dt;
+        perf.tick(frame_ns);
 
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
         // between -8m and +20m so a stretch of every orbit is below the
@@ -160,3 +178,55 @@ fn recordOcean(
     const ocean: *render.Ocean = @ptrCast(@alignCast(ctx));
     ocean.record(cb, extent);
 }
+
+const Cli = struct { uncap: bool = false };
+
+fn parseCli(gpa: std.mem.Allocator) !Cli {
+    var args = try std.process.argsWithAllocator(gpa);
+    defer args.deinit();
+    _ = args.next(); // skip exe name
+    var cli: Cli = .{};
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--uncap")) cli.uncap = true;
+    }
+    return cli;
+}
+
+const PerfWindow = struct {
+    accum_ns: u64 = 0,
+    frames: u32 = 0,
+    min_ns: u64 = std.math.maxInt(u64),
+    max_ns: u64 = 0,
+    accum_dt: f32 = 0,
+    skip_first: bool = true,
+
+    /// Roll a frame-time sample into the 1-second window. Logs and
+    /// resets when the window closes. `frame_ns` includes the entire
+    /// CPU loop iteration — pollEvents, watcher poll, draw record +
+    /// submit, present — which is what the gate cares about.
+    fn tick(self: *PerfWindow, frame_ns: u64) void {
+        if (self.skip_first) {
+            self.skip_first = false;
+            return;
+        }
+        self.accum_ns += frame_ns;
+        self.frames += 1;
+        if (frame_ns < self.min_ns) self.min_ns = frame_ns;
+        if (frame_ns > self.max_ns) self.max_ns = frame_ns;
+        self.accum_dt += @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
+        if (self.accum_dt >= 1.0) {
+            const avg_ns = self.accum_ns / self.frames;
+            std.log.info("perf: avg {d:.2} ms / min {d:.2} ms / max {d:.2} ms ({d} fps)", .{
+                @as(f64, @floatFromInt(avg_ns)) / 1.0e6,
+                @as(f64, @floatFromInt(self.min_ns)) / 1.0e6,
+                @as(f64, @floatFromInt(self.max_ns)) / 1.0e6,
+                std.time.ns_per_s / avg_ns,
+            });
+            self.accum_ns = 0;
+            self.frames = 0;
+            self.min_ns = std.math.maxInt(u64);
+            self.max_ns = 0;
+            self.accum_dt = 0;
+        }
+    }
+};
