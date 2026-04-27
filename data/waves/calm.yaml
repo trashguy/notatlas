@@ -1,0 +1,16 @@
+seed: 1001
+components:
+  - amplitude: 0.30
+    wavelength: 60.0
+    direction:
+      x: 1.0
+      z: 0.0
+    speed: 1.5
+    steepness: 0.05
+  - amplitude: 0.15
+    wavelength: 35.0
+    direction:
+      x: 0.7071
+      z: 0.7071
+    speed: 1.2
+    steepness: 0.05

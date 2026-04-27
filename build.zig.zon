@@ -1,0 +1,18 @@
+.{
+    .name = .notatlas,
+    .version = "0.0.1",
+    .fingerprint = 0xf9263f2932677f56,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .ymlz = .{
+            .url = "https://github.com/pwbh/ymlz/archive/refs/tags/0.6.0.tar.gz",
+            .hash = "ymlz-0.5.0-TG82aXqrAAC-NtiqbYQC2cNo4Qr9L9LDKEKMYRjtK6vT",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "data",
+    },
+}
