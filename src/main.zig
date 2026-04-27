@@ -1,9 +1,9 @@
-//! notatlas sandbox entry point. M2.2: opens a window, brings up the
-//! Vulkan device + swapchain, and renders an animated clear-to-color in
-//! a frame loop until the window is closed. Resize is handled by
-//! recreating the swapchain + framebuffers on OUT_OF_DATE / SUBOPTIMAL.
+//! notatlas sandbox entry point. M2.3: an XZ tessellated plane drawn by
+//! the ocean pass with an orbiting flying camera. Single-process; no
+//! networking.
 
 const std = @import("std");
+const notatlas = @import("notatlas");
 const render = @import("render/render.zig");
 
 pub fn main() !void {
@@ -24,13 +24,22 @@ pub fn main() !void {
     var frame = try render.Frame.init(gpa, &gpu, &swapchain);
     defer frame.deinit();
 
+    var ocean = try render.Ocean.init(gpa, &gpu, frame.render_pass, .{
+        .plane_resolution = 128,
+        .plane_size_m = 256.0,
+    });
+    defer ocean.deinit();
+
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
+
+    // Sky-ish background; the ocean fragment shader paints over the
+    // visible portion of the framebuffer.
+    const clear: [4]f32 = .{ 0.55, 0.70, 0.85, 1.0 };
 
     while (!window.shouldClose()) {
         render.Window.pollEvents();
 
-        // Sleep while minimized; redrawing a 0-extent swapchain is invalid.
         var size = window.framebufferSize();
         while ((size[0] == 0 or size[1] == 0) and !window.shouldClose()) {
             render.Window.waitEvents();
@@ -41,17 +50,33 @@ pub fn main() !void {
         const dt: f32 = @as(f32, @floatFromInt(timer.lap())) / @as(f32, std.time.ns_per_s);
         t += dt;
 
-        const clear = [4]f32{
-            0.5 + 0.5 * @sin(t * 0.7),
-            0.5 + 0.5 * @sin(t * 1.1 + 2.0),
-            0.5 + 0.5 * @sin(t * 1.3 + 4.0),
-            1.0,
+        // Orbit the origin at 60m radius, 25m altitude, half a turn per
+        // 12 seconds. Lets us see the plane stretch into the distance
+        // and confirm the perspective is sane.
+        const radius: f32 = 60.0;
+        const altitude: f32 = 25.0;
+        const angle = t * (std.math.tau / 12.0);
+        const camera: render.Camera = .{
+            .eye = notatlas.math.Vec3.init(@cos(angle) * radius, altitude, @sin(angle) * radius),
+            .target = notatlas.math.Vec3.zero,
+            .fov_y = std.math.degreesToRadians(60.0),
+            .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
+        ocean.updateCamera(camera);
 
-        const result = try frame.draw(&swapchain, clear);
+        const result = try frame.draw(&swapchain, clear, recordOcean, &ocean);
         if (result == .resize_needed) {
             try swapchain.recreate(window.framebufferSize());
             try frame.recreateFramebuffers(&swapchain);
         }
     }
+}
+
+fn recordOcean(
+    ctx: *anyopaque,
+    cb: render.types.vk.VkCommandBuffer,
+    extent: render.types.vk.VkExtent2D,
+) void {
+    const ocean: *render.Ocean = @ptrCast(@alignCast(ctx));
+    ocean.record(cb, extent);
 }

@@ -31,6 +31,16 @@ pub const VulkanError = error{
     AcquireImageFailed,
     QueueSubmitFailed,
     QueuePresentFailed,
+    BufferCreationFailed,
+    MemoryAllocationFailed,
+    NoSuitableMemoryType,
+    MemoryMapFailed,
+    ShaderModuleCreationFailed,
+    DescriptorSetLayoutCreationFailed,
+    DescriptorPoolCreationFailed,
+    DescriptorSetAllocationFailed,
+    PipelineLayoutCreationFailed,
+    PipelineCreationFailed,
 };
 
 pub const QueueFamilies = struct {

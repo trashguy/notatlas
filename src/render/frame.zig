@@ -14,6 +14,11 @@ const VulkanError = types.VulkanError;
 
 pub const DrawResult = enum { ok, resize_needed };
 
+/// Caller-provided pass recorder. Invoked between vkCmdBeginRenderPass and
+/// vkCmdEndRenderPass with the active command buffer and swapchain extent.
+/// `ctx` is whatever pointer the caller passed alongside the function.
+pub const RecordPassFn = *const fn (ctx: *anyopaque, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void;
+
 pub const Frame = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
@@ -26,7 +31,12 @@ pub const Frame = struct {
     command_buffer: vk.VkCommandBuffer,
 
     image_available: vk.VkSemaphore,
-    render_finished: vk.VkSemaphore,
+    /// One render-finished semaphore per swapchain image. Indexed by the
+    /// image returned from vkAcquireNextImageKHR. A single shared semaphore
+    /// here would violate VUID-vkQueueSubmit-pSignalSemaphores-00067 because
+    /// the WSI may still hold the previous present's signal semaphore when
+    /// the next submit signals it.
+    render_finished_per_image: []vk.VkSemaphore,
     in_flight: vk.VkFence,
 
     pub fn init(
@@ -46,9 +56,12 @@ pub const Frame = struct {
         const command_buffer = try allocateCommandBuffer(gpu.device, command_pool);
 
         var image_available: vk.VkSemaphore = undefined;
-        var render_finished: vk.VkSemaphore = undefined;
         var in_flight: vk.VkFence = undefined;
-        try createSync(gpu.device, &image_available, &render_finished, &in_flight);
+        try createSyncSingles(gpu.device, &image_available, &in_flight);
+        errdefer vk.vkDestroySemaphore(gpu.device, image_available, null);
+        errdefer vk.vkDestroyFence(gpu.device, in_flight, null);
+
+        const render_finished = try createPerImageSemaphores(gpa, gpu.device, swapchain.images.len);
 
         return .{
             .gpa = gpa,
@@ -60,7 +73,7 @@ pub const Frame = struct {
             .command_pool = command_pool,
             .command_buffer = command_buffer,
             .image_available = image_available,
-            .render_finished = render_finished,
+            .render_finished_per_image = render_finished,
             .in_flight = in_flight,
         };
     }
@@ -68,26 +81,33 @@ pub const Frame = struct {
     pub fn deinit(self: *Frame) void {
         _ = vk.vkDeviceWaitIdle(self.device);
         vk.vkDestroySemaphore(self.device, self.image_available, null);
-        vk.vkDestroySemaphore(self.device, self.render_finished, null);
+        destroyPerImageSemaphores(self.gpa, self.device, self.render_finished_per_image);
         vk.vkDestroyFence(self.device, self.in_flight, null);
         vk.vkDestroyCommandPool(self.device, self.command_pool, null);
         destroyFramebuffers(self.gpa, self.device, self.framebuffers);
         vk.vkDestroyRenderPass(self.device, self.render_pass, null);
     }
 
-    /// Tear down the framebuffer set and rebuild it against the (already
-    /// recreated) swapchain. Caller must have run `swapchain.recreate()`
-    /// first; that call already waits on device idle.
+    /// Tear down framebuffers + per-image semaphores and rebuild them
+    /// against the (already recreated) swapchain. Both depend on the
+    /// swapchain image count, which can change on resize. Caller must
+    /// have run `swapchain.recreate()` first; that already waits idle.
     pub fn recreateFramebuffers(self: *Frame, swapchain: *const swapchain_mod.Swapchain) !void {
         destroyFramebuffers(self.gpa, self.device, self.framebuffers);
         self.framebuffers = &.{};
         self.framebuffers = try createFramebuffers(self.gpa, self.device, self.render_pass, swapchain);
+
+        destroyPerImageSemaphores(self.gpa, self.device, self.render_finished_per_image);
+        self.render_finished_per_image = &.{};
+        self.render_finished_per_image = try createPerImageSemaphores(self.gpa, self.device, swapchain.images.len);
     }
 
     pub fn draw(
         self: *Frame,
         swapchain: *const swapchain_mod.Swapchain,
         clear_color: [4]f32,
+        record_pass: ?RecordPassFn,
+        record_ctx: ?*anyopaque,
     ) !DrawResult {
         _ = vk.vkWaitForFences(self.device, 1, &self.in_flight, vk.VK_TRUE, std.math.maxInt(u64));
 
@@ -108,14 +128,17 @@ pub const Frame = struct {
         // we returned early on resize and never signalled the fence.
         _ = vk.vkResetFences(self.device, 1, &self.in_flight);
 
-        try recordClear(
+        try recordPass(
             self.command_buffer,
             self.render_pass,
             self.framebuffers[image_index],
             swapchain.extent,
             clear_color,
+            record_pass,
+            record_ctx,
         );
 
+        const render_finished = self.render_finished_per_image[image_index];
         const wait_stage: vk.VkPipelineStageFlags = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         const submit_info = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -126,7 +149,7 @@ pub const Frame = struct {
             .commandBufferCount = 1,
             .pCommandBuffers = &self.command_buffer,
             .signalSemaphoreCount = 1,
-            .pSignalSemaphores = &self.render_finished,
+            .pSignalSemaphores = &render_finished,
         };
         try types.check(
             vk.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.in_flight),
@@ -137,7 +160,7 @@ pub const Frame = struct {
             .sType = vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .pNext = null,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &self.render_finished,
+            .pWaitSemaphores = &render_finished,
             .swapchainCount = 1,
             .pSwapchains = &swapchain.handle,
             .pImageIndices = &image_index,
@@ -280,10 +303,9 @@ fn allocateCommandBuffer(device: vk.VkDevice, pool: vk.VkCommandPool) !vk.VkComm
     return buf;
 }
 
-fn createSync(
+fn createSyncSingles(
     device: vk.VkDevice,
     image_available: *vk.VkSemaphore,
-    render_finished: *vk.VkSemaphore,
     in_flight: *vk.VkFence,
 ) !void {
     const sem_ci = vk.VkSemaphoreCreateInfo{
@@ -305,23 +327,49 @@ fn createSync(
     errdefer vk.vkDestroySemaphore(device, image_available.*, null);
 
     try types.check(
-        vk.vkCreateSemaphore(device, &sem_ci, null, render_finished),
-        VulkanError.SemaphoreCreationFailed,
-    );
-    errdefer vk.vkDestroySemaphore(device, render_finished.*, null);
-
-    try types.check(
         vk.vkCreateFence(device, &fence_ci, null, in_flight),
         VulkanError.FenceCreationFailed,
     );
 }
 
-fn recordClear(
+fn createPerImageSemaphores(
+    gpa: std.mem.Allocator,
+    device: vk.VkDevice,
+    count: usize,
+) ![]vk.VkSemaphore {
+    const sems = try gpa.alloc(vk.VkSemaphore, count);
+    var created: usize = 0;
+    errdefer {
+        for (sems[0..created]) |s| vk.vkDestroySemaphore(device, s, null);
+        gpa.free(sems);
+    }
+    const sem_ci = vk.VkSemaphoreCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+    };
+    while (created < count) : (created += 1) {
+        try types.check(
+            vk.vkCreateSemaphore(device, &sem_ci, null, &sems[created]),
+            VulkanError.SemaphoreCreationFailed,
+        );
+    }
+    return sems;
+}
+
+fn destroyPerImageSemaphores(gpa: std.mem.Allocator, device: vk.VkDevice, sems: []vk.VkSemaphore) void {
+    for (sems) |s| vk.vkDestroySemaphore(device, s, null);
+    if (sems.len != 0) gpa.free(sems);
+}
+
+fn recordPass(
     cb: vk.VkCommandBuffer,
     render_pass: vk.VkRenderPass,
     framebuffer: vk.VkFramebuffer,
     extent: vk.VkExtent2D,
     clear_color: [4]f32,
+    record_fn: ?RecordPassFn,
+    ctx: ?*anyopaque,
 ) !void {
     try types.check(vk.vkResetCommandBuffer(cb, 0), VulkanError.CommandBufferBeginFailed);
 
@@ -346,6 +394,7 @@ fn recordClear(
         .pClearValues = &clear,
     };
     vk.vkCmdBeginRenderPass(cb, &rp_begin, vk.VK_SUBPASS_CONTENTS_INLINE);
+    if (record_fn) |f| f(ctx.?, cb, extent);
     vk.vkCmdEndRenderPass(cb);
 
     try types.check(vk.vkEndCommandBuffer(cb), VulkanError.CommandBufferEndFailed);

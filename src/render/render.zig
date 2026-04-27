@@ -1,14 +1,21 @@
-//! Public render-layer surface. Window + GPU context (M2.1) plus the
-//! swapchain and per-frame loop (M2.2).
+//! Public render-layer surface.
 
 pub const types = @import("vulkan_types.zig");
 pub const window = @import("window.zig");
 pub const gpu = @import("gpu.zig");
 pub const swapchain = @import("swapchain.zig");
 pub const frame = @import("frame.zig");
+pub const buffer = @import("buffer.zig");
+pub const mesh = @import("mesh.zig");
+pub const camera = @import("camera.zig");
+pub const shader = @import("shader.zig");
+pub const pipeline = @import("pipeline.zig");
+pub const ocean = @import("ocean.zig");
 
 pub const Window = window.Window;
 pub const GpuContext = gpu.GpuContext;
 pub const Swapchain = swapchain.Swapchain;
 pub const Frame = frame.Frame;
 pub const DrawResult = frame.DrawResult;
+pub const Camera = camera.Camera;
+pub const Ocean = ocean.Ocean;

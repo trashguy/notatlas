@@ -58,6 +58,13 @@ pub fn build(b: *std.Build) void {
     sandbox_mod.linkSystemLibrary("vulkan", .{});
     sandbox_mod.link_libc = true;
 
+    // Compile GLSL → SPIR-V via system glslc and embed each blob into the
+    // sandbox module as a named anonymous import. Code references them via
+    // `@embedFile("ocean_vert_spv")` etc. M2.6 will replace this with a
+    // runtime hot-reload subprocess.
+    embedShader(b, sandbox_mod, "assets/shaders/ocean.vert", "ocean_vert_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/ocean.frag", "ocean_frag_spv");
+
     const sandbox = b.addExecutable(.{
         .name = "notatlas-sandbox",
         .root_module = sandbox_mod,
@@ -68,4 +75,17 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_sandbox.addArgs(args);
     const run_step = b.step("run", "Run the notatlas sandbox");
     run_step.dependOn(&run_sandbox.step);
+}
+
+fn embedShader(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    src_path: []const u8,
+    import_name: []const u8,
+) void {
+    const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3", "-O" });
+    cmd.addFileArg(b.path(src_path));
+    cmd.addArg("-o");
+    const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{import_name}));
+    mod.addAnonymousImport(import_name, .{ .root_source_file = spv });
 }
