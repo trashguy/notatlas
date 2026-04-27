@@ -17,12 +17,24 @@ pub const Config = struct {
     height: i32 = 720,
     title: [:0]const u8 = "notatlas sandbox",
     resizable: bool = true,
+    /// Force GLFW onto the X11 backend (via XWayland on Wayland sessions).
+    /// The RenderDoc Vulkan layer doesn't support `VK_KHR_wayland_surface`,
+    /// and `glfwGetRequiredInstanceExtensions` returns APIUnavailable when
+    /// the layer is loaded on a Wayland-backed window — XWayland is the
+    /// supported escape hatch.
+    force_x11: bool = false,
 };
+
+// glfw constants for the platform init hint. These are stable in upstream
+// GLFW and not directly re-exported by zglfw, so we hard-code the value
+// rather than thread a wrapper through.
+const GLFW_PLATFORM_X11: c_int = 0x00060004;
 
 pub const Window = struct {
     handle: *zglfw.Window,
 
     pub fn init(cfg: Config) WindowError!Window {
+        if (cfg.force_x11) zglfw.initHint(.platform, GLFW_PLATFORM_X11) catch {};
         zglfw.init() catch return error.GlfwInitFailed;
         errdefer zglfw.terminate();
 

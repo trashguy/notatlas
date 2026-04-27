@@ -22,7 +22,20 @@ pub fn main() !void {
 
     const cli = try parseCli(gpa);
 
-    var window = try render.Window.init(.{});
+    // RenderDoc must be loaded BEFORE the Vulkan instance is created so its
+    // layer can hook the loader. Frame capture happens later, after a brief
+    // warmup, so the captured frame is in steady state.
+    var capture: ?render.capture.Capture = null;
+    defer if (capture) |*c| c.deinit();
+    if (cli.capture) {
+        try std.fs.cwd().makePath("captures");
+        capture = render.capture.Capture.init("captures/notatlas") catch |err| blk: {
+            std.log.err("renderdoc init: {s} (continuing without capture)", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    var window = try render.Window.init(.{ .force_x11 = cli.capture });
     defer window.deinit();
 
     var gpu = try render.GpuContext.init(gpa, &window, .{});
@@ -70,6 +83,14 @@ pub fn main() !void {
     // first frame because it bundles loop-preamble + Vulkan warm-up.
     var perf: PerfWindow = .{};
 
+    // RenderDoc capture: warm up for `capture_warmup_frames` to let pipeline
+    // caches settle, then capture exactly one frame and exit. Frame 30 puts
+    // the orbit camera at an above-water angle (~9 m altitude), good for
+    // inspecting the steady-state water pass.
+    const capture_warmup_frames: u32 = 30;
+    var frame_index: u32 = 0;
+    var capture_done = false;
+
     // Clear color is irrelevant — the fullscreen water/sky shader paints
     // every pixel.  Keep it black so any unrendered area is obvious.
     const clear: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 };
@@ -107,11 +128,24 @@ pub fn main() !void {
         ocean.updateCamera(camera);
         ocean.updateTime(t);
 
+        const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
+        if (capturing_this_frame) capture.?.start();
+
         const result = try frame.draw(&swapchain, clear, recordOcean, &ocean);
         if (result == .resize_needed) {
             try swapchain.recreate(window.framebufferSize());
             try frame.recreateFramebuffers(&gpu, &swapchain);
         }
+
+        if (capturing_this_frame) {
+            const ok = capture.?.end();
+            std.log.info("renderdoc capture {s}; .rdc dropped under captures/", .{
+                if (ok) "ok" else "FAILED",
+            });
+            capture_done = true;
+            break;
+        }
+        frame_index += 1;
     }
 
     // Drain the GPU before the defer chain destroys descriptor pools,
@@ -186,7 +220,10 @@ fn recordOcean(
     ocean.record(cb, extent);
 }
 
-const Cli = struct { uncap: bool = false };
+const Cli = struct {
+    uncap: bool = false,
+    capture: bool = false,
+};
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
     var args = try std.process.argsWithAllocator(gpa);
@@ -194,7 +231,7 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
     _ = args.next(); // skip exe name
     var cli: Cli = .{};
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--uncap")) cli.uncap = true;
+        if (std.mem.eql(u8, a, "--uncap")) cli.uncap = true else if (std.mem.eql(u8, a, "--capture")) cli.capture = true;
     }
     return cli;
 }

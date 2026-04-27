@@ -14,6 +14,7 @@ pub const waves = @import("waves.zig");
 pub const ocean_uniform = @import("ocean_uniform.zig");
 pub const file_watch = @import("file_watch.zig");
 pub const shader_compile = @import("shader_compile.zig");
+pub const capture = @import("capture.zig");
 
 pub const Window = window.Window;
 pub const GpuContext = gpu.GpuContext;
