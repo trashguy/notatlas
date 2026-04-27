@@ -1,30 +1,10 @@
+# Choppy: medium amplitude (1.5m), 22m scale, moderate drag.
 seed: 1002
-components:
-  - amplitude: 0.80
-    wavelength: 40.0
-    direction:
-      x: 1.0
-      z: 0.0
-    speed: 3.0
-    steepness: 0.25
-  - amplitude: 0.55
-    wavelength: 22.0
-    direction:
-      x: 0.5
-      z: 0.866
-    speed: 2.5
-    steepness: 0.30
-  - amplitude: 0.40
-    wavelength: 14.0
-    direction:
-      x: -0.6
-      z: 0.8
-    speed: 2.0
-    steepness: 0.30
-  - amplitude: 0.25
-    wavelength: 8.5
-    direction:
-      x: 0.866
-      z: -0.5
-    speed: 1.6
-    steepness: 0.25
+iterations: 32
+drag_multiplier: 0.30
+amplitude_m: 1.5
+wave_scale_m: 22.0
+frequency_mult: 1.18
+base_time_mult: 1.8
+time_mult: 1.07
+weight_decay: 0.8

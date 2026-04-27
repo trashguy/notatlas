@@ -1,8 +1,12 @@
-//! Per-frame command buffer + sync primitives + render pass + framebuffers.
+//! Per-frame command buffer + sync primitives + render pass + framebuffers
+//! + depth buffer.
 //!
 //! Single frame in flight for M2.2 — adequate for clear-to-color and avoids
 //! the bookkeeping of MFIF until M2.3+ when there's actually GPU work to
-//! pipeline against the next-frame CPU.
+//! pipeline against the next-frame CPU. Depth attachment was added at M2.5
+//! once the surface had real 3D structure (Gerstner crests overlap and
+//! occlude each other; without z-test, the triangles paint in vertex order
+//! and produce picket-fence artifacts along the horizon).
 
 const std = @import("std");
 const types = @import("vulkan_types.zig");
@@ -11,6 +15,21 @@ const swapchain_mod = @import("swapchain.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
+
+/// D32_SFLOAT is mandatory in Vulkan core; no fallback path needed.
+pub const DEPTH_FORMAT: vk.VkFormat = vk.VK_FORMAT_D32_SFLOAT;
+
+const DepthBuffer = struct {
+    image: vk.VkImage,
+    memory: vk.VkDeviceMemory,
+    view: vk.VkImageView,
+
+    fn deinit(self: DepthBuffer, device: vk.VkDevice) void {
+        vk.vkDestroyImageView(device, self.view, null);
+        vk.vkDestroyImage(device, self.image, null);
+        vk.vkFreeMemory(device, self.memory, null);
+    }
+};
 
 pub const DrawResult = enum { ok, resize_needed };
 
@@ -22,10 +41,12 @@ pub const RecordPassFn = *const fn (ctx: *anyopaque, cb: vk.VkCommandBuffer, ext
 pub const Frame = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
+    physical_device: vk.VkPhysicalDevice,
     graphics_queue: vk.VkQueue,
     present_queue: vk.VkQueue,
 
     render_pass: vk.VkRenderPass,
+    depth: DepthBuffer,
     framebuffers: []vk.VkFramebuffer,
     command_pool: vk.VkCommandPool,
     command_buffer: vk.VkCommandBuffer,
@@ -47,7 +68,10 @@ pub const Frame = struct {
         const render_pass = try createRenderPass(gpu.device, swapchain.format);
         errdefer vk.vkDestroyRenderPass(gpu.device, render_pass, null);
 
-        const framebuffers = try createFramebuffers(gpa, gpu.device, render_pass, swapchain);
+        const depth = try createDepthBuffer(gpu, swapchain.extent);
+        errdefer depth.deinit(gpu.device);
+
+        const framebuffers = try createFramebuffers(gpa, gpu.device, render_pass, swapchain, depth.view);
         errdefer destroyFramebuffers(gpa, gpu.device, framebuffers);
 
         const command_pool = try createCommandPool(gpu.device, gpu.families.graphics);
@@ -66,9 +90,11 @@ pub const Frame = struct {
         return .{
             .gpa = gpa,
             .device = gpu.device,
+            .physical_device = gpu.physical_device,
             .graphics_queue = gpu.graphics_queue,
             .present_queue = gpu.present_queue,
             .render_pass = render_pass,
+            .depth = depth,
             .framebuffers = framebuffers,
             .command_pool = command_pool,
             .command_buffer = command_buffer,
@@ -85,17 +111,26 @@ pub const Frame = struct {
         vk.vkDestroyFence(self.device, self.in_flight, null);
         vk.vkDestroyCommandPool(self.device, self.command_pool, null);
         destroyFramebuffers(self.gpa, self.device, self.framebuffers);
+        self.depth.deinit(self.device);
         vk.vkDestroyRenderPass(self.device, self.render_pass, null);
     }
 
-    /// Tear down framebuffers + per-image semaphores and rebuild them
-    /// against the (already recreated) swapchain. Both depend on the
-    /// swapchain image count, which can change on resize. Caller must
-    /// have run `swapchain.recreate()` first; that already waits idle.
-    pub fn recreateFramebuffers(self: *Frame, swapchain: *const swapchain_mod.Swapchain) !void {
+    /// Tear down framebuffers + per-image semaphores + depth buffer and
+    /// rebuild them against the (already recreated) swapchain. All three
+    /// depend on the swapchain extent or image count. Caller must have
+    /// run `swapchain.recreate()` first; that already waits idle.
+    pub fn recreateFramebuffers(
+        self: *Frame,
+        gpu: *const gpu_mod.GpuContext,
+        swapchain: *const swapchain_mod.Swapchain,
+    ) !void {
         destroyFramebuffers(self.gpa, self.device, self.framebuffers);
         self.framebuffers = &.{};
-        self.framebuffers = try createFramebuffers(self.gpa, self.device, self.render_pass, swapchain);
+
+        self.depth.deinit(self.device);
+        self.depth = try createDepthBuffer(gpu, swapchain.extent);
+
+        self.framebuffers = try createFramebuffers(self.gpa, self.device, self.render_pass, swapchain, self.depth.view);
 
         destroyPerImageSemaphores(self.gpa, self.device, self.render_finished_per_image);
         self.render_finished_per_image = &.{};
@@ -176,20 +211,38 @@ pub const Frame = struct {
 };
 
 fn createRenderPass(device: vk.VkDevice, format: vk.VkFormat) !vk.VkRenderPass {
-    const color_attachment = vk.VkAttachmentDescription{
-        .flags = 0,
-        .format = format,
-        .samples = vk.VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = vk.VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp = vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .stencilStoreOp = vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    const attachments = [_]vk.VkAttachmentDescription{
+        .{
+            .flags = 0,
+            .format = format,
+            .samples = vk.VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = vk.VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        },
+        .{
+            .flags = 0,
+            .format = DEPTH_FORMAT,
+            .samples = vk.VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
+            // Depth is consumed only within this pass; presenting doesn't read it.
+            .storeOp = vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = vk.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        },
     };
     const color_ref = vk.VkAttachmentReference{
         .attachment = 0,
         .layout = vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+    const depth_ref = vk.VkAttachmentReference{
+        .attachment = 1,
+        .layout = vk.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     };
     const subpass = vk.VkSubpassDescription{
         .flags = 0,
@@ -199,27 +252,32 @@ fn createRenderPass(device: vk.VkDevice, format: vk.VkFormat) !vk.VkRenderPass {
         .colorAttachmentCount = 1,
         .pColorAttachments = &color_ref,
         .pResolveAttachments = null,
-        .pDepthStencilAttachment = null,
+        .pDepthStencilAttachment = &depth_ref,
         .preserveAttachmentCount = 0,
         .pPreserveAttachments = null,
     };
-    // External → subpass 0 dependency: don't write the attachment until the
-    // image-available semaphore has been waited on at color-output stage.
+    // External → subpass 0 dependency: cover both color-attachment writes
+    // (synchronized against the image-available semaphore) and the
+    // early-fragment depth read/write that happens before the fragment
+    // shader runs.
     const dep = vk.VkSubpassDependency{
         .srcSubpass = vk.VK_SUBPASS_EXTERNAL,
         .dstSubpass = 0,
-        .srcStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            vk.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        .dstStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            vk.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
         .srcAccessMask = 0,
-        .dstAccessMask = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            vk.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         .dependencyFlags = 0,
     };
     const ci = vk.VkRenderPassCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .attachmentCount = 1,
-        .pAttachments = &color_attachment,
+        .attachmentCount = attachments.len,
+        .pAttachments = &attachments,
         .subpassCount = 1,
         .pSubpasses = &subpass,
         .dependencyCount = 1,
@@ -233,11 +291,112 @@ fn createRenderPass(device: vk.VkDevice, format: vk.VkFormat) !vk.VkRenderPass {
     return rp;
 }
 
+fn createDepthBuffer(
+    gpu: *const gpu_mod.GpuContext,
+    extent: vk.VkExtent2D,
+) !DepthBuffer {
+    const image_ci = vk.VkImageCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .imageType = vk.VK_IMAGE_TYPE_2D,
+        .format = DEPTH_FORMAT,
+        .extent = .{ .width = extent.width, .height = extent.height, .depth = 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk.VK_SAMPLE_COUNT_1_BIT,
+        .tiling = vk.VK_IMAGE_TILING_OPTIMAL,
+        .usage = vk.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+        .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    var image: vk.VkImage = undefined;
+    try types.check(
+        vk.vkCreateImage(gpu.device, &image_ci, null, &image),
+        VulkanError.ImageCreationFailed,
+    );
+    errdefer vk.vkDestroyImage(gpu.device, image, null);
+
+    var req: vk.VkMemoryRequirements = undefined;
+    vk.vkGetImageMemoryRequirements(gpu.device, image, &req);
+
+    const mem_idx = try findMemoryType(
+        gpu.physical_device,
+        req.memoryTypeBits,
+        vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    );
+    const alloc_ci = vk.VkMemoryAllocateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = null,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mem_idx,
+    };
+    var memory: vk.VkDeviceMemory = undefined;
+    try types.check(
+        vk.vkAllocateMemory(gpu.device, &alloc_ci, null, &memory),
+        VulkanError.MemoryAllocationFailed,
+    );
+    errdefer vk.vkFreeMemory(gpu.device, memory, null);
+
+    try types.check(
+        vk.vkBindImageMemory(gpu.device, image, memory, 0),
+        VulkanError.MemoryAllocationFailed,
+    );
+
+    const view_ci = vk.VkImageViewCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .image = image,
+        .viewType = vk.VK_IMAGE_VIEW_TYPE_2D,
+        .format = DEPTH_FORMAT,
+        .components = .{
+            .r = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .subresourceRange = .{
+            .aspectMask = vk.VK_IMAGE_ASPECT_DEPTH_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    var view: vk.VkImageView = undefined;
+    try types.check(
+        vk.vkCreateImageView(gpu.device, &view_ci, null, &view),
+        VulkanError.ImageViewCreationFailed,
+    );
+    return .{ .image = image, .memory = memory, .view = view };
+}
+
+fn findMemoryType(
+    physical_device: vk.VkPhysicalDevice,
+    type_filter: u32,
+    properties: vk.VkMemoryPropertyFlags,
+) !u32 {
+    var props: vk.VkPhysicalDeviceMemoryProperties = undefined;
+    vk.vkGetPhysicalDeviceMemoryProperties(physical_device, &props);
+
+    var i: u32 = 0;
+    while (i < props.memoryTypeCount) : (i += 1) {
+        const bit: u32 = @as(u32, 1) << @intCast(i);
+        if ((type_filter & bit) == 0) continue;
+        if ((props.memoryTypes[i].propertyFlags & properties) == properties) return i;
+    }
+    return VulkanError.NoSuitableMemoryType;
+}
+
 fn createFramebuffers(
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
     render_pass: vk.VkRenderPass,
     swapchain: *const swapchain_mod.Swapchain,
+    depth_view: vk.VkImageView,
 ) ![]vk.VkFramebuffer {
     const fbs = try gpa.alloc(vk.VkFramebuffer, swapchain.image_views.len);
     var created: usize = 0;
@@ -246,13 +405,15 @@ fn createFramebuffers(
         gpa.free(fbs);
     }
     for (swapchain.image_views) |iv| {
-        const attachments = [_]vk.VkImageView{iv};
+        // Depth view is shared across all swapchain images — only one frame
+        // is in flight, so they can't read/write it concurrently.
+        const attachments = [_]vk.VkImageView{ iv, depth_view };
         const ci = vk.VkFramebufferCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .pNext = null,
             .flags = 0,
             .renderPass = render_pass,
-            .attachmentCount = 1,
+            .attachmentCount = attachments.len,
             .pAttachments = &attachments,
             .width = swapchain.extent.width,
             .height = swapchain.extent.height,
@@ -381,8 +542,9 @@ fn recordPass(
     };
     try types.check(vk.vkBeginCommandBuffer(cb, &begin), VulkanError.CommandBufferBeginFailed);
 
-    const clear = vk.VkClearValue{
-        .color = .{ .float32 = clear_color },
+    const clears = [_]vk.VkClearValue{
+        .{ .color = .{ .float32 = clear_color } },
+        .{ .depthStencil = .{ .depth = 1.0, .stencil = 0 } },
     };
     const rp_begin = vk.VkRenderPassBeginInfo{
         .sType = vk.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -390,8 +552,8 @@ fn recordPass(
         .renderPass = render_pass,
         .framebuffer = framebuffer,
         .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
-        .clearValueCount = 1,
-        .pClearValues = &clear,
+        .clearValueCount = clears.len,
+        .pClearValues = &clears,
     };
     vk.vkCmdBeginRenderPass(cb, &rp_begin, vk.VK_SUBPASS_CONTENTS_INLINE);
     if (record_fn) |f| f(ctx.?, cb, extent);

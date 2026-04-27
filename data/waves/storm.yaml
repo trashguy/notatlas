@@ -1,37 +1,13 @@
+# Storm wave kernel: real chop. Lower iterations (=20) keeps high-octave
+# averaging from blunting the peaks; bigger amplitude_m and tighter
+# wave_scale_m put visible 4-6m crests within camera frame; higher drag
+# pulls subsequent octaves around for a non-uniform surface.
 seed: 1003
-components:
-  - amplitude: 2.5
-    wavelength: 55.0
-    direction:
-      x: 1.0
-      z: 0.0
-    speed: 5.5
-    steepness: 0.45
-  - amplitude: 1.8
-    wavelength: 32.0
-    direction:
-      x: 0.866
-      z: 0.5
-    speed: 4.5
-    steepness: 0.50
-  - amplitude: 1.4
-    wavelength: 20.0
-    direction:
-      x: 0.5
-      z: 0.866
-    speed: 3.5
-    steepness: 0.55
-  - amplitude: 1.0
-    wavelength: 12.0
-    direction:
-      x: -0.6
-      z: 0.8
-    speed: 2.8
-    steepness: 0.55
-  - amplitude: 0.6
-    wavelength: 7.0
-    direction:
-      x: 0.866
-      z: -0.5
-    speed: 2.2
-    steepness: 0.40
+iterations: 20
+drag_multiplier: 0.50
+amplitude_m: 8.0
+wave_scale_m: 14.0
+frequency_mult: 1.18
+base_time_mult: 2.0
+time_mult: 1.07
+weight_decay: 0.8

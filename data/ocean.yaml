@@ -1,0 +1,19 @@
+# Ocean shading + foam + underwater fog. Consumed by water.frag via the
+# OceanParams UBO. Slimmed at the afl_ext rewrite — Schlick fresnel + the
+# sun disc are hardcoded in the shader, so scatter/fresnel_pow/sun_specular
+# no longer live here. ymlz parses fields in declaration order; no blanks.
+shallow_color:
+  r: 0.10
+  g: 0.45
+  b: 0.55
+deep_color:
+  r: 0.02
+  g: 0.08
+  b: 0.18
+crest_curvature_threshold: 0.30
+crest_width: 0.10
+fog_color:
+  r: 0.05
+  g: 0.18
+  b: 0.22
+fog_density: 0.08

@@ -1,13 +1,18 @@
 //! Graphics pipeline + matching pipeline layout + descriptor set layout for
-//! the M2.3 ocean pass.
+//! the M2 raymarched water pass.
 //!
-//! Single descriptor set, binding 0 = uniform buffer (vertex stage). Vertex
-//! input is `Vertex` from mesh.zig. Viewport and scissor are dynamic so a
-//! window resize doesn't require rebuilding the pipeline.
+//! No vertex input — the fullscreen triangle is emitted from
+//! `gl_VertexIndex` in `fullscreen.vert`. All UBO bindings are fragment-
+//! stage; the vertex shader doesn't read uniforms. Viewport and scissor
+//! are dynamic so a window resize doesn't require rebuilding the pipeline.
+//!
+//! The fragment shader writes `gl_FragDepth`, which forces late depth-test
+//! and disables early-Z. We accept the perf hit at M2 — it's free for
+//! future ship/structure passes that need correct occlusion against the
+//! water surface (M5+).
 
 const std = @import("std");
 const types = @import("vulkan_types.zig");
-const mesh_mod = @import("mesh.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -71,16 +76,15 @@ pub fn create(
         },
     };
 
-    const binding = mesh_mod.Vertex.binding_description;
-    const attrs = mesh_mod.Vertex.attribute_descriptions;
+    // No vertex input — fullscreen tri from gl_VertexIndex.
     const vertex_input = vk.VkPipelineVertexInputStateCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .vertexBindingDescriptionCount = 1,
-        .pVertexBindingDescriptions = &binding,
-        .vertexAttributeDescriptionCount = attrs.len,
-        .pVertexAttributeDescriptions = &attrs,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = null,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = null,
     };
 
     const input_assembly = vk.VkPipelineInputAssemblyStateCreateInfo{
@@ -91,8 +95,6 @@ pub fn create(
         .primitiveRestartEnable = vk.VK_FALSE,
     };
 
-    // Viewport + scissor are dynamic; the actual values come from
-    // vkCmdSetViewport / vkCmdSetScissor in the record path.
     const viewport_state = vk.VkPipelineViewportStateCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .pNext = null,
@@ -110,7 +112,7 @@ pub fn create(
         .depthClampEnable = vk.VK_FALSE,
         .rasterizerDiscardEnable = vk.VK_FALSE,
         .polygonMode = vk.VK_POLYGON_MODE_FILL,
-        .cullMode = vk.VK_CULL_MODE_NONE, // M2.3: see plane from below too
+        .cullMode = vk.VK_CULL_MODE_NONE,
         .frontFace = vk.VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .depthBiasEnable = vk.VK_FALSE,
         .depthBiasConstantFactor = 0,
@@ -153,6 +155,25 @@ pub fn create(
         .blendConstants = .{ 0, 0, 0, 0 },
     };
 
+    // Frag writes gl_FragDepth so future ship/structure passes can z-test
+    // against the water surface. compareOp = LESS_OR_EQUAL because the sky
+    // path writes gl_FragDepth = 1.0 (far plane) and the depth buffer is
+    // cleared to 1.0 — strict LESS would reject all sky fragments.
+    const depth_stencil = vk.VkPipelineDepthStencilStateCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .depthTestEnable = vk.VK_TRUE,
+        .depthWriteEnable = vk.VK_TRUE,
+        .depthCompareOp = vk.VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depthBoundsTestEnable = vk.VK_FALSE,
+        .stencilTestEnable = vk.VK_FALSE,
+        .front = std.mem.zeroes(vk.VkStencilOpState),
+        .back = std.mem.zeroes(vk.VkStencilOpState),
+        .minDepthBounds = 0,
+        .maxDepthBounds = 1,
+    };
+
     const dynamic_states = [_]vk.VkDynamicState{
         vk.VK_DYNAMIC_STATE_VIEWPORT,
         vk.VK_DYNAMIC_STATE_SCISSOR,
@@ -177,7 +198,7 @@ pub fn create(
         .pViewportState = &viewport_state,
         .pRasterizationState = &rasterizer,
         .pMultisampleState = &multisampling,
-        .pDepthStencilState = null, // no depth attachment in render pass
+        .pDepthStencilState = &depth_stencil,
         .pColorBlendState = &color_blend,
         .pDynamicState = &dynamic_state,
         .layout = pipeline_layout,
@@ -202,20 +223,30 @@ pub fn create(
 }
 
 fn createSetLayout(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
-    // binding 0: camera UBO; binding 1: wave UBO. Both vertex stage.
+    // All bindings fragment-only — fullscreen.vert reads no uniforms.
+    // binding 0: camera UBO
+    // binding 1: wave kernel UBO
+    // binding 2: ocean shading UBO
     const bindings = [_]vk.VkDescriptorSetLayoutBinding{
         .{
             .binding = 0,
             .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT,
             .pImmutableSamplers = null,
         },
         .{
             .binding = 1,
             .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = null,
+        },
+        .{
+            .binding = 2,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT,
             .pImmutableSamplers = null,
         },
     };

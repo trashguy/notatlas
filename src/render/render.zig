@@ -6,12 +6,12 @@ pub const gpu = @import("gpu.zig");
 pub const swapchain = @import("swapchain.zig");
 pub const frame = @import("frame.zig");
 pub const buffer = @import("buffer.zig");
-pub const mesh = @import("mesh.zig");
 pub const camera = @import("camera.zig");
 pub const shader = @import("shader.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const ocean = @import("ocean.zig");
 pub const waves = @import("waves.zig");
+pub const ocean_uniform = @import("ocean_uniform.zig");
 
 pub const Window = window.Window;
 pub const GpuContext = gpu.GpuContext;

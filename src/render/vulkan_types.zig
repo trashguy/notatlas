@@ -32,6 +32,7 @@ pub const VulkanError = error{
     QueueSubmitFailed,
     QueuePresentFailed,
     BufferCreationFailed,
+    ImageCreationFailed,
     MemoryAllocationFailed,
     NoSuitableMemoryType,
     MemoryMapFailed,

@@ -1,85 +1,73 @@
-//! Wave UBO layout consumed by `assets/shaders/ocean.vert`.
+//! Wave kernel UBO consumed by `assets/shaders/water.frag`.
 //!
 //! Mirrors std140 layout for the `Waves` block:
 //!
 //! ```glsl
-//! struct Component {
-//!     vec4 dir_amp_steep;       // (dir.x, dir.z, amplitude, steepness)
-//!     vec4 wavelen_speed_phi;   // (wavelength, speed, phi, _pad)
-//! };
 //! layout(set=0, binding=1) uniform Waves {
-//!     int   count;
-//!     float time;
-//!     vec2  _pad0;
-//!     Component components[MAX_COMPONENTS];
+//!     vec4 a;        // (time, drag_multiplier, amplitude_m, wave_scale_m)
+//!     vec4 b;        // (frequency_mult, base_time_mult, time_mult, weight_decay)
+//!     vec4 c;        // (initial_iter, iterations_as_float, _, _)
 //! } waves;
 //! ```
 //!
-//! Per-component phase offset `phi` is precomputed CPU-side via
-//! `wave_query.componentPhase`. The shader can't reproduce splitmix64
-//! (no u64 in core GLSL), so we ship phi alongside the params instead.
+//! `iterations` is sent as a float (slot `c.y`) and cast to `uint` in the
+//! shader — keeps the entire UBO at vec4 alignment with no uvec4 padding,
+//! and the iteration count is small enough that float→uint round-trip is
+//! exact.
+//!
+//! Same `iterations` value drives both the GPU raymarch and the CPU
+//! `wave_query.waveHeight` calls used by future buoyancy code, so the
+//! two surfaces agree at every (x, z, t).
 
 const std = @import("std");
 const notatlas = @import("notatlas");
 const wave = notatlas.wave_query;
 const math = notatlas.math;
 
-/// Max components packed in the UBO. Real configs use 2-5 (calm/choppy/storm).
-/// Increase if a wave config exceeds this; rebuild required.
-pub const MAX_COMPONENTS: u32 = 8;
-
-pub const GerstnerUbo = extern struct {
-    /// (dir.x, dir.z, amplitude, steepness)
-    dir_amp_steep: math.Vec4,
-    /// (wavelength, speed, phi, _pad)
-    wavelen_speed_phi: math.Vec4,
-};
-
 pub const Ubo = extern struct {
-    count: u32,
-    time: f32,
-    _pad0: [2]f32 = .{ 0, 0 },
-    components: [MAX_COMPONENTS]GerstnerUbo,
+    a: math.Vec4,
+    b: math.Vec4,
+    c: math.Vec4,
 
-    /// Build a UBO snapshot from a WaveParams + current time. Phases are
-    /// derived from the seed via `wave_query.componentPhase`. Inactive slots
-    /// (idx >= count) are zeroed; the shader skips them via the count guard.
     pub fn fromParams(params: wave.WaveParams, time: f32) Ubo {
-        std.debug.assert(params.components.len <= MAX_COMPONENTS);
-        var out: Ubo = .{
-            .count = @intCast(params.components.len),
-            .time = time,
-            .components = std.mem.zeroes([MAX_COMPONENTS]GerstnerUbo),
+        return .{
+            .a = .{
+                .x = time,
+                .y = params.drag_multiplier,
+                .z = params.amplitude_m,
+                .w = params.wave_scale_m,
+            },
+            .b = .{
+                .x = params.frequency_mult,
+                .y = params.base_time_mult,
+                .z = params.time_mult,
+                .w = params.weight_decay,
+            },
+            .c = .{
+                .x = seedToInitialIter(params.seed),
+                .y = @floatFromInt(params.iterations),
+                .z = 0,
+                .w = 0,
+            },
         };
-        for (params.components, 0..) |c, i| {
-            const phi = wave.componentPhase(params.seed, i);
-            out.components[i] = .{
-                .dir_amp_steep = .{
-                    .x = c.direction[0],
-                    .y = c.direction[1],
-                    .z = c.amplitude,
-                    .w = c.steepness,
-                },
-                .wavelen_speed_phi = .{
-                    .x = c.wavelength,
-                    .y = c.speed,
-                    .z = phi,
-                    .w = 0,
-                },
-            };
-        }
-        return out;
     }
 };
 
-// std140 layout asserted at build time. If any of these trip, the GLSL
-// `Waves` block in ocean.vert will read garbage.
+/// Same algorithm as `wave_query.seedToInitialIter` (private there); shipped
+/// here so the UBO is self-contained.
+fn seedToInitialIter(seed: u64) f32 {
+    var s: u64 = seed;
+    s = (s ^ (s >> 30)) *% 0xBF58476D1CE4E5B9;
+    s = (s ^ (s >> 27)) *% 0x94D049BB133111EB;
+    s = s ^ (s >> 31);
+    const u: u32 = @truncate(s);
+    const fraction: f32 = @as(f32, @floatFromInt(u)) / 4294967296.0;
+    return fraction * std.math.tau;
+}
+
 comptime {
-    std.debug.assert(@sizeOf(GerstnerUbo) == 32);
-    std.debug.assert(@offsetOf(GerstnerUbo, "dir_amp_steep") == 0);
-    std.debug.assert(@offsetOf(GerstnerUbo, "wavelen_speed_phi") == 16);
-    std.debug.assert(@offsetOf(Ubo, "count") == 0);
-    std.debug.assert(@offsetOf(Ubo, "time") == 4);
-    std.debug.assert(@offsetOf(Ubo, "components") == 16);
-    std.debug.assert(@sizeOf(Ubo) == 16 + MAX_COMPONENTS * 32);
+    std.debug.assert(@sizeOf(Ubo) == 48);
+    std.debug.assert(@offsetOf(Ubo, "a") == 0);
+    std.debug.assert(@offsetOf(Ubo, "b") == 16);
+    std.debug.assert(@offsetOf(Ubo, "c") == 32);
 }
