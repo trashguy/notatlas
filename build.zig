@@ -1,16 +1,28 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Pin glibc_version so Zig builds its bundled glibc (incl. crt1.o)
+    // instead of pulling Arch's system Scrt1.o, whose .sframe section
+    // currently trips Zig 0.15.2's bundled LLD on linux-gnu native targets.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 38, .patch = 0 } },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
-    const notatlas_mod = b.addModule("notatlas", .{
-        .root_source_file = b.path("src/root.zig"),
+    const ymlz_dep = b.dependency("ymlz", .{
         .target = target,
         .optimize = optimize,
     });
+    const zglfw_dep = b.dependency("zglfw", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const vulkan_headers_dep = b.dependency("vulkan-headers", .{});
+    const vulkan_include = vulkan_headers_dep.path("include");
 
-    const ymlz_dep = b.dependency("ymlz", .{
+    // Library module: math, wave_query, yaml_loader. No graphics deps here.
+    const notatlas_mod = b.addModule("notatlas", .{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -29,4 +41,31 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Sandbox executable: window + Vulkan playground. Phase 0 M2.
+    const sandbox_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sandbox_mod.addImport("notatlas", notatlas_mod);
+    sandbox_mod.addImport("zglfw", zglfw_dep.module("root"));
+    sandbox_mod.addIncludePath(vulkan_include);
+    sandbox_mod.linkLibrary(zglfw_dep.artifact("glfw"));
+    // Pinned glibc makes Zig treat this as cross-compile; add system dirs
+    // back so it can resolve libvulkan/libX11.
+    sandbox_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    sandbox_mod.linkSystemLibrary("vulkan", .{});
+    sandbox_mod.link_libc = true;
+
+    const sandbox = b.addExecutable(.{
+        .name = "notatlas-sandbox",
+        .root_module = sandbox_mod,
+    });
+    b.installArtifact(sandbox);
+
+    const run_sandbox = b.addRunArtifact(sandbox);
+    if (b.args) |args| run_sandbox.addArgs(args);
+    const run_step = b.step("run", "Run the notatlas sandbox");
+    run_step.dependOn(&run_sandbox.step);
 }
