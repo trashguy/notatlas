@@ -17,7 +17,6 @@ need integration, not greenfield work.
 |---|---|---|
 | ECS world / components / systems | `src/shared/ecs/` | Entity management |
 | TCP framing + packet protocol | `src/shared/net/` | Extend protocol set; reuse framing |
-| Vulkan 3D renderer | `src/client/renderer/` | G-buffer, deferred lighting, shadow pass, glTF loading |
 | Lua scripting (comptime bindings) | `src/shared/lua_bind.zig` | Recipe and AI scripts |
 | Authoritative server pattern | `src/server/` | Tick loop and command stream |
 | PG persistence | `src/shared/db/` | Models, migrations |
@@ -25,6 +24,14 @@ need integration, not greenfield work.
 | Gateway service | `src/services/gateway/` | Stateless client-facing |
 | Auth service | `src/services/auth/` | Login, JWT |
 | Resilience primitives | `src/shared/resilience/` | Circuit breaker, request context |
+
+> **Renderer is reference, not reuse.** fallen-runes'
+> `src/client/renderer/` is read for patterns and reimplemented in
+> notatlas, not imported as a build dependency. fallen-runes is a
+> different game (top-down sprites, tilemap, glTF asset pipeline) and
+> its renderer carries features notatlas doesn't need. See
+> [m2-ocean-render.md §2](m2-ocean-render.md) for the rationale and
+> the per-component reference map.
 
 ---
 

@@ -21,7 +21,9 @@ Atlas (Grapeshot Games' pirate MMO). Reading order:
 
 notatlas is a pirate MMO in the spirit of 2018-2020 Atlas, built on a custom Zig
 engine that reuses substantial parts of `~/Projects/fallen-runes` (ECS,
-networking, NATS infrastructure, gateway/auth services, Vulkan 3D renderer).
+networking, NATS infrastructure, gateway/auth services). The renderer is
+written from scratch in notatlas — fallen-runes' renderer is read as a
+reference, not imported.
 
 Atlas's design space remains underserved — Sea of Thieves is too arcade,
 Skull and Bones flopped, and Atlas itself was abandoned by Grapeshot. The
