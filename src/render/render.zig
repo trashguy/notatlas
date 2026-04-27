@@ -11,6 +11,7 @@ pub const camera = @import("camera.zig");
 pub const shader = @import("shader.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const ocean = @import("ocean.zig");
+pub const waves = @import("waves.zig");
 
 pub const Window = window.Window;
 pub const GpuContext = gpu.GpuContext;

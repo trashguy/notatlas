@@ -16,7 +16,7 @@ pub const WaveParams = struct {
     components: []const GerstnerComponent,
 };
 
-fn componentPhase(seed: u64, component_idx: usize) f32 {
+pub fn componentPhase(seed: u64, component_idx: usize) f32 {
     var s: u64 = seed +% (@as(u64, component_idx) *% 0x9E3779B97F4A7C15);
     s = (s ^ (s >> 30)) *% 0xBF58476D1CE4E5B9;
     s = (s ^ (s >> 27)) *% 0x94D049BB133111EB;

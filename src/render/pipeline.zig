@@ -202,19 +202,29 @@ pub fn create(
 }
 
 fn createSetLayout(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
-    const binding = vk.VkDescriptorSetLayoutBinding{
-        .binding = 0,
-        .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
-        .pImmutableSamplers = null,
+    // binding 0: camera UBO; binding 1: wave UBO. Both vertex stage.
+    const bindings = [_]vk.VkDescriptorSetLayoutBinding{
+        .{
+            .binding = 0,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = null,
+        },
+        .{
+            .binding = 1,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = null,
+        },
     };
     const ci = vk.VkDescriptorSetLayoutCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .bindingCount = 1,
-        .pBindings = &binding,
+        .bindingCount = bindings.len,
+        .pBindings = &bindings,
     };
     var layout: vk.VkDescriptorSetLayout = undefined;
     try types.check(
