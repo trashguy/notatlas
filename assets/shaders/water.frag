@@ -140,14 +140,18 @@ float waveHeight(vec2 world_xz, uint iterations) {
 // surface. Plane bracket = ±amplitude_m so we always cross the heightfield.
 //
 // Two-phase intersect:
-//   1. Linear march with `pos += dir * (pos.y - h)`. This heuristic
-//      accelerates over flat water and slows near the surface, but its
-//      effective per-pixel step count varies with ray slope, which
-//      produces visible level-curves on midground waves at the horizon.
+//   1. Sphere-trace-style step: `step = (pos.y - h) / -dir.y`. This is the
+//      ray-distance to where pos.y would equal h if h were locally
+//      constant — the proper first-order convergence target. Multiplied by
+//      a 0.5 conservative factor so we don't overshoot when the surface
+//      curves up between samples. The naive `pos += dir * (pos.y - h)`
+//      version stalls on near-horizon rays (vertical step shrinks with
+//      `dir.y`), producing visible glitching when the camera is near the
+//      water line; dividing by `-dir.y` removes the ray-slope dependence.
 //   2. Once a crossing is bracketed (last `prev` strictly above, current
-//      `pos` at-or-below), 6 bisection steps refine the hit. The final
-//      hit position becomes independent of how many linear steps the ray
-//      took to find the bracket — kills the banding.
+//      `pos` at-or-below), 6 bisection steps refine the hit. Final
+//      hit-distance is independent of how many steps the linear phase
+//      took.
 float raymarchWater(vec3 origin, vec3 ray, float amp) {
     // Intersect against y = +amp (entry) and y = -amp (exit). For rays
     // pointing down (ray.y < 0) we enter at the high plane.
@@ -164,6 +168,10 @@ float raymarchWater(vec3 origin, vec3 ray, float amp) {
     vec3 pos = start;
     vec3 dir = normalize(end - start);
     float total_dist = distance(start, end);
+    // Guard against horizontal rays. Caller's underwater check should
+    // already have funneled rays going up out of this function, but a
+    // tiny epsilon prevents division-by-zero for grazing rays.
+    float vy = max(0.0001, -dir.y);
 
     uint iterations = uint(waves.c.y);
     bool hit = false;
@@ -174,9 +182,7 @@ float raymarchWater(vec3 origin, vec3 ray, float amp) {
             break;
         }
         prev = pos;
-        // Step proportional to vertical mismatch — accelerates over flat
-        // water, slows near the surface.
-        pos += dir * (pos.y - h);
+        pos += dir * ((pos.y - h) / vy) * 0.5;
         if (distance(start, pos) > total_dist) break;
     }
     if (!hit) return distance(start, origin); // miss; clamp to high plane for stability
@@ -220,14 +226,16 @@ void main() {
     vec3 eye = cam.eye.xyz;
 
     // ---------------- underwater ----------------
-    // Camera below mean water level: every ray is in water. The above-water
-    // surface raymarch and sky branch are both wrong here (sky branch paints
-    // atmosphere through the water; raymarch returns hit_dist ≈ 0 for the
-    // already-inside-the-slab start, so the existing fog branch evaluates to
-    // zero and the screen flattens to the scatter colour). Short-circuit to
-    // pure fog with a brightness gradient toward the surface so the image
-    // still has a sense of "up".
-    if (eye.y < 0.0) {
+    // Camera below the LOCAL surface (not just below mean sea level): a
+    // wave crest can rise above the camera at altitudes < amplitude_m, so
+    // the test must compare against waveHeight at eye.xz, not zero. Every
+    // ray is in water in that case — short-circuit to fog with a 0.6×→1.4×
+    // brightness gradient along ray.y so the image still has a sense of
+    // "up". (See raymarchWater above for why the surface path is wrong
+    // here even when the camera is only momentarily engulfed.)
+    uint iter_eye = uint(waves.c.y);
+    float eye_h = waveHeight(eye.xz, iter_eye);
+    if (eye.y < eye_h) {
         float up = max(0.0, ray.y);
         vec3 col = ocean.fog_color.rgb * (0.6 + 0.8 * up);
         o_color = vec4(aces_tonemap(col * 2.0), 1.0);
