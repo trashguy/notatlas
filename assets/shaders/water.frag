@@ -219,6 +219,22 @@ void main() {
     vec3 ray = viewRayFromUv(v_uv);
     vec3 eye = cam.eye.xyz;
 
+    // ---------------- underwater ----------------
+    // Camera below mean water level: every ray is in water. The above-water
+    // surface raymarch and sky branch are both wrong here (sky branch paints
+    // atmosphere through the water; raymarch returns hit_dist ≈ 0 for the
+    // already-inside-the-slab start, so the existing fog branch evaluates to
+    // zero and the screen flattens to the scatter colour). Short-circuit to
+    // pure fog with a brightness gradient toward the surface so the image
+    // still has a sense of "up".
+    if (eye.y < 0.0) {
+        float up = max(0.0, ray.y);
+        vec3 col = ocean.fog_color.rgb * (0.6 + 0.8 * up);
+        o_color = vec4(aces_tonemap(col * 2.0), 1.0);
+        gl_FragDepth = 1.0;
+        return;
+    }
+
     // ---------------- sky ----------------
     if (ray.y >= 0.0) {
         vec3 col = getAtmosphere(ray) + vec3(getSun(ray));
