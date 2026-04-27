@@ -17,6 +17,20 @@ pub const VulkanError = error{
     NoSuitableDevice,
     QueueFamilyNotFound,
     DeviceCreationFailed,
+    SwapchainCreationFailed,
+    SurfaceFormatEnumerationFailed,
+    ImageViewCreationFailed,
+    RenderPassCreationFailed,
+    FramebufferCreationFailed,
+    CommandPoolCreationFailed,
+    CommandBufferAllocationFailed,
+    CommandBufferBeginFailed,
+    CommandBufferEndFailed,
+    SemaphoreCreationFailed,
+    FenceCreationFailed,
+    AcquireImageFailed,
+    QueueSubmitFailed,
+    QueuePresentFailed,
 };
 
 pub const QueueFamilies = struct {

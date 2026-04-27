@@ -50,6 +50,15 @@ pub const Window = struct {
         zglfw.pollEvents();
     }
 
+    pub fn waitEvents() void {
+        zglfw.waitEvents();
+    }
+
+    pub fn framebufferSize(self: *Window) [2]u32 {
+        const sz = self.handle.getFramebufferSize();
+        return .{ @intCast(sz[0]), @intCast(sz[1]) };
+    }
+
     /// Vulkan instance extensions GLFW needs for surface support.
     pub fn requiredInstanceExtensions() ![][*:0]const u8 {
         return zglfw.getRequiredInstanceExtensions();
