@@ -113,6 +113,13 @@ pub fn main() !void {
             try frame.recreateFramebuffers(&gpu, &swapchain);
         }
     }
+
+    // Drain the GPU before the defer chain destroys descriptor pools,
+    // pipelines, and other resources still referenced by the in-flight
+    // command buffer. Without this, validation fires
+    // VUID-vkDestroyDescriptorPool-descriptorPool-00303 +
+    // VUID-vkDestroyPipeline-pipeline-00765 on clean shutdown.
+    _ = render.types.vk.vkDeviceWaitIdle(gpu.device);
 }
 
 fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.WaveParams {
