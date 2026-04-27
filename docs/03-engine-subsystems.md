@@ -82,9 +82,11 @@ later.
 **Data:** `data/ocean.yaml` — mesh resolution, foam thresholds, water
 albedo, scatter parameters.
 
-**Milestone gate (M2):** beautiful Gerstner ocean visible in the sandbox
-at 60fps on RTX 4060. Camera flies over; no z-fighting; foam at wave
-crests; underwater fog when camera submerges.
+**Milestone gate (M2):** beautiful raymarched ocean visible in the
+sandbox at ≥ 150 fps on the dev-box GPU (RX 9070 XT, 1280×720) — proxy
+for ≥ 60 fps on a 4060-class card; rationale + cross-vendor caveat in
+[m2-ocean-render.md §10](m2-ocean-render.md). Camera flies over; no
+z-fighting; foam at wave crests; underwater fog when camera submerges.
 
 ---
 
