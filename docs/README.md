@@ -49,3 +49,19 @@ deliverable is Phase 0 work — the engine water lift (Gerstner ocean + wave
 query + buoyancy + ship-as-vehicle in the sandbox). See
 [roadmap.md](04-roadmap.md).
 
+## Project Skills
+
+This repo includes two local Codex skills under `skills/`:
+
+1. `notatlas-engineering`
+2. `notatlas-architecture-review`
+
+Recommended usage sequence in PRs:
+
+1. Implement with `notatlas-engineering`.
+2. Validate with tests/smoke runs.
+3. Run findings-first review with `notatlas-architecture-review`.
+4. Address findings and re-validate.
+
+For details, see [engineering-skill-base.md](08-engineering-skill-base.md).
+
