@@ -15,6 +15,17 @@ const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
 const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
+const box_vert_shader_path = "assets/shaders/box.vert";
+const box_frag_shader_path = "assets/shaders/box.frag";
+
+/// 2m half-extents → 4m cube. Matches the Jolt body created below; renderer
+/// scales the unit-cube mesh by 2× this on every model matrix.
+const box_half_extents: [3]f32 = .{ 2, 2, 2 };
+
+const Scene = struct {
+    ocean: *render.Ocean,
+    box: *render.Box,
+};
 
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -60,6 +71,10 @@ pub fn main() !void {
     var ocean = try render.Ocean.init(gpa, &gpu, frame.render_pass, .{});
     defer ocean.deinit();
 
+    var box = try render.Box.init(&gpu, frame.render_pass, ocean.camera_ubo.handle);
+    defer box.deinit();
+    var scene: Scene = .{ .ocean = &ocean, .box = &box };
+
     const wave_params = try loadWaves(gpa, wave_config_path);
     ocean.setWaveParams(wave_params);
 
@@ -84,15 +99,18 @@ pub fn main() !void {
     var phys = try jolt.System.init(.{});
     defer phys.deinit();
 
+    // M3.2: park the floor high enough that the box rests well above storm
+    // wave peaks (~+8m). Pure renderer test — no water-vs-box occlusion to
+    // worry about until M3.3 turns this into a buoyancy demo.
     _ = try phys.createBox(.{
         .half_extents = .{ 50, 0.5, 50 },
-        .position = .{ 0, -0.5, 0 },
+        .position = .{ 0, 15, 0 },
         .motion = .static,
         .activate = false,
     });
     const box_id = try phys.createBox(.{
-        .half_extents = .{ 1, 1, 1 },
-        .position = .{ 0, 20, 0 },
+        .half_extents = box_half_extents,
+        .position = .{ 0, 40, 0 },
         .motion = .dynamic,
         .mass_override_kg = 100,
     });
@@ -130,7 +148,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &box, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -152,15 +170,31 @@ pub fn main() !void {
             phys_log_accum = 0;
         }
 
+        // Drive box renderer from current Jolt pose. Mesh is a unit cube;
+        // scale by 2× the half-extents to recover a 2m cube matching the
+        // Jolt shape. Quaternion comes back identity-ish until something
+        // tips the box.
+        const box_pos = phys.getPosition(box_id) orelse .{ 0, 0, 0 };
+        const box_quat = phys.getRotation(box_id) orelse .{ 0, 0, 0, 1 };
+        const box_model = notatlas.math.Mat4.trs(
+            notatlas.math.Vec3.init(box_pos[0], box_pos[1], box_pos[2]),
+            box_quat,
+            notatlas.math.Vec3.init(2 * box_half_extents[0], 2 * box_half_extents[1], 2 * box_half_extents[2]),
+        );
+        box.setModel(box_model.data);
+
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
         // between 12m and 24m — stays clear of storm-preset peaks (~8m)
-        // so the camera never submerges.
+        // so the camera never submerges. Look-at point lifted to y=12 so
+        // the M3.2 debug box (resting around y=16.5) sits centered in
+        // frame; will revert toward y=0 when M3.3 brings the box to sea
+        // level via buoyancy.
         const radius: f32 = 80.0;
         const angle = t * (std.math.tau / 16.0);
         const altitude: f32 = 18.0 + 6.0 * @sin(angle);
         const camera: render.Camera = .{
             .eye = notatlas.math.Vec3.init(@cos(angle) * radius, altitude, @sin(angle) * radius),
-            .target = notatlas.math.Vec3.zero,
+            .target = notatlas.math.Vec3.init(0, 12, 0),
             .fov_y = std.math.degreesToRadians(60.0),
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
@@ -170,7 +204,7 @@ pub fn main() !void {
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
 
-        const result = try frame.draw(&swapchain, clear, recordOcean, &ocean);
+        const result = try frame.draw(&swapchain, clear, recordScene, &scene);
         if (result == .resize_needed) {
             try swapchain.recreate(window.framebufferSize());
             try frame.recreateFramebuffers(&gpu, &swapchain);
@@ -213,6 +247,7 @@ fn loadOcean(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.ocean_param
 fn handleReload(
     gpa: std.mem.Allocator,
     ocean: *render.Ocean,
+    box: *render.Box,
     render_pass: render.types.vk.VkRenderPass,
     events: render.file_watch.Events,
 ) void {
@@ -236,27 +271,40 @@ fn handleReload(
         }
     }
 
+    // Watcher emits a single .shader bool — no per-file granularity. Both
+    // pipelines recompile on any shader edit. Cheap (~100ms total) and
+    // simpler than fan-out per-shader bookkeeping.
     if (events.shader) {
         const vert_spv = render.shader_compile.compileGlsl(gpa, vert_shader_path, "fullscreen.vert") catch return;
         defer gpa.free(vert_spv);
         const frag_spv = render.shader_compile.compileGlsl(gpa, frag_shader_path, "water.frag") catch return;
         defer gpa.free(frag_spv);
-
         ocean.reloadShaders(render_pass, vert_spv, frag_spv) catch |err| {
-            std.log.err("reload shaders: {s}", .{@errorName(err)});
+            std.log.err("reload water shaders: {s}", .{@errorName(err)});
             return;
         };
+
+        const box_vert_spv = render.shader_compile.compileGlsl(gpa, box_vert_shader_path, "box.vert") catch return;
+        defer gpa.free(box_vert_spv);
+        const box_frag_spv = render.shader_compile.compileGlsl(gpa, box_frag_shader_path, "box.frag") catch return;
+        defer gpa.free(box_frag_spv);
+        box.reloadShaders(render_pass, box_vert_spv, box_frag_spv) catch |err| {
+            std.log.err("reload box shaders: {s}", .{@errorName(err)});
+            return;
+        };
+
         std.log.info("reload shaders ({d} ms)", .{timer.lap() / std.time.ns_per_ms});
     }
 }
 
-fn recordOcean(
+fn recordScene(
     ctx: *anyopaque,
     cb: render.types.vk.VkCommandBuffer,
     extent: render.types.vk.VkExtent2D,
 ) void {
-    const ocean: *render.Ocean = @ptrCast(@alignCast(ctx));
-    ocean.record(cb, extent);
+    const scene: *Scene = @ptrCast(@alignCast(ctx));
+    scene.ocean.record(cb, extent);
+    scene.box.record(cb, extent);
 }
 
 const Cli = struct {

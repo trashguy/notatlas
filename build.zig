@@ -83,6 +83,8 @@ pub fn build(b: *std.Build) void {
     // runtime hot-reload subprocess.
     embedShader(b, sandbox_mod, "assets/shaders/fullscreen.vert", "fullscreen_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/water.frag", "water_frag_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/box.vert", "box_vert_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/box.frag", "box_frag_spv");
 
     const sandbox = b.addExecutable(.{
         .name = "notatlas-sandbox",

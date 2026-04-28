@@ -122,6 +122,42 @@ pub const Mat4 = extern struct {
         };
     }
 
+    /// Build a TRS matrix from translation + quaternion (x,y,z,w) +
+    /// per-axis scale. Quaternion convention matches Jolt: x,y,z is the
+    /// imaginary part, w is the scalar. Result is `T · R · S` so points
+    /// are scaled, then rotated, then translated when multiplied on the
+    /// right.
+    pub fn trs(translation: Vec3, quat: [4]f32, scale_xyz: Vec3) Mat4 {
+        const x = quat[0];
+        const y = quat[1];
+        const z = quat[2];
+        const w = quat[3];
+        const xx = x * x;
+        const yy = y * y;
+        const zz = z * z;
+        const xy = x * y;
+        const xz = x * z;
+        const yz = y * z;
+        const wx = w * x;
+        const wy = w * y;
+        const wz = w * z;
+        const sx = scale_xyz.x;
+        const sy = scale_xyz.y;
+        const sz = scale_xyz.z;
+        return .{
+            .data = .{
+                // col 0 = R · (sx, 0, 0, 0)
+                (1 - 2 * (yy + zz)) * sx, (2 * (xy + wz)) * sx, (2 * (xz - wy)) * sx, 0,
+                // col 1 = R · (0, sy, 0, 0)
+                (2 * (xy - wz)) * sy, (1 - 2 * (xx + zz)) * sy, (2 * (yz + wx)) * sy, 0,
+                // col 2 = R · (0, 0, sz, 0)
+                (2 * (xz + wy)) * sz, (2 * (yz - wx)) * sz, (1 - 2 * (xx + yy)) * sz, 0,
+                // col 3 = translation
+                translation.x, translation.y, translation.z, 1,
+            },
+        };
+    }
+
     /// Right-handed perspective for Vulkan NDC: y points down, z ∈ [0,1].
     /// `fov_y` is the vertical field of view in radians. `aspect` is W/H.
     pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
@@ -188,4 +224,27 @@ test "Vec3 cross is right-handed" {
     try std.testing.expectEqual(@as(f32, 0), z.x);
     try std.testing.expectEqual(@as(f32, 0), z.y);
     try std.testing.expectEqual(@as(f32, 1), z.z);
+}
+
+test "Mat4.trs identity quaternion translates a point" {
+    const m = Mat4.trs(Vec3.init(3, 5, 7), .{ 0, 0, 0, 1 }, Vec3.init(1, 1, 1));
+    // m · (1,2,3,1) = (1+3, 2+5, 3+7, 1) = (4, 7, 10, 1)
+    const px = m.at(0, 0) * 1 + m.at(1, 0) * 2 + m.at(2, 0) * 3 + m.at(3, 0);
+    const py = m.at(0, 1) * 1 + m.at(1, 1) * 2 + m.at(2, 1) * 3 + m.at(3, 1);
+    const pz = m.at(0, 2) * 1 + m.at(1, 2) * 2 + m.at(2, 2) * 3 + m.at(3, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), px, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), py, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), pz, 1e-5);
+}
+
+test "Mat4.trs 90deg-around-y rotates +x to -z" {
+    // Quaternion for +90° around y: (0, sin(45°), 0, cos(45°))
+    const s2 = @sqrt(@as(f32, 0.5));
+    const m = Mat4.trs(Vec3.zero, .{ 0, s2, 0, s2 }, Vec3.init(1, 1, 1));
+    const px = m.at(0, 0) * 1 + m.at(1, 0) * 0 + m.at(2, 0) * 0;
+    const py = m.at(0, 1) * 1 + m.at(1, 1) * 0 + m.at(2, 1) * 0;
+    const pz = m.at(0, 2) * 1 + m.at(1, 2) * 0 + m.at(2, 2) * 0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0), px, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), py, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), pz, 1e-5);
 }
