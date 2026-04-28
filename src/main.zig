@@ -307,6 +307,16 @@ pub fn main() !void {
             }
             const move = pollMove(&window);
             player.applyMove(move, dt);
+            // M5.4: pin to deck plane. Without this, walking off the edge
+            // floats you in local-space air; Space/Ctrl would lift you off
+            // the deck. Inset 0.3 m keeps the eye off the deck-edge corner
+            // (the box's exact edge would clip the camera into nothing).
+            player.clampToDeck(
+                hull.half_extents[1],
+                hull.half_extents[0],
+                hull.half_extents[2],
+                0.3,
+            );
         }
         last_cursor = cursor;
         if (cursor_captured and window.handle.getKey(.escape) == .press) {

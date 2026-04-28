@@ -145,6 +145,33 @@ pub const Player = struct {
         self.pos.y += m.up * step;
     }
 
+    /// Constrain the player to a rectangular deck plane in ship-local
+    /// space. Snaps `pos.y` to the deck and bounds `pos.x` / `pos.z` to
+    /// `±(half - inset)`, so walking off the box edge doesn't float you
+    /// in local-space air. `inset` accounts for player width — at the
+    /// camera that's the gap between the eye and the deck-edge corner
+    /// before view-frustum clipping starts to feel cramped.
+    ///
+    /// No-op when not attached. M5.4 minimal scope: hard clamp, no edge
+    /// step-off / fall-off (sandbox doesn't have a swim state to drop
+    /// into yet); the "magnetic boots" gameplay-comfort lever — projecting
+    /// WASD onto world-horizontal so a rolling deck doesn't make W feel
+    /// vertical — would also live here when we add it.
+    pub fn clampToDeck(
+        self: *Player,
+        deck_y: f32,
+        half_x: f32,
+        half_z: f32,
+        inset: f32,
+    ) void {
+        if (self.attached_ship == null) return;
+        self.pos.y = deck_y;
+        const max_x = @max(0.0, half_x - inset);
+        const max_z = @max(0.0, half_z - inset);
+        self.pos.x = std.math.clamp(self.pos.x, -max_x, max_x);
+        self.pos.z = std.math.clamp(self.pos.z, -max_z, max_z);
+    }
+
     /// World-space eye position. When attached, composes the local eye
     /// (feet + eye_height) through the ship's pose; when not attached,
     /// interprets `pos` as world-frame.
@@ -335,6 +362,43 @@ test "disembark snapshots world pos and clears attachment" {
     // world feet = ship_pos + rotated(local_pos, identity) = (10,0,0) + (2,2,0)
     try std.testing.expectApproxEqAbs(@as(f32, 12), p.pos.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2), p.pos.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), p.pos.z, 1e-6);
+}
+
+test "clampToDeck snaps y and bounds x/z when attached" {
+    var p: Player = .{};
+    p.boardShip(1, Vec3.init(5, -10, 5));
+    // 4m cube → half_extents=2; inset 0.3 → walkable ±1.7.
+    p.clampToDeck(2.0, 2.0, 2.0, 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), p.pos.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.7), p.pos.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.7), p.pos.z, 1e-6);
+}
+
+test "clampToDeck preserves in-bounds pos" {
+    var p: Player = .{};
+    p.boardShip(1, Vec3.init(0.5, 99, -0.5));
+    p.clampToDeck(2.0, 2.0, 2.0, 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), p.pos.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), p.pos.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), p.pos.z, 1e-6);
+}
+
+test "clampToDeck noop when unattached" {
+    var p: Player = .{};
+    p.pos = Vec3.init(100, 100, 100);
+    p.clampToDeck(2.0, 2.0, 2.0, 0.3);
+    try std.testing.expectEqual(@as(f32, 100), p.pos.x);
+    try std.testing.expectEqual(@as(f32, 100), p.pos.y);
+    try std.testing.expectEqual(@as(f32, 100), p.pos.z);
+}
+
+test "clampToDeck handles inset >= half (degenerate small deck)" {
+    var p: Player = .{};
+    p.boardShip(1, Vec3.init(5, 0, -3));
+    // inset > half → walkable area collapses to the deck centerline.
+    p.clampToDeck(0.0, 0.5, 0.5, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), p.pos.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0), p.pos.z, 1e-6);
 }
 
