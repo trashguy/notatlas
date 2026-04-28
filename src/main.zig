@@ -10,6 +10,7 @@ const std = @import("std");
 const notatlas = @import("notatlas");
 const render = @import("render/render.zig");
 const physics = @import("physics");
+const zglfw = @import("zglfw");
 
 const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
@@ -164,6 +165,25 @@ pub fn main() !void {
     var pose_curr_pos: [3]f32 = pose_prev_pos;
     var pose_curr_rot: [4]f32 = pose_prev_rot;
 
+    // M5.2 first-person camera. Initial pose places the player ~30 m back
+    // and 5 m up, looking at the origin where the box bobs. WASD walks
+    // (planar — looking up doesn't lift you), Space/Ctrl raise/lower for
+    // free-fly until M5.3/M5.4 swap this for boarded/walking modes.
+    var fly_cam: notatlas.fly_camera.FlyCamera = .{
+        .pos = notatlas.math.Vec3.init(0, 5, 30),
+        .yaw = 0, // looking down -Z toward origin
+        .pitch = std.math.degreesToRadians(-8.0),
+    };
+    var last_cursor: ?[2]f64 = null;
+    var cursor_captured: bool = false;
+    // Capture the cursor at startup so mouse-look works from the first frame.
+    // `.disabled` mode hides the cursor and reports unbounded virtual
+    // positions — the FPS standard. Esc releases, left-click recaptures.
+    if (!cli.capture and cli.soak_seconds == 0) {
+        zglfw.setInputMode(window.handle, .cursor, .disabled) catch {};
+        cursor_captured = true;
+    }
+
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
     var soak_stats: SoakStats = .{};
@@ -268,17 +288,36 @@ pub fn main() !void {
 
         if (cli.soak_seconds > 0 and t >= cli.soak_seconds) break;
 
-        // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
-        // between 12m and 24m — stays clear of storm-preset peaks (~8m)
-        // so the camera never submerges. Look-at the sea surface where
-        // the buoyant box bobs.
-        const radius: f32 = 80.0;
-        const angle = t * (std.math.tau / 16.0);
-        const altitude: f32 = 18.0 + 6.0 * @sin(angle);
+        // M5.2 input. Mouse delta drives yaw/pitch (only while captured);
+        // WASD + Space/Ctrl drive position. Esc releases the cursor (so the
+        // window is dismissable); left-click re-captures. We re-poll cursor
+        // position every frame regardless of capture state so re-capturing
+        // doesn't snap the view by the cursor's drift while released.
+        const cursor = window.handle.getCursorPos();
+        if (cursor_captured) {
+            if (last_cursor) |lc| {
+                const dx: f32 = @floatCast(cursor[0] - lc[0]);
+                const dy: f32 = @floatCast(cursor[1] - lc[1]);
+                fly_cam.applyMouseDelta(dx, dy);
+            }
+            const move = pollMove(&window);
+            fly_cam.applyMove(move, dt);
+        }
+        last_cursor = cursor;
+        if (cursor_captured and window.handle.getKey(.escape) == .press) {
+            zglfw.setInputMode(window.handle, .cursor, .normal) catch {};
+            cursor_captured = false;
+            last_cursor = null;
+        } else if (!cursor_captured and window.handle.getMouseButton(.left) == .press) {
+            zglfw.setInputMode(window.handle, .cursor, .disabled) catch {};
+            cursor_captured = true;
+            last_cursor = null;
+        }
+
         const camera: render.Camera = .{
-            .eye = notatlas.math.Vec3.init(@cos(angle) * radius, altitude, @sin(angle) * radius),
-            .target = notatlas.math.Vec3.zero,
-            .fov_y = std.math.degreesToRadians(60.0),
+            .eye = fly_cam.pos,
+            .target = notatlas.math.Vec3.add(fly_cam.pos, fly_cam.forward()),
+            .fov_y = fly_cam.fov_y,
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
         ocean.updateCamera(camera);
@@ -475,6 +514,20 @@ fn recordScene(
     scene.ocean.record(cb, extent);
     scene.box.record(cb, extent);
     scene.arrows.record(cb, extent);
+}
+
+/// Snapshot WASD / Space / Ctrl into a FlyCamera move vector. Each axis is
+/// the difference of two boolean keys, so chord cancellation works the same
+/// as any FPS (W+S = 0, A+D = 0). Diagonal (W+D) is unnormalized — gives
+/// the classic √2× bonus on diagonals; not worth normalizing for sandbox.
+fn pollMove(window: *render.Window) notatlas.fly_camera.FlyCamera.Move {
+    const fw: f32 = if (window.handle.getKey(.w) == .press) 1 else 0;
+    const bw: f32 = if (window.handle.getKey(.s) == .press) 1 else 0;
+    const lf: f32 = if (window.handle.getKey(.a) == .press) 1 else 0;
+    const rt: f32 = if (window.handle.getKey(.d) == .press) 1 else 0;
+    const up: f32 = if (window.handle.getKey(.space) == .press) 1 else 0;
+    const dn: f32 = if (window.handle.getKey(.left_control) == .press) 1 else 0;
+    return .{ .forward = fw - bw, .strafe = rt - lf, .up = up - dn };
 }
 
 /// Fill `out` with `arrow_grid_dim²` windAt samples on a centered grid.
