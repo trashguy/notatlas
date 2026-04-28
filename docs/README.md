@@ -13,6 +13,7 @@ Atlas (Grapeshot Games' pirate MMO). Reading order:
 | 05 | [data-model.md](05-data-model.md) | Data-driven principle and where each kind of content lives |
 | 06 | [design-caps.md](06-design-caps.md) | First-pass content caps (data-driven, adjustable) |
 | 07 | [anti-patterns.md](07-anti-patterns.md) | Atlas mistakes to NOT replicate |
+| 08 | [engineering-skill-base.md](08-engineering-skill-base.md) | Contributor and agent execution playbook based on live code + locked architecture |
 | R1 | [research/atlas-features.md](research/atlas-features.md) | Consolidated feature research |
 | R2 | [research/atlas-postmortem.md](research/atlas-postmortem.md) | Why Atlas failed (lessons learned) |
 | R3 | [research/atlas-server-tech.md](research/atlas-server-tech.md) | Original Atlas server architecture for reference |
@@ -47,3 +48,4 @@ As of 2026-04-27: design and architecture front is closed (ratified). Next
 deliverable is Phase 0 work — the engine water lift (Gerstner ocean + wave
 query + buoyancy + ship-as-vehicle in the sandbox). See
 [roadmap.md](04-roadmap.md).
+

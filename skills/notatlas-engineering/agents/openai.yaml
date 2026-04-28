@@ -1,0 +1,4 @@
+interface:
+  display_name: "Notatlas Engineering"
+  short_description: "Implement and validate notatlas engine work"
+  default_prompt: "Use this skill to implement or review notatlas engine changes while preserving locked architecture constraints and milestone gate discipline."

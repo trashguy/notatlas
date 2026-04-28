@@ -1,0 +1,4 @@
+interface:
+  display_name: "Notatlas Architecture Review"
+  short_description: "Review for architecture and scale-gate compliance"
+  default_prompt: "Use this skill to perform strict notatlas architecture and stress-gate reviews with findings-first output and severity ordering."
