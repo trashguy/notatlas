@@ -67,6 +67,54 @@ pub const Vec3 = extern struct {
     }
 };
 
+/// Spherical-linear interpolation between two unit quaternions in
+/// `(x, y, z, w)` order (Jolt convention). Used for sub-tick rendering
+/// of physics bodies — at frame time we slerp between `pose_prev` and
+/// `pose_curr` by the accumulator alpha so the visual is smooth even
+/// when render rate ≫ physics rate.
+///
+/// Negates `b` if `dot(a, b) < 0` to take the shortest-arc path —
+/// quaternions q and -q encode the same rotation but slerp without
+/// the flip walks the long way around when they straddle the
+/// hemisphere boundary.
+///
+/// For nearly-aligned inputs the trig form loses precision, so above
+/// `dot > 0.9995` we fall back to nlerp (lerp + renormalize), which is
+/// well-defined and visually identical at small angles.
+pub fn quatSlerp(a: [4]f32, b: [4]f32, t: f32) [4]f32 {
+    var b2 = b;
+    var d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    if (d < 0) {
+        b2 = .{ -b[0], -b[1], -b[2], -b[3] };
+        d = -d;
+    }
+    if (d > 0.9995) {
+        const r: [4]f32 = .{
+            a[0] + (b2[0] - a[0]) * t,
+            a[1] + (b2[1] - a[1]) * t,
+            a[2] + (b2[2] - a[2]) * t,
+            a[3] + (b2[3] - a[3]) * t,
+        };
+        const len2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3];
+        if (len2 == 0) return .{ 0, 0, 0, 1 };
+        const inv = 1.0 / @sqrt(len2);
+        return .{ r[0] * inv, r[1] * inv, r[2] * inv, r[3] * inv };
+    }
+    const d_clamped = @max(@as(f32, -1.0), @min(@as(f32, 1.0), d));
+    const theta_0 = std.math.acos(d_clamped);
+    const theta = theta_0 * t;
+    const sin_theta = @sin(theta);
+    const sin_theta_0 = @sin(theta_0);
+    const s0 = @cos(theta) - d * sin_theta / sin_theta_0;
+    const s1 = sin_theta / sin_theta_0;
+    return .{
+        s0 * a[0] + s1 * b2[0],
+        s0 * a[1] + s1 * b2[1],
+        s0 * a[2] + s1 * b2[2],
+        s0 * a[3] + s1 * b2[3],
+    };
+}
+
 pub const Vec4 = extern struct {
     x: f32,
     y: f32,
@@ -261,6 +309,58 @@ test "Vec3.rotateByQuat identity preserves vector" {
     try std.testing.expectApproxEqAbs(v.x, r.x, 1e-5);
     try std.testing.expectApproxEqAbs(v.y, r.y, 1e-5);
     try std.testing.expectApproxEqAbs(v.z, r.z, 1e-5);
+}
+
+test "quatSlerp endpoints return inputs (up to sign)" {
+    const a: [4]f32 = .{ 0, 0, 0, 1 };
+    const s2 = @sqrt(@as(f32, 0.5));
+    const b: [4]f32 = .{ 0, s2, 0, s2 }; // 90° around y
+    const r0 = quatSlerp(a, b, 0);
+    const r1 = quatSlerp(a, b, 1);
+    for (0..4) |i| {
+        try std.testing.expectApproxEqAbs(a[i], r0[i], 1e-6);
+        try std.testing.expectApproxEqAbs(b[i], r1[i], 1e-6);
+    }
+}
+
+test "quatSlerp halfway between identity and 90deg-y is 45deg-y" {
+    const a: [4]f32 = .{ 0, 0, 0, 1 };
+    const s2 = @sqrt(@as(f32, 0.5));
+    const b: [4]f32 = .{ 0, s2, 0, s2 };
+    const r = quatSlerp(a, b, 0.5);
+    // 45° around y: (0, sin(22.5°), 0, cos(22.5°))
+    const half = std.math.pi / 8.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@sin(half), r[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@cos(half), r[3], 1e-5);
+
+    // And the result is a unit quaternion.
+    const len2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3];
+    try std.testing.expectApproxEqAbs(@as(f32, 1), len2, 1e-5);
+}
+
+test "quatSlerp takes shortest path when inputs straddle hemisphere" {
+    // Same rotation, opposite signs — slerp should walk a zero arc, not 360°.
+    const a: [4]f32 = .{ 0, 0, 0, 1 };
+    const b: [4]f32 = .{ 0, 0, 0, -1 };
+    const r = quatSlerp(a, b, 0.5);
+    // After sign-flip, b is treated as identity; midpoint should be
+    // identity (or its negation — same rotation).
+    const w_abs = @abs(r[3]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), w_abs, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r[2], 1e-5);
+}
+
+test "quatSlerp small-angle path stays unit-length" {
+    // Nearly-aligned inputs hit the nlerp branch.
+    const a: [4]f32 = .{ 0, 0, 0, 1 };
+    const b: [4]f32 = .{ 0.001, 0, 0, @sqrt(1.0 - 0.001 * 0.001) };
+    const r = quatSlerp(a, b, 0.3);
+    const len2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3];
+    try std.testing.expectApproxEqAbs(@as(f32, 1), len2, 1e-5);
 }
 
 test "Mat4.trs 90deg-around-y rotates +x to -z" {

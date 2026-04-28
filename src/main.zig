@@ -141,6 +141,29 @@ pub fn main() !void {
 
     var buoy = physics.Buoyancy.init(buoyancyConfigFromHull(hull));
 
+    // M5.1: physics runs at the locked 60Hz auth tick; render is uncapped.
+    // We accumulate frame dt and step Jolt in fixed 1/60 s chunks. Each tick
+    // snapshots the prior pose so the render frame can lerp/slerp between
+    // (prev, curr) by `alpha = phys_accum / phys_dt_fixed`. The same
+    // interpolation pattern carries forward to M5.3 where the passenger
+    // composes against the *interpolated* ship pose — without it, a 144Hz
+    // first-person camera on a 60Hz pitching deck shows visible jitter.
+    //
+    // `phys_t` is the simulation clock (advances by exactly phys_dt per step,
+    // monotonic, identical run-to-run for a fixed soak duration). Wave queries
+    // inside buoyancy use phys_t so successive ticks integrate against a
+    // self-consistent height field. Camera, ocean shader time, and the
+    // wind-arrow viz keep using the render-time `t` — they're cosmetic and
+    // don't need bit-identical reproducibility.
+    const phys_dt_fixed: f32 = 1.0 / 60.0;
+    const max_steps_per_frame: u32 = 5;
+    var phys_accum: f32 = 0;
+    var phys_t: f32 = 0;
+    var pose_prev_pos: [3]f32 = phys.getPosition(box_id) orelse .{ 0, 4, 0 };
+    var pose_prev_rot: [4]f32 = phys.getRotation(box_id) orelse .{ 0, 0, 0, 1 };
+    var pose_curr_pos: [3]f32 = pose_prev_pos;
+    var pose_curr_rot: [4]f32 = pose_prev_rot;
+
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
     var soak_stats: SoakStats = .{};
@@ -181,42 +204,69 @@ pub fn main() !void {
         t += dt;
         perf.tick(frame_ns);
 
-        // Physics step. Cap at 1/30 s so a hitch on the first frame (or a
-        // long capture pause) doesn't tunnel the dynamic box through the
-        // floor. Buoyancy applies forces against the same wave kernel the
-        // GPU raymarches, then Jolt integrates them.
-        const phys_dt = @min(dt, 1.0 / 30.0);
-        buoy.step(&phys, box_id, wave_params, t);
-        phys.step(phys_dt, 1);
-        phys_log_accum += phys_dt;
+        // Fixed-step physics. Owe `phys_accum` seconds of sim; consume in
+        // exact 1/60 s chunks. `max_steps_per_frame` caps runaway: if the
+        // sandbox stalls (RenderDoc capture pause, breakpoint), we'd
+        // otherwise try to catch up by running hundreds of physics ticks
+        // in one frame and tunneling through wave gradients. Better to
+        // drop the residual and let the sim slow down briefly than to
+        // explode the box.
+        phys_accum += dt;
+        var steps: u32 = 0;
+        while (phys_accum >= phys_dt_fixed and steps < max_steps_per_frame) : (steps += 1) {
+            pose_prev_pos = pose_curr_pos;
+            pose_prev_rot = pose_curr_rot;
+            buoy.step(&phys, box_id, wave_params, phys_t);
+            phys.step(phys_dt_fixed, 1);
+            phys_t += phys_dt_fixed;
+            pose_curr_pos = phys.getPosition(box_id) orelse pose_curr_pos;
+            pose_curr_rot = phys.getRotation(box_id) orelse pose_curr_rot;
+
+            // Per-tick soak observations — uniform 1/60 s sampling, identical
+            // to the rate the integrator actually steps at. Replaces the
+            // pre-M5.1 per-render-frame sampling which redundantly observed
+            // the same Jolt state ~15× per tick at uncapped framerates.
+            if (cli.soak_seconds > 0) {
+                const lin_v = phys.getLinearVelocity(box_id) orelse .{ 0, 0, 0 };
+                const ang_v = phys.getAngularVelocity(box_id) orelse .{ 0, 0, 0 };
+                soak_stats.observe(pose_curr_pos, lin_v, ang_v);
+                wind_soak.observe(wind_params, phys_t);
+            }
+            phys_accum -= phys_dt_fixed;
+        }
+        if (steps == max_steps_per_frame and phys_accum >= phys_dt_fixed) {
+            phys_accum = 0;
+        }
+
+        phys_log_accum += dt;
         if (phys_log_accum >= 1.0) {
-            const pos = phys.getPosition(box_id) orelse .{ 0, 0, 0 };
             const vel = phys.getLinearVelocity(box_id) orelse .{ 0, 0, 0 };
             std.log.info("phys: box pos=({d:.2},{d:.2},{d:.2}) vel=({d:.2},{d:.2},{d:.2})", .{
-                pos[0], pos[1], pos[2], vel[0], vel[1], vel[2],
+                pose_curr_pos[0], pose_curr_pos[1], pose_curr_pos[2], vel[0], vel[1], vel[2],
             });
             logWind(wind_params, t);
             phys_log_accum = 0;
         }
 
-        // Drive box renderer from current Jolt pose. Mesh is a unit cube;
-        // scale by 2× the half-extents from the hull config to recover the
-        // 4m cube. Quaternion comes back identity-ish until waves tip it.
-        const box_pos = phys.getPosition(box_id) orelse .{ 0, 0, 0 };
-        const box_quat = phys.getRotation(box_id) orelse .{ 0, 0, 0, 1 };
+        // Render the box at the interpolated pose between the two most recent
+        // physics ticks. `alpha ∈ [0, 1]` is the fractional position into the
+        // next tick; at exactly the tick boundary alpha=0 and we render the
+        // last completed pose.
+        const alpha: f32 = std.math.clamp(phys_accum / phys_dt_fixed, 0.0, 1.0);
+        const render_pos = notatlas.math.Vec3.init(
+            pose_prev_pos[0] + (pose_curr_pos[0] - pose_prev_pos[0]) * alpha,
+            pose_prev_pos[1] + (pose_curr_pos[1] - pose_prev_pos[1]) * alpha,
+            pose_prev_pos[2] + (pose_curr_pos[2] - pose_prev_pos[2]) * alpha,
+        );
+        const render_rot = notatlas.math.quatSlerp(pose_prev_rot, pose_curr_rot, alpha);
         const box_model = notatlas.math.Mat4.trs(
-            notatlas.math.Vec3.init(box_pos[0], box_pos[1], box_pos[2]),
-            box_quat,
+            render_pos,
+            render_rot,
             notatlas.math.Vec3.init(2 * hull.half_extents[0], 2 * hull.half_extents[1], 2 * hull.half_extents[2]),
         );
         box.setModel(box_model.data);
 
-        if (cli.soak_seconds > 0) {
-            const lin_v = phys.getLinearVelocity(box_id) orelse .{ 0, 0, 0 };
-            const ang_v = phys.getAngularVelocity(box_id) orelse .{ 0, 0, 0 };
-            soak_stats.observe(box_pos, lin_v, ang_v);
-            if (t >= cli.soak_seconds) break;
-        }
+        if (cli.soak_seconds > 0 and t >= cli.soak_seconds) break;
 
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
         // between 12m and 24m — stays clear of storm-preset peaks (~8m)
@@ -239,8 +289,6 @@ pub fn main() !void {
         var arrow_instances: [arrow_count]render.wind_arrows.ArrowInstance = undefined;
         sampleWindGrid(wind_params, t, &arrow_instances);
         arrows.updateInstances(&arrow_instances);
-
-        if (cli.soak_seconds > 0) wind_soak.observe(wind_params, t);
 
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
