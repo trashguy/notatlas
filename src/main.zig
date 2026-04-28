@@ -122,6 +122,7 @@ pub fn main() !void {
 
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
+    var soak_stats: SoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -187,6 +188,13 @@ pub fn main() !void {
         );
         box.setModel(box_model.data);
 
+        if (cli.soak_seconds > 0) {
+            const lin_v = phys.getLinearVelocity(box_id) orelse .{ 0, 0, 0 };
+            const ang_v = phys.getAngularVelocity(box_id) orelse .{ 0, 0, 0 };
+            soak_stats.observe(box_pos, lin_v, ang_v);
+            if (t >= cli.soak_seconds) break;
+        }
+
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
         // between 12m and 24m — stays clear of storm-preset peaks (~8m)
         // so the camera never submerges. Look-at the sea surface where
@@ -229,6 +237,8 @@ pub fn main() !void {
     // VUID-vkDestroyDescriptorPool-descriptorPool-00303 +
     // VUID-vkDestroyPipeline-pipeline-00765 on clean shutdown.
     _ = render.types.vk.vkDeviceWaitIdle(gpu.device);
+
+    if (cli.soak_seconds > 0) soak_stats.report(t);
 }
 
 fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.WaveParams {
@@ -348,6 +358,9 @@ fn recordScene(
 const Cli = struct {
     uncap: bool = false,
     capture: bool = false,
+    /// Run the loop for this many seconds with pose telemetry accumulated,
+    /// then print stats and exit. 0 = normal interactive run.
+    soak_seconds: f32 = 0,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -356,10 +369,73 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
     _ = args.next(); // skip exe name
     var cli: Cli = .{};
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--uncap")) cli.uncap = true else if (std.mem.eql(u8, a, "--capture")) cli.capture = true;
+        if (std.mem.eql(u8, a, "--uncap")) {
+            cli.uncap = true;
+        } else if (std.mem.eql(u8, a, "--capture")) {
+            cli.capture = true;
+        } else if (std.mem.eql(u8, a, "--soak")) {
+            const v = args.next() orelse return error.MissingSoakValue;
+            cli.soak_seconds = try std.fmt.parseFloat(f32, v);
+        }
     }
     return cli;
 }
+
+/// Per-frame pose telemetry for the M3.5 stability gate. Tracks running
+/// extrema and counts NaN appearances; bounded numbers across a 5-min run
+/// are the gate.
+const SoakStats = struct {
+    samples: u64 = 0,
+    nan_count: u64 = 0,
+
+    pos_min: [3]f32 = .{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) },
+    pos_max: [3]f32 = .{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) },
+    speed_max: f32 = 0,
+    angvel_max: f32 = 0,
+
+    fn observe(self: *SoakStats, pos: [3]f32, lin_v: [3]f32, ang_v: [3]f32) void {
+        self.samples += 1;
+        for (pos) |c| if (std.math.isNan(c)) {
+            self.nan_count += 1;
+            return;
+        };
+        for (lin_v) |c| if (std.math.isNan(c)) {
+            self.nan_count += 1;
+            return;
+        };
+        for (ang_v) |c| if (std.math.isNan(c)) {
+            self.nan_count += 1;
+            return;
+        };
+        for (0..3) |i| {
+            if (pos[i] < self.pos_min[i]) self.pos_min[i] = pos[i];
+            if (pos[i] > self.pos_max[i]) self.pos_max[i] = pos[i];
+        }
+        const speed = @sqrt(lin_v[0] * lin_v[0] + lin_v[1] * lin_v[1] + lin_v[2] * lin_v[2]);
+        const angsp = @sqrt(ang_v[0] * ang_v[0] + ang_v[1] * ang_v[1] + ang_v[2] * ang_v[2]);
+        if (speed > self.speed_max) self.speed_max = speed;
+        if (angsp > self.angvel_max) self.angvel_max = angsp;
+    }
+
+    fn report(self: SoakStats, duration_s: f32) void {
+        std.log.info(
+            \\soak: {d:.1}s, {d} samples, {d} NaN
+            \\  pos x: [{d:.2}, {d:.2}]
+            \\  pos y: [{d:.2}, {d:.2}]
+            \\  pos z: [{d:.2}, {d:.2}]
+            \\  max |lin v|: {d:.2} m/s
+            \\  max |ang v|: {d:.2} rad/s
+        , .{
+            duration_s,           self.samples,
+            self.nan_count,
+            self.pos_min[0],      self.pos_max[0],
+            self.pos_min[1],      self.pos_max[1],
+            self.pos_min[2],      self.pos_max[2],
+            self.speed_max,
+            self.angvel_max,
+        });
+    }
+};
 
 const PerfWindow = struct {
     accum_ns: u64 = 0,
