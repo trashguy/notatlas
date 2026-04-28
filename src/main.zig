@@ -36,6 +36,7 @@ const box_frag_shader_path = "assets/shaders/box.frag";
 /// to the deck through pitches/rolls — the same SoT-style composition the
 /// player camera uses, but rendered as actual visible bodies.
 const npc_pax_count: u32 = 3;
+const pax_total_count: u32 = 1 + npc_pax_count;
 
 const Scene = struct {
     ocean: *render.Ocean,
@@ -236,6 +237,7 @@ pub fn main() !void {
     var t: f32 = 0.0;
     var soak_stats: SoakStats = .{};
     var wind_soak: WindSoakStats = .{};
+    var pax_soak: PaxSoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -299,6 +301,27 @@ pub fn main() !void {
                 const ang_v = phys.getAngularVelocity(box_id) orelse .{ 0, 0, 0 };
                 soak_stats.observe(pose_curr_pos, lin_v, ang_v);
                 wind_soak.observe(wind_params, phys_t);
+
+                // M5.6 — observe the composed world eye for player + each
+                // NPC pax. Builds the same `Pose` shape main passes to
+                // worldEye at render time, but uses pose_curr (just-stepped,
+                // deterministic at this tick boundary — no interpolation).
+                // Catches NaN, unbounded growth, and per-tick teleports
+                // through the SoT composition.
+                const tick_ship_pose: notatlas.player.Pose = .{
+                    .pos = notatlas.math.Vec3.init(pose_curr_pos[0], pose_curr_pos[1], pose_curr_pos[2]),
+                    .rot = pose_curr_rot,
+                };
+                var eyes: [pax_total_count][3]f32 = undefined;
+                {
+                    const e = player.worldEye(tick_ship_pose);
+                    eyes[0] = .{ e.x, e.y, e.z };
+                }
+                for (0..npc_pax_count) |i| {
+                    const e = npc_pax[i].worldEye(tick_ship_pose);
+                    eyes[1 + i] = .{ e.x, e.y, e.z };
+                }
+                pax_soak.observe(&eyes);
             }
             phys_accum -= phys_dt_fixed;
         }
@@ -457,6 +480,7 @@ pub fn main() !void {
     if (cli.soak_seconds > 0) {
         soak_stats.report(t);
         wind_soak.report(wind_params, t);
+        pax_soak.report(t);
     }
 }
 
@@ -851,6 +875,64 @@ const WindSoakStats = struct {
             const expected = p.storms[i].speed_mps * duration_s;
             std.log.info("  storm[{d}]: path={d:.1} m, max-step={d:.4} m, expected drift={d:.1} m", .{
                 i, self.storm_path_length[i], self.storm_max_step[i], expected,
+            });
+        }
+    }
+};
+
+/// M5.6 stability gate for the M5 SoT composition. Each tick, observes the
+/// world-space eye position for the player + each NPC pax — the value
+/// `player.worldEye(ship_pose)` produces against the just-stepped (not
+/// interpolated) ship pose. Tracks per-pax y range (sanity-bounds the
+/// composition output against the wave amplitude + eye height) plus the
+/// max single-tick eye delta (catches teleports / NaN-induced jumps that
+/// wouldn't show up in M3.5's box-pose-only soak).
+///
+/// Pass criteria (informal — the user reads the log):
+///   - `nan_count` is 0
+///   - `y_max - y_min` consistent with the storm preset's ±5 m wave bound
+///     plus the player's eye-height offset (~3.7 m above local-y=0)
+///   - `max_step` per pax << ship motion, since the per-tick ship delta
+///     itself is bounded by the integrator (~10 m/s × 1/60 s ≈ 0.17 m).
+const PaxSoakStats = struct {
+    samples: u64 = 0,
+    nan_count: u64 = 0,
+    pax_count: u32 = 0,
+    y_min: [pax_total_count]f32 = .{std.math.floatMax(f32)} ** pax_total_count,
+    y_max: [pax_total_count]f32 = .{-std.math.floatMax(f32)} ** pax_total_count,
+    max_step: [pax_total_count]f32 = .{0} ** pax_total_count,
+    last_eye: [pax_total_count][3]f32 = .{.{ 0, 0, 0 }} ** pax_total_count,
+
+    fn observe(self: *PaxSoakStats, eyes: *const [pax_total_count][3]f32) void {
+        const first = self.samples == 0;
+        if (first) self.pax_count = pax_total_count;
+        for (eyes, 0..) |eye, i| {
+            if (std.math.isNan(eye[0]) or std.math.isNan(eye[1]) or std.math.isNan(eye[2])) {
+                self.nan_count += 1;
+                continue;
+            }
+            if (eye[1] < self.y_min[i]) self.y_min[i] = eye[1];
+            if (eye[1] > self.y_max[i]) self.y_max[i] = eye[1];
+            if (!first) {
+                const dx = eye[0] - self.last_eye[i][0];
+                const dy = eye[1] - self.last_eye[i][1];
+                const dz = eye[2] - self.last_eye[i][2];
+                const step = @sqrt(dx * dx + dy * dy + dz * dz);
+                if (step > self.max_step[i]) self.max_step[i] = step;
+            }
+            self.last_eye[i] = eye;
+        }
+        self.samples += 1;
+    }
+
+    fn report(self: PaxSoakStats, duration_s: f32) void {
+        std.log.info(
+            \\pax soak: {d:.1}s, {d} samples, {d} NaN, {d} pax tracked
+        , .{ duration_s, self.samples, self.nan_count, self.pax_count });
+        for (0..self.pax_count) |i| {
+            const role = if (i == 0) "player" else "npc";
+            std.log.info("  pax[{d}] ({s}): world_eye y∈[{d:.2},{d:.2}] max_step={d:.4} m", .{
+                i, role, self.y_min[i], self.y_max[i], self.max_step[i],
             });
         }
     }

@@ -256,18 +256,21 @@ test "load box hull.yaml round-trips fields and 8 sample points" {
     const hull = try loadHullFromFile(testing.allocator, abs);
     defer hull.deinit(testing.allocator);
 
+    // Updated at M5.5 to a 4 × 2.5 × 6 m rectangle (more boat-like than
+    // the original 4 m cube). 2×2×2 sample grid still spans the volume.
     try testing.expectEqual(@as(f32, 2.0), hull.half_extents[0]);
-    try testing.expectEqual(@as(f32, 2.0), hull.half_extents[1]);
-    try testing.expectEqual(@as(f32, 2.0), hull.half_extents[2]);
-    try testing.expectEqual(@as(f32, 16000.0), hull.mass_kg);
-    try testing.expectEqual(@as(f32, 1.0), hull.cell_half_height);
-    try testing.expectEqual(@as(f32, 4.0), hull.cell_cross_section);
+    try testing.expectEqual(@as(f32, 1.25), hull.half_extents[1]);
+    try testing.expectEqual(@as(f32, 3.0), hull.half_extents[2]);
+    try testing.expectEqual(@as(f32, 15000.0), hull.mass_kg);
+    try testing.expectEqual(@as(f32, 0.625), hull.cell_half_height);
+    try testing.expectEqual(@as(f32, 6.0), hull.cell_cross_section);
     try testing.expectEqual(@as(f32, 15000.0), hull.drag_per_point);
 
-    // 2×2×2 grid: 8 corners of {±1,±1,±1}.
     try testing.expectEqual(@as(usize, 8), hull.sample_points.len);
     for (hull.sample_points) |p| {
-        for (p) |c| try testing.expect(c == 1.0 or c == -1.0);
+        try testing.expect(p[0] == 1.0 or p[0] == -1.0);
+        try testing.expect(p[1] == 0.625 or p[1] == -0.625);
+        try testing.expect(p[2] == 1.5 or p[2] == -1.5);
     }
 }
 
