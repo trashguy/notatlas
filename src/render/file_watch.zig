@@ -20,10 +20,11 @@ pub const Events = packed struct {
     wave: bool = false,
     ocean: bool = false,
     hull: bool = false,
+    wind: bool = false,
     shader: bool = false,
 
     pub fn any(self: Events) bool {
-        return self.wave or self.ocean or self.hull or self.shader;
+        return self.wave or self.ocean or self.hull or self.wind or self.shader;
     }
 };
 
@@ -100,6 +101,7 @@ pub const Watcher = struct {
                 const name = ev.getName() orelse continue;
                 if (ev.wd == self.wd_data) {
                     if (std.mem.eql(u8, name, "ocean.yaml")) events.ocean = true;
+                    if (std.mem.eql(u8, name, "wind.yaml")) events.wind = true;
                 } else if (ev.wd == self.wd_waves) {
                     if (std.mem.eql(u8, name, self.wave_basename)) events.wave = true;
                 } else if (ev.wd == self.wd_ships) {

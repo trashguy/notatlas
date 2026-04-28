@@ -1,0 +1,30 @@
+# Wind-field config — drives wind_query.zig.
+# Two layers: a tactical global wind (base + shift), and storm cells
+# that perturb it. Each storm is an addressable entity; per-cell
+# strength/radius/speed/vortex_mix lets future fog/visibility/audio
+# coupling treat each storm individually. Spawn position and drift
+# direction are hash-derived from (seed, cell_index).
+# ymlz: no blank lines; fields read in declaration order.
+seed: 2003
+base_speed_mps: 12.0
+base_direction_rad: 0.7
+shift_period_s: 180.0
+shift_amplitude_rad: 0.6
+storm_world_m: 4096.0
+storms:
+  - radius_m: 300.0
+    strength_mps: 10.0
+    speed_mps: 6.0
+    vortex_mix: 0.2
+  - radius_m: 300.0
+    strength_mps: 10.0
+    speed_mps: 6.0
+    vortex_mix: 0.2
+  - radius_m: 300.0
+    strength_mps: 10.0
+    speed_mps: 6.0
+    vortex_mix: 0.2
+  - radius_m: 300.0
+    strength_mps: 10.0
+    speed_mps: 6.0
+    vortex_mix: 0.2

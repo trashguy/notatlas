@@ -8,6 +8,7 @@
 const std = @import("std");
 const ymlz = @import("ymlz");
 const wave = @import("wave_query.zig");
+const wind = @import("wind_query.zig");
 const ocean_params_mod = @import("ocean_params.zig");
 const hull_mod = @import("hull_params.zig");
 
@@ -147,6 +148,54 @@ pub fn loadHullFromFile(gpa: Allocator, abs_path: []const u8) !hull_mod.HullPara
 }
 
 // ------------------------------------------------------------
+// data/wind.yaml
+// ------------------------------------------------------------
+
+const RawWindStorm = struct {
+    radius_m: f32,
+    strength_mps: f32,
+    speed_mps: f32,
+    vortex_mix: f32,
+};
+
+const RawWindParams = struct {
+    seed: u64,
+    base_speed_mps: f32,
+    base_direction_rad: f32,
+    shift_period_s: f32,
+    shift_amplitude_rad: f32,
+    storm_world_m: f32,
+    storms: []RawWindStorm,
+};
+
+/// Parse a wind YAML and return params with storms copied into a
+/// caller-owned slice. Caller frees via `WindParams.deinit(gpa)`.
+pub fn loadWindFromFile(gpa: Allocator, abs_path: []const u8) !wind.WindParams {
+    var parser = try ymlz.Ymlz(RawWindParams).init(gpa);
+    const raw = try parser.loadFile(abs_path);
+    defer parser.deinit(raw);
+
+    const cells = try gpa.alloc(wind.WindStorm, raw.storms.len);
+    errdefer gpa.free(cells);
+    for (raw.storms, 0..) |s, i| cells[i] = .{
+        .radius_m = s.radius_m,
+        .strength_mps = s.strength_mps,
+        .speed_mps = s.speed_mps,
+        .vortex_mix = s.vortex_mix,
+    };
+
+    return .{
+        .seed = raw.seed,
+        .base_speed_mps = raw.base_speed_mps,
+        .base_direction_rad = raw.base_direction_rad,
+        .shift_period_s = raw.shift_period_s,
+        .shift_amplitude_rad = raw.shift_amplitude_rad,
+        .storm_world_m = raw.storm_world_m,
+        .storms = cells,
+    };
+}
+
+// ------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------
 
@@ -219,6 +268,47 @@ test "load box hull.yaml round-trips fields and 8 sample points" {
     try testing.expectEqual(@as(usize, 8), hull.sample_points.len);
     for (hull.sample_points) |p| {
         for (p) |c| try testing.expect(c == 1.0 or c == -1.0);
+    }
+}
+
+test "load wind.yaml matches storm preset fixture" {
+    const abs = try std.fs.cwd().realpathAlloc(testing.allocator, "data/wind.yaml");
+    defer testing.allocator.free(abs);
+    const loaded = try loadWindFromFile(testing.allocator, abs);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(wind.storm.seed, loaded.seed);
+    try testing.expectEqual(wind.storm.base_speed_mps, loaded.base_speed_mps);
+    try testing.expectEqual(wind.storm.base_direction_rad, loaded.base_direction_rad);
+    try testing.expectEqual(wind.storm.shift_period_s, loaded.shift_period_s);
+    try testing.expectEqual(wind.storm.shift_amplitude_rad, loaded.shift_amplitude_rad);
+    try testing.expectEqual(wind.storm.storm_world_m, loaded.storm_world_m);
+    try testing.expectEqual(wind.storm.storms.len, loaded.storms.len);
+    for (wind.storm.storms, loaded.storms) |w, l| {
+        try testing.expectEqual(w.radius_m, l.radius_m);
+        try testing.expectEqual(w.strength_mps, l.strength_mps);
+        try testing.expectEqual(w.speed_mps, l.speed_mps);
+        try testing.expectEqual(w.vortex_mix, l.vortex_mix);
+    }
+}
+
+test "loaded wind produces same windAt as preset" {
+    const abs = try std.fs.cwd().realpathAlloc(testing.allocator, "data/wind.yaml");
+    defer testing.allocator.free(abs);
+    const loaded = try loadWindFromFile(testing.allocator, abs);
+    defer loaded.deinit(testing.allocator);
+
+    var rng = std.Random.DefaultPrng.init(0xBEEF);
+    const r = rng.random();
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const x = (r.float(f32) - 0.5) * 4000.0;
+        const z = (r.float(f32) - 0.5) * 4000.0;
+        const t = r.float(f32) * 600.0;
+        const a = wind.windAt(wind.storm, x, z, t);
+        const b = wind.windAt(loaded, x, z, t);
+        try testing.expectEqual(a[0], b[0]);
+        try testing.expectEqual(a[1], b[1]);
     }
 }
 

@@ -9,27 +9,41 @@
 //!      ships in the same combat feel the same wind — the "weather gauge"
 //!      tactic survives. Atlas-flavored.
 //!
-//!   2. Storm-cell terrain. N translating Gaussian blobs that perturb the
-//!      base wind locally. Each cell has a hash-derived gust direction;
-//!      its contribution is a coherent gust pointing that way. Sailors
-//!      route around (or through) storm cells the way they'd treat a
-//!      headwind region.
+//!   2. Storm-cell terrain. A slice of `WindStorm` cells; each is an
+//!      addressable entity (id = index) with its own radius, strength,
+//!      drift speed, and vortex mix. Each cell has a hash-derived gust
+//!      direction and drift heading from `(seed, index)`; spawn position
+//!      is also hash-derived. Their contribution is a coherent gust
+//!      pointing in the cell's gust direction, blendable with a tangent
+//!      cyclone term via per-cell `vortex_mix`. Sailors route around (or
+//!      through) storm cells the way they'd treat a headwind region.
 //!
-//! `storm_vortex_mix ∈ [0, 1]` blends each cell's contribution between
-//! pure gust (0, Atlas-style) and pure cyclone (1, tangent flow with
-//! a calm eye). The vortex term is rescaled by √e so peak magnitude is
+//! `vortex_mix ∈ [0, 1]` blends each cell's contribution between pure
+//! gust (0, Atlas-style) and pure cyclone (1, tangent flow with a calm
+//! eye). The vortex term is rescaled by √e so peak magnitude is
 //! `strength` at either endpoint — turning the knob never weakens storms.
-//! Mid values give "gust with a hint of swirl"; the storm preset uses 0.5.
 //!
-//! Storm centers translate at constant velocity on a torus of size
-//! `storm_world_m`; spawn positions and drift directions come from a
-//! splitmix64-style hash of `(seed, cell_index)` so `windAt` is a pure
-//! function of its inputs — no per-storm state.
+//! The slice is laid out so every cell shares the same `seed` and the
+//! same toroidal `storm_world_m`; per-cell fields drive *what* the storm
+//! does, hash-derived per-cell properties drive *where it is*. This keeps
+//! YAML compact while making each storm individually addressable for the
+//! visibility / stealth / audio queries that will follow (see
+//! `design_storms_as_cover.md`).
 //!
 //! Output is `[2]f32 = {wind_x, wind_z}` — horizontal components in world
 //! axes. Vertical wind is implicitly zero in this model.
 
 const std = @import("std");
+
+/// Per-cell storm configuration. The slice is owned by whoever built the
+/// `WindParams`; presets reference a const-data-segment array, YAML-loaded
+/// params own a heap allocation freed by `WindParams.deinit`.
+pub const WindStorm = struct {
+    radius_m: f32,
+    strength_mps: f32,
+    speed_mps: f32,
+    vortex_mix: f32,
+};
 
 pub const WindParams = struct {
     seed: u64,
@@ -47,24 +61,17 @@ pub const WindParams = struct {
 
     // ---- Terrain layer (storms) ----
 
-    /// Number of active storm cells. All evaluated every `windAt` call;
-    /// keep small (≤ 8) — cost is O(N) per query.
-    storm_count: u32,
-    /// Gaussian sigma in meters. Influence is essentially zero past ~3σ.
-    /// Pick `storm_world_m` ≥ ~6σ so toroidal wraps don't bleed into view.
-    storm_radius_m: f32,
-    /// Peak magnitude a storm adds, in m/s. Holds at either mix endpoint.
-    storm_strength_mps: f32,
-    /// Speed (m/s) at which storm centers translate. Direction per cell
-    /// is hash-derived from (seed, cell_index).
-    storm_speed_mps: f32,
     /// Storm centers wrap toroidally inside a square of this size; spawn
     /// positions are uniformly distributed within the square.
     storm_world_m: f32,
-    /// Blend between coherent gust (0.0) and cyclone vortex (1.0). 0 is
-    /// the Atlas-flavored default; 0.3-0.6 keeps a tactical gust direction
-    /// with visible swirl; 1.0 is the meteorological cyclone.
-    storm_vortex_mix: f32,
+    /// One entry per storm cell. Empty = no storms.
+    storms: []WindStorm,
+
+    /// Free the storms slice. Only call on YAML-loaded params; preset
+    /// values point at module-const data and must not be passed here.
+    pub fn deinit(self: WindParams, gpa: std.mem.Allocator) void {
+        gpa.free(self.storms);
+    }
 };
 
 /// SplitMix64-style hash to f32 in [0, 1). Pure function of (seed, idx, salt);
@@ -96,6 +103,22 @@ fn wrapTorus(v: f32, world: f32) f32 {
 /// dialing `vortex_mix` toward 1 would silently weaken storms by ~40%.
 const sqrt_e: f32 = 1.6487213;
 
+/// Position of storm cell `i` at time `t`, on the toroidal world. Returns
+/// `{cx, cz}` in world axes, in the canonical `[-world/2, +world/2)` range.
+/// Used by the kernel and exposed publicly for fog / visibility / stealth
+/// queries that need to know "where is storm i right now?".
+pub fn stormCenter(p: WindParams, i: usize, t: f32) [2]f32 {
+    if (i >= p.storms.len) return .{ 0, 0 };
+    const idx32: u32 = @intCast(i);
+    const cell = p.storms[i];
+    const sx0 = (hash01(p.seed, idx32, 0xA1) - 0.5) * p.storm_world_m;
+    const sz0 = (hash01(p.seed, idx32, 0xB2) - 0.5) * p.storm_world_m;
+    const drift_angle = hash01(p.seed, idx32, 0xC3) * std.math.tau;
+    const cx = wrapTorus(sx0 + @cos(drift_angle) * cell.speed_mps * t, p.storm_world_m);
+    const cz = wrapTorus(sz0 + @sin(drift_angle) * cell.speed_mps * t, p.storm_world_m);
+    return .{ cx, cz };
+}
+
 /// Horizontal wind at (x, z) at time t. Returns {wind_x, wind_z}.
 pub fn windAt(p: WindParams, x: f32, z: f32, t: f32) [2]f32 {
     var dir = p.base_direction_rad;
@@ -105,25 +128,28 @@ pub fn windAt(p: WindParams, x: f32, z: f32, t: f32) [2]f32 {
     var wx: f32 = @cos(dir) * p.base_speed_mps;
     var wz: f32 = @sin(dir) * p.base_speed_mps;
 
-    if (p.storm_count == 0 or p.storm_radius_m <= 0) return .{ wx, wz };
+    if (p.storms.len == 0) return .{ wx, wz };
 
-    const sigma = p.storm_radius_m;
-    const inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
-    const inv_sigma = 1.0 / sigma;
     const world = p.storm_world_m;
-    const mix = std.math.clamp(p.storm_vortex_mix, 0.0, 1.0);
-    const gust_w = 1.0 - mix;
-    const vortex_w = mix * sqrt_e;
 
-    var i: u32 = 0;
-    while (i < p.storm_count) : (i += 1) {
-        const sx0 = (hash01(p.seed, i, 0xA1) - 0.5) * world;
-        const sz0 = (hash01(p.seed, i, 0xB2) - 0.5) * world;
-        const drift_angle = hash01(p.seed, i, 0xC3) * std.math.tau;
-        const gust_angle = hash01(p.seed, i, 0xC4) * std.math.tau;
+    for (p.storms, 0..) |cell, i| {
+        if (cell.radius_m <= 0) continue;
+        const idx32: u32 = @intCast(i);
 
-        const cx = wrapTorus(sx0 + @cos(drift_angle) * p.storm_speed_mps * t, world);
-        const cz = wrapTorus(sz0 + @sin(drift_angle) * p.storm_speed_mps * t, world);
+        const sigma = cell.radius_m;
+        const inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+        const inv_sigma = 1.0 / sigma;
+        const mix = std.math.clamp(cell.vortex_mix, 0.0, 1.0);
+        const gust_w = 1.0 - mix;
+        const vortex_w = mix * sqrt_e;
+
+        const sx0 = (hash01(p.seed, idx32, 0xA1) - 0.5) * world;
+        const sz0 = (hash01(p.seed, idx32, 0xB2) - 0.5) * world;
+        const drift_angle = hash01(p.seed, idx32, 0xC3) * std.math.tau;
+        const gust_angle = hash01(p.seed, idx32, 0xC4) * std.math.tau;
+
+        const cx = wrapTorus(sx0 + @cos(drift_angle) * cell.speed_mps * t, world);
+        const cz = wrapTorus(sz0 + @sin(drift_angle) * cell.speed_mps * t, world);
 
         const dx = wrapTorus(x - cx, world);
         const dz = wrapTorus(z - cz, world);
@@ -136,7 +162,7 @@ pub fn windAt(p: WindParams, x: f32, z: f32, t: f32) [2]f32 {
         // the center smooth cancels out of the unit-tangent normalization,
         // leaving a contribution that is exactly zero at the eye and peaks
         // on the σ ring. The √e rescale keeps mix=1 peak == mix=0 peak.
-        const k = p.storm_strength_mps * falloff;
+        const k = cell.strength_mps * falloff;
         wx += k * (gust_w * @cos(gust_angle) + vortex_w * (-dz) * inv_sigma);
         wz += k * (gust_w * @sin(gust_angle) + vortex_w * (dx) * inv_sigma);
     }
@@ -145,9 +171,24 @@ pub fn windAt(p: WindParams, x: f32, z: f32, t: f32) [2]f32 {
 }
 
 // ------------------------------------------------------------
-// Hand-coded preset fixtures. Will mirror `data/wind.yaml` once M4.2
-// adds the loader; for M4.1 they're the only source.
+// Hand-coded preset fixtures. Mirror `data/wind.yaml`. The storm
+// arrays are module-level vars so a const `WindParams` can hold a
+// non-const slice into them; nothing actually mutates the arrays.
 // ------------------------------------------------------------
+
+var calm_storms = [_]WindStorm{};
+
+var breezy_storms = [_]WindStorm{
+    .{ .radius_m = 250.0, .strength_mps = 4.0, .speed_mps = 3.0, .vortex_mix = 0.0 },
+    .{ .radius_m = 250.0, .strength_mps = 4.0, .speed_mps = 3.0, .vortex_mix = 0.0 },
+};
+
+var storm_storms = [_]WindStorm{
+    .{ .radius_m = 300.0, .strength_mps = 10.0, .speed_mps = 6.0, .vortex_mix = 0.2 },
+    .{ .radius_m = 300.0, .strength_mps = 10.0, .speed_mps = 6.0, .vortex_mix = 0.2 },
+    .{ .radius_m = 300.0, .strength_mps = 10.0, .speed_mps = 6.0, .vortex_mix = 0.2 },
+    .{ .radius_m = 300.0, .strength_mps = 10.0, .speed_mps = 6.0, .vortex_mix = 0.2 },
+};
 
 pub const calm: WindParams = .{
     .seed = 2001,
@@ -155,12 +196,8 @@ pub const calm: WindParams = .{
     .base_direction_rad = 0.0,
     .shift_period_s = 600.0,
     .shift_amplitude_rad = 0.2,
-    .storm_count = 0,
-    .storm_radius_m = 200.0,
-    .storm_strength_mps = 0.0,
-    .storm_speed_mps = 0.0,
     .storm_world_m = 4096.0,
-    .storm_vortex_mix = 0.0,
+    .storms = &calm_storms,
 };
 
 pub const breezy: WindParams = .{
@@ -169,12 +206,8 @@ pub const breezy: WindParams = .{
     .base_direction_rad = 0.3,
     .shift_period_s = 300.0,
     .shift_amplitude_rad = 0.4,
-    .storm_count = 2,
-    .storm_radius_m = 250.0,
-    .storm_strength_mps = 4.0,
-    .storm_speed_mps = 3.0,
     .storm_world_m = 4096.0,
-    .storm_vortex_mix = 0.0,
+    .storms = &breezy_storms,
 };
 
 pub const storm: WindParams = .{
@@ -183,12 +216,8 @@ pub const storm: WindParams = .{
     .base_direction_rad = 0.7,
     .shift_period_s = 180.0,
     .shift_amplitude_rad = 0.6,
-    .storm_count = 4,
-    .storm_radius_m = 300.0,
-    .storm_strength_mps = 10.0,
-    .storm_speed_mps = 6.0,
     .storm_world_m = 4096.0,
-    .storm_vortex_mix = 0.2,
+    .storms = &storm_storms,
 };
 
 // ------------------------------------------------------------
@@ -226,7 +255,6 @@ test "determinism: storm" {
 
 test "no storms: magnitude equals base_speed_mps everywhere" {
     var p = calm;
-    p.storm_count = 0;
     p.shift_period_s = 0;
     p.base_direction_rad = 0;
     p.base_speed_mps = 7.5;
@@ -246,28 +274,23 @@ test "no storms: magnitude equals base_speed_mps everywhere" {
 
 test "wind shift: direction wobbles ±amplitude over shift period" {
     var p = calm;
-    p.storm_count = 0;
     p.shift_period_s = 100;
     p.shift_amplitude_rad = 0.3;
     p.base_direction_rad = 0;
     p.base_speed_mps = 1.0;
 
-    // t=0: dir = base = 0 → +x
     const w0 = windAt(p, 0, 0, 0);
     try testing.expectApproxEqAbs(@as(f32, 1), w0[0], 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 0), w0[1], 1e-5);
 
-    // t=period/4: dir = +amplitude
     const wq = windAt(p, 0, 0, 25);
     try testing.expectApproxEqAbs(@cos(@as(f32, 0.3)), wq[0], 1e-5);
     try testing.expectApproxEqAbs(@sin(@as(f32, 0.3)), wq[1], 1e-5);
 
-    // t=period/2: back to base
     const wh = windAt(p, 0, 0, 50);
     try testing.expectApproxEqAbs(@as(f32, 1), wh[0], 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 0), wh[1], 1e-5);
 
-    // t=3·period/4: dir = -amplitude
     const wt = windAt(p, 0, 0, 75);
     try testing.expectApproxEqAbs(@cos(@as(f32, -0.3)), wt[0], 1e-5);
     try testing.expectApproxEqAbs(@sin(@as(f32, -0.3)), wt[1], 1e-5);
@@ -275,7 +298,6 @@ test "wind shift: direction wobbles ±amplitude over shift period" {
 
 test "shift_period_s=0 freezes direction" {
     var p = calm;
-    p.storm_count = 0;
     p.shift_period_s = 0;
     p.base_direction_rad = 0;
     p.base_speed_mps = 1.0;
@@ -295,20 +317,30 @@ test "different seeds produce different storm fields" {
     try testing.expect(wa[0] != wb[0] or wa[1] != wb[1]);
 }
 
-test "gust storm peak ≈ strength at the eye (vortex_mix=0)" {
-    const p: WindParams = .{
-        .seed = 0xDEADBEEF,
+// Single-storm helpers — mutate a stack-local array so we can swap
+// vortex_mix without needing the YAML loader.
+fn singleStormParams(seed: u64, world: f32, cell: WindStorm, storms_buf: *[1]WindStorm) WindParams {
+    storms_buf.* = .{cell};
+    return .{
+        .seed = seed,
         .base_speed_mps = 0,
         .base_direction_rad = 0,
         .shift_period_s = 0,
         .shift_amplitude_rad = 0,
-        .storm_count = 1,
-        .storm_radius_m = 200,
-        .storm_strength_mps = 10,
-        .storm_speed_mps = 0,
-        .storm_world_m = 4000,
-        .storm_vortex_mix = 0.0,
+        .storm_world_m = world,
+        .storms = storms_buf,
     };
+}
+
+test "gust storm peak ≈ strength at the eye (vortex_mix=0)" {
+    var buf: [1]WindStorm = undefined;
+    const p = singleStormParams(0xDEADBEEF, 4000, .{
+        .radius_m = 200,
+        .strength_mps = 10,
+        .speed_mps = 0,
+        .vortex_mix = 0.0,
+    }, &buf);
+
     var max_mag: f32 = 0;
     var x: f32 = -2000;
     while (x <= 2000) : (x += 25) {
@@ -319,26 +351,19 @@ test "gust storm peak ≈ strength at the eye (vortex_mix=0)" {
             if (m > max_mag) max_mag = m;
         }
     }
-    // Gust peaks at r=0 with magnitude == strength. 25 m grid → at worst
-    // √2·12.5 ≈ 18 m from true center → falloff ≥ exp(-324/80000) ≈ 0.996.
     try testing.expect(max_mag > 9.5);
     try testing.expect(max_mag <= 10.0);
 }
 
 test "vortex storm peak ≈ strength on σ ring (vortex_mix=1)" {
-    const p: WindParams = .{
-        .seed = 0xDEADBEEF,
-        .base_speed_mps = 0,
-        .base_direction_rad = 0,
-        .shift_period_s = 0,
-        .shift_amplitude_rad = 0,
-        .storm_count = 1,
-        .storm_radius_m = 200,
-        .storm_strength_mps = 10,
-        .storm_speed_mps = 0,
-        .storm_world_m = 4000,
-        .storm_vortex_mix = 1.0,
-    };
+    var buf: [1]WindStorm = undefined;
+    const p = singleStormParams(0xDEADBEEF, 4000, .{
+        .radius_m = 200,
+        .strength_mps = 10,
+        .speed_mps = 0,
+        .vortex_mix = 1.0,
+    }, &buf);
+
     var max_mag: f32 = 0;
     var x: f32 = -2000;
     while (x <= 2000) : (x += 25) {
@@ -349,30 +374,19 @@ test "vortex storm peak ≈ strength on σ ring (vortex_mix=1)" {
             if (m > max_mag) max_mag = m;
         }
     }
-    // With the √e rescale, vortex peak magnitude is also strength at r=σ.
     try testing.expect(max_mag > 9.5);
     try testing.expect(max_mag <= 10.0);
 }
 
 test "storm influence ~zero at the torus antipode" {
-    // On a toroidal world there's no "infinity" — instead the farthest
-    // a query point can be from a storm center is the antipode, at
-    // distance √2 · world/2. With world=8000, σ=200 that's ≈ 5.66 km
-    // ≈ 28 σ; the *minimum* magnitude sampled across the torus must be
-    // near zero for any vortex_mix.
-    const p: WindParams = .{
-        .seed = 0xDEADBEEF,
-        .base_speed_mps = 0,
-        .base_direction_rad = 0,
-        .shift_period_s = 0,
-        .shift_amplitude_rad = 0,
-        .storm_count = 1,
-        .storm_radius_m = 200,
-        .storm_strength_mps = 10,
-        .storm_speed_mps = 0,
-        .storm_world_m = 8000,
-        .storm_vortex_mix = 0.5,
-    };
+    var buf: [1]WindStorm = undefined;
+    const p = singleStormParams(0xDEADBEEF, 8000, .{
+        .radius_m = 200,
+        .strength_mps = 10,
+        .speed_mps = 0,
+        .vortex_mix = 0.5,
+    }, &buf);
+
     var min_mag: f32 = std.math.floatMax(f32);
     var x: f32 = -4000;
     while (x <= 4000) : (x += 200) {
@@ -402,10 +416,11 @@ test "no NaN over wide grid and time range" {
     }
 }
 
-test "bounded magnitude: ≤ base_speed + N·strength" {
+test "bounded magnitude: ≤ base_speed + Σ strength" {
     const p = storm;
-    const cap = p.base_speed_mps +
-        @as(f32, @floatFromInt(p.storm_count)) * p.storm_strength_mps;
+    var sum_strength: f32 = 0;
+    for (p.storms) |c| sum_strength += c.strength_mps;
+    const cap = p.base_speed_mps + sum_strength;
 
     var rng = std.Random.DefaultPrng.init(0xFEED);
     const r = rng.random();
@@ -420,52 +435,64 @@ test "bounded magnitude: ≤ base_speed + N·strength" {
     }
 }
 
-test "storm centers translate over time" {
-    // Single gust storm; the peak sits exactly at the storm center, so
-    // findPeak tracks the cell. With drift_speed=5 the storm moves 300 m
-    // in 60 s, which must register as > 100 m of peak motion (loose,
-    // covers grid quantization and possible toroidal wrap).
-    const p: WindParams = .{
-        .seed = 0x12345,
-        .base_speed_mps = 0,
-        .base_direction_rad = 0,
-        .shift_period_s = 0,
-        .shift_amplitude_rad = 0,
-        .storm_count = 1,
-        .storm_radius_m = 200,
-        .storm_strength_mps = 10,
-        .storm_speed_mps = 5,
-        .storm_world_m = 4000,
-        .storm_vortex_mix = 0.0,
-    };
+test "stormCenter matches kernel-internal storm position over time" {
+    var buf: [1]WindStorm = undefined;
+    const p = singleStormParams(0x12345, 4000, .{
+        .radius_m = 200,
+        .strength_mps = 10,
+        .speed_mps = 5,
+        .vortex_mix = 0.0,
+    }, &buf);
 
-    const peak0 = findPeak(p, 0);
-    const peak1 = findPeak(p, 60);
-    const dx = peak1.x - peak0.x;
-    const dz = peak1.z - peak0.z;
-    const moved = @sqrt(dx * dx + dz * dz);
-    try testing.expect(moved > 100.0);
-}
-
-const Peak = struct { x: f32, z: f32 };
-
-fn findPeak(p: WindParams, t: f32) Peak {
-    var max_mag: f32 = -1;
-    var px: f32 = 0;
-    var pz: f32 = 0;
-    const half = p.storm_world_m * 0.5;
-    var x: f32 = -half;
-    while (x <= half) : (x += 50) {
-        var z: f32 = -half;
-        while (z <= half) : (z += 50) {
-            const w = windAt(p, x, z, t);
-            const m = w[0] * w[0] + w[1] * w[1];
-            if (m > max_mag) {
-                max_mag = m;
-                px = x;
-                pz = z;
+    // Probe a fine grid; the gust-mix=0 peak sits exactly at the storm
+    // center, so the location of max magnitude must be within √2·step/2
+    // of stormCenter().
+    const step: f32 = 25;
+    const times: [3]f32 = .{ 0, 30, 90 };
+    for (times) |t| {
+        const center = stormCenter(p, 0, t);
+        var max_mag2: f32 = -1;
+        var px: f32 = 0;
+        var pz: f32 = 0;
+        var x: f32 = -2000;
+        while (x <= 2000) : (x += step) {
+            var z: f32 = -2000;
+            while (z <= 2000) : (z += step) {
+                const w = windAt(p, x, z, t);
+                const m2 = w[0] * w[0] + w[1] * w[1];
+                if (m2 > max_mag2) {
+                    max_mag2 = m2;
+                    px = x;
+                    pz = z;
+                }
             }
         }
+        const ddx = px - center[0];
+        const ddz = pz - center[1];
+        const dist = @sqrt(ddx * ddx + ddz * ddz);
+        try testing.expect(dist < step * std.math.sqrt2);
     }
-    return .{ .x = px, .z = pz };
+}
+
+test "stormCenter translates over time at speed_mps" {
+    var buf: [1]WindStorm = undefined;
+    const p = singleStormParams(0x12345, 4000, .{
+        .radius_m = 200,
+        .strength_mps = 10,
+        .speed_mps = 5,
+        .vortex_mix = 0.0,
+    }, &buf);
+
+    const c0 = stormCenter(p, 0, 0);
+    const c1 = stormCenter(p, 0, 60);
+    var dx = c1[0] - c0[0];
+    var dz = c1[1] - c0[1];
+    // Account for one possible wrap.
+    if (dx > p.storm_world_m * 0.5) dx -= p.storm_world_m;
+    if (dx < -p.storm_world_m * 0.5) dx += p.storm_world_m;
+    if (dz > p.storm_world_m * 0.5) dz -= p.storm_world_m;
+    if (dz < -p.storm_world_m * 0.5) dz += p.storm_world_m;
+    const moved = @sqrt(dx * dx + dz * dz);
+    // 5 m/s × 60 s = 300 m. Allow a small fp tolerance.
+    try testing.expectApproxEqAbs(@as(f32, 300), moved, 0.5);
 }

@@ -14,6 +14,7 @@ const physics = @import("physics");
 const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
 const hull_config_path = "data/ships/box.yaml";
+const wind_config_path = "data/wind.yaml";
 const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
 const box_vert_shader_path = "assets/shaders/box.vert";
@@ -83,10 +84,11 @@ pub fn main() !void {
         .hull_basename = std.fs.path.basename(hull_config_path),
     });
     defer watcher.deinit();
-    std.log.info("hot-reload watching {s}, {s}, {s}, assets/shaders/*", .{
+    std.log.info("hot-reload watching {s}, {s}, {s}, {s}, assets/shaders/*", .{
         ocean_config_path,
         wave_config_path,
         hull_config_path,
+        wind_config_path,
     });
     std.log.info("present mode = {s}", .{if (cli.uncap) "MAILBOX (uncapped)" else "FIFO (vsync)"});
 
@@ -104,6 +106,13 @@ pub fn main() !void {
     // mass-properties path through our wrapper yet.
     var hull = try loadHull(gpa, hull_config_path);
     defer hull.deinit(gpa);
+
+    // Wind field is loaded but not yet driving any forces — sails land
+    // in M5. For M4.2 the value is logged ~1 Hz so hot-reload is visible
+    // and the YAML→kernel path is exercised on every run.
+    var wind_params = try loadWind(gpa, wind_config_path);
+    defer wind_params.deinit(gpa);
+    logWind(wind_params, 0.0);
 
     // M3.3: no static floor — the box floats on the wave heightfield,
     // which is the same scalar function the GPU raymarches. Body drops
@@ -152,7 +161,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &box, &hull, &buoy, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &box, &hull, &buoy, &wind_params, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -173,6 +182,7 @@ pub fn main() !void {
             std.log.info("phys: box pos=({d:.2},{d:.2},{d:.2}) vel=({d:.2},{d:.2},{d:.2})", .{
                 pos[0], pos[1], pos[2], vel[0], vel[1], vel[2],
             });
+            logWind(wind_params, t);
             phys_log_accum = 0;
         }
 
@@ -259,6 +269,23 @@ fn loadHull(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.hull_params.
     return notatlas.yaml_loader.loadHullFromFile(gpa, abs);
 }
 
+fn loadWind(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wind_query.WindParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadWindFromFile(gpa, abs);
+}
+
+/// Sample the wind at the origin and log direction + magnitude. Cheap
+/// proof-of-life that the YAML→kernel path is wired and that hot-reload
+/// updates are taking effect.
+fn logWind(p: notatlas.wind_query.WindParams, t: f32) void {
+    const w = notatlas.wind_query.windAt(p, 0, 0, t);
+    const mag = @sqrt(w[0] * w[0] + w[1] * w[1]);
+    std.log.info("wind: ({d:.2},{d:.2}) m/s |{d:.2}| storms={d}", .{
+        w[0], w[1], mag, p.storms.len,
+    });
+}
+
 fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.BuoyancyConfig {
     return .{
         .sample_points = hull.sample_points,
@@ -277,6 +304,7 @@ fn handleReload(
     box: *render.Box,
     hull: *notatlas.hull_params.HullParams,
     buoy: *physics.Buoyancy,
+    wind_params: *notatlas.wind_query.WindParams,
     render_pass: render.types.vk.VkRenderPass,
     events: render.file_watch.Events,
 ) void {
@@ -316,6 +344,17 @@ fn handleReload(
             std.log.info("reload {s} ({d} ms)", .{ hull_config_path, timer.lap() / std.time.ns_per_ms });
         } else |err| {
             std.log.err("reload {s}: {s}", .{ hull_config_path, @errorName(err) });
+        }
+    }
+
+    if (events.wind) {
+        if (loadWind(gpa, wind_config_path)) |new_params| {
+            wind_params.deinit(gpa);
+            wind_params.* = new_params;
+            std.log.info("reload {s} ({d} ms)", .{ wind_config_path, timer.lap() / std.time.ns_per_ms });
+            logWind(new_params, 0.0);
+        } else |err| {
+            std.log.err("reload {s}: {s}", .{ wind_config_path, @errorName(err) });
         }
     }
 
