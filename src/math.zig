@@ -55,6 +55,16 @@ pub const Vec3 = extern struct {
         const inv = 1.0 / len;
         return .{ .x = a.x * inv, .y = a.y * inv, .z = a.z * inv };
     }
+
+    /// Rotate a vector by a unit quaternion (x,y,z,w). Uses the identity
+    /// v' = v + 2·u × (u × v + w·v) where u = q.xyz; cheaper than building a
+    /// 3×3 rotation matrix and matches Jolt's quaternion convention.
+    pub fn rotateByQuat(v: Vec3, q: [4]f32) Vec3 {
+        const u: Vec3 = .{ .x = q[0], .y = q[1], .z = q[2] };
+        const w = q[3];
+        const t = scale(cross(u, v), 2.0);
+        return add(v, add(scale(cross(u, t), 1.0), scale(t, w)));
+    }
 };
 
 pub const Vec4 = extern struct {
@@ -235,6 +245,22 @@ test "Mat4.trs identity quaternion translates a point" {
     try std.testing.expectApproxEqAbs(@as(f32, 4), px, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 7), py, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 10), pz, 1e-5);
+}
+
+test "Vec3.rotateByQuat 90deg around y rotates +x to -z" {
+    const s2 = @sqrt(@as(f32, 0.5));
+    const r = Vec3.rotateByQuat(Vec3.init(1, 0, 0), .{ 0, s2, 0, s2 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), r.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), r.z, 1e-5);
+}
+
+test "Vec3.rotateByQuat identity preserves vector" {
+    const v = Vec3.init(3, -7, 2);
+    const r = Vec3.rotateByQuat(v, .{ 0, 0, 0, 1 });
+    try std.testing.expectApproxEqAbs(v.x, r.x, 1e-5);
+    try std.testing.expectApproxEqAbs(v.y, r.y, 1e-5);
+    try std.testing.expectApproxEqAbs(v.z, r.z, 1e-5);
 }
 
 test "Mat4.trs 90deg-around-y rotates +x to -z" {

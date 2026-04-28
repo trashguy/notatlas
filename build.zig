@@ -51,13 +51,14 @@ pub fn build(b: *std.Build) void {
     const jolt = buildJolt(b, target, optimize) catch @panic("jolt source enumeration failed");
     b.installArtifact(jolt);
 
-    // Zig-side bindings for the C wrapper. Pure-Zig module; no graphics
-    // deps. Importable as `physics`.
+    // Zig-side physics module: Jolt FFI + buoyancy. Buoyancy imports
+    // notatlas math/wave_query, so the dependency edge goes that way.
     const physics_mod = b.addModule("physics", .{
-        .root_source_file = b.path("src/physics/jolt.zig"),
+        .root_source_file = b.path("src/physics/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    physics_mod.addImport("notatlas", notatlas_mod);
 
     // Sandbox executable: window + Vulkan playground. Phase 0 M2.
     const sandbox_mod = b.createModule(.{

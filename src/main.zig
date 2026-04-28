@@ -9,7 +9,7 @@
 const std = @import("std");
 const notatlas = @import("notatlas");
 const render = @import("render/render.zig");
-const jolt = @import("physics");
+const physics = @import("physics");
 
 const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
@@ -21,6 +21,21 @@ const box_frag_shader_path = "assets/shaders/box.frag";
 /// 2m half-extents → 4m cube. Matches the Jolt body created below; renderer
 /// scales the unit-cube mesh by 2× this on every model matrix.
 const box_half_extents: [3]f32 = .{ 2, 2, 2 };
+
+/// Body-local sample positions (meters) for buoyancy. 2×2×2 grid at half-
+/// extent / 2; each sample owns a 2×2×2 m cell of the box's interior.
+const buoyancy_samples: [8][3]f32 = .{
+    .{ -1, -1, -1 }, .{ 1, -1, -1 },
+    .{ -1, -1, 1 },  .{ 1, -1, 1 },
+    .{ -1, 1, -1 },  .{ 1, 1, -1 },
+    .{ -1, 1, 1 },   .{ 1, 1, 1 },
+};
+
+/// 4m cube at 250 kg/m³ density (≈balsa) → floats with ~25% submerged
+/// (mass / (V·ρ_water) = 16000 / (64·1000) = 0.25). Heavy enough that the
+/// 9070 XT's float precision doesn't matter; light enough that the box
+/// rides clearly on top of the waves rather than swamping.
+const box_mass_kg: f32 = 16_000;
 
 const Scene = struct {
     ocean: *render.Ocean,
@@ -94,28 +109,33 @@ pub fn main() !void {
     // M3.1 smoke test: drop a 1×1×1 m box from y=20 onto a static floor
     // at y=0. Confirms Jolt FFI works end-to-end — gravity pulls it down,
     // collision halts it, body sleeps. Pose logged ~1 Hz.
-    jolt.init();
-    defer jolt.shutdown();
-    var phys = try jolt.System.init(.{});
+    physics.init();
+    defer physics.shutdown();
+    var phys = try physics.System.init(.{});
     defer phys.deinit();
 
-    // M3.2: park the floor high enough that the box rests well above storm
-    // wave peaks (~+8m). Pure renderer test — no water-vs-box occlusion to
-    // worry about until M3.3 turns this into a buoyancy demo.
-    _ = try phys.createBox(.{
-        .half_extents = .{ 50, 0.5, 50 },
-        .position = .{ 0, 15, 0 },
-        .motion = .static,
-        .activate = false,
-    });
+    // M3.3: no static floor — the box floats on the wave heightfield,
+    // which is the same scalar function the GPU raymarches. Body drops
+    // from above SL onto the waves; buoyancy halts the fall. Modest drop
+    // height keeps initial KE low so settle is visible.
     const box_id = try phys.createBox(.{
         .half_extents = box_half_extents,
-        .position = .{ 0, 40, 0 },
+        .position = .{ 0, 4, 0 },
         .motion = .dynamic,
-        .mass_override_kg = 100,
+        .mass_override_kg = box_mass_kg,
     });
     phys.optimizeBroadPhase();
     var phys_log_accum: f32 = 0;
+
+    // drag_per_point tuned to ~0.6 of critical damping at half-submerged
+    // equilibrium (4 active samples × 15k = 60k N·s/m vs 100k critical).
+    // Gives a visible 1-2 cycle bob before settling, not a swamp.
+    const buoy = physics.Buoyancy.init(.{
+        .sample_points = &buoyancy_samples,
+        .cell_half_height = 1.0, // each cell extends ±1m around its sample's y
+        .cell_cross_section = 4.0, // 4 columns sharing a 4×4 m top → 4 m² each
+        .drag_per_point = 15_000,
+    });
 
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
@@ -157,8 +177,10 @@ pub fn main() !void {
 
         // Physics step. Cap at 1/30 s so a hitch on the first frame (or a
         // long capture pause) doesn't tunnel the dynamic box through the
-        // floor. M3.3 buoyancy will run the same way.
+        // floor. Buoyancy applies forces against the same wave kernel the
+        // GPU raymarches, then Jolt integrates them.
         const phys_dt = @min(dt, 1.0 / 30.0);
+        buoy.step(&phys, box_id, wave_params, t);
         phys.step(phys_dt, 1);
         phys_log_accum += phys_dt;
         if (phys_log_accum >= 1.0) {
@@ -185,16 +207,14 @@ pub fn main() !void {
 
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
         // between 12m and 24m — stays clear of storm-preset peaks (~8m)
-        // so the camera never submerges. Look-at point lifted to y=12 so
-        // the M3.2 debug box (resting around y=16.5) sits centered in
-        // frame; will revert toward y=0 when M3.3 brings the box to sea
-        // level via buoyancy.
+        // so the camera never submerges. Look-at the sea surface where
+        // the buoyant box bobs.
         const radius: f32 = 80.0;
         const angle = t * (std.math.tau / 16.0);
         const altitude: f32 = 18.0 + 6.0 * @sin(angle);
         const camera: render.Camera = .{
             .eye = notatlas.math.Vec3.init(@cos(angle) * radius, altitude, @sin(angle) * radius),
-            .target = notatlas.math.Vec3.init(0, 12, 0),
+            .target = notatlas.math.Vec3.zero,
             .fov_y = std.math.degreesToRadians(60.0),
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
