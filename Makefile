@@ -1,5 +1,5 @@
 .PHONY: all build run test release fmt fmt-check clean help \
-        setup-windows check-windows-deps build-windows build-windows-debug
+        setup-windows build-windows build-windows-debug
 
 all: build
 
@@ -25,23 +25,19 @@ clean:
 	rm -rf zig-out .zig-cache
 
 # -----------------------------------------------------------------------------
-# Windows cross-compilation (from Linux)
+# Windows builds (cross-compile from Linux, or native on a Windows host).
+# Recipes use `python` rather than `python3` so they work on both Arch and
+# stock Windows Python installs. The build.zig itself prints a friendly
+# error if vulkan-1.lib is missing — no separate dep-check recipe needed.
 # -----------------------------------------------------------------------------
 
 setup-windows:
-	@python3 scripts/fetch_windows_deps.py
+	@python scripts/fetch_windows_deps.py
 
-check-windows-deps:
-	@if [ ! -f "libs/windows/vulkan/lib/vulkan-1.lib" ]; then \
-		echo "Missing libs/windows/vulkan/lib/vulkan-1.lib"; \
-		echo "Run: make setup-windows"; \
-		exit 1; \
-	fi
-
-build-windows: check-windows-deps
+build-windows:
 	zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
 
-build-windows-debug: check-windows-deps
+build-windows-debug:
 	zig build -Dtarget=x86_64-windows
 
 help:

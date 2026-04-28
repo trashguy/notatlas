@@ -70,21 +70,21 @@ Output lands at `zig-out\bin\notatlas-sandbox.exe`.
 
 ### Optional: GNU Make on Windows
 
-The Makefile targets (`make build-windows`, `make setup-windows`) work on
-a Windows host too — but you need both `make` and a POSIX-ish shell because
-some recipes use `[ -f ... ]` syntax. Pick whichever you already use:
+The Makefile targets (`make build-windows`, `make setup-windows`) work
+fine on a Windows host — recipes only call `python` and `zig`, no shell
+plumbing required. Pick whichever package manager you already use:
 
 | Manager | Command | Notes |
 |---|---|---|
-| **winget** | `winget install ezwinports.make` | Official MS package manager, ships with Win10/11. Standalone make — combine with Git Bash for the shell. |
+| **winget** | `winget install ezwinports.make` | Official MS package manager, ships with Win10/11. |
 | **Scoop** | `scoop install make` | Popular among devs; user-scope, no admin. |
 | **Chocolatey** | `choco install make` | Older, needs admin shell. |
-| **MSYS2** | `pacman -S make` | Heaviest install but you also get bash + a real POSIX shell, which is what the Makefile actually wants. |
+| **MSYS2** | `pacman -S make` | Heaviest install; also gives you bash and the rest of a POSIX userland. |
 
-If you don't want to install any of the above, skip `make` entirely and
-call `zig build -Dtarget=...` directly — the Makefile is just a convenience
-shim over those commands. (NuGet is .NET-package-only; it doesn't ship
-GNU make.)
+If you don't want any of the above, skip `make` entirely and call
+`zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe` directly — the
+Makefile is just a thin shim. (NuGet is .NET-package-only; it doesn't
+ship GNU make.)
 
 ## Running
 
