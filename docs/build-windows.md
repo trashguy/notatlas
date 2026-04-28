@@ -68,9 +68,23 @@ zig build
 
 Output lands at `zig-out\bin\notatlas-sandbox.exe`.
 
-`make` also works if you have GNU Make installed (Git Bash, MSYS2,
-`choco install make`); the same `make build-windows` / `make setup-windows`
-targets work on a Windows host because the underlying scripts are portable.
+### Optional: GNU Make on Windows
+
+The Makefile targets (`make build-windows`, `make setup-windows`) work on
+a Windows host too — but you need both `make` and a POSIX-ish shell because
+some recipes use `[ -f ... ]` syntax. Pick whichever you already use:
+
+| Manager | Command | Notes |
+|---|---|---|
+| **winget** | `winget install ezwinports.make` | Official MS package manager, ships with Win10/11. Standalone make — combine with Git Bash for the shell. |
+| **Scoop** | `scoop install make` | Popular among devs; user-scope, no admin. |
+| **Chocolatey** | `choco install make` | Older, needs admin shell. |
+| **MSYS2** | `pacman -S make` | Heaviest install but you also get bash + a real POSIX shell, which is what the Makefile actually wants. |
+
+If you don't want to install any of the above, skip `make` entirely and
+call `zig build -Dtarget=...` directly — the Makefile is just a convenience
+shim over those commands. (NuGet is .NET-package-only; it doesn't ship
+GNU make.)
 
 ## Running
 
