@@ -15,6 +15,15 @@ const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
 const hull_config_path = "data/ships/box.yaml";
 const wind_config_path = "data/wind.yaml";
+const arrows_vert_path = "assets/shaders/wind_arrows.vert";
+const arrows_frag_path = "assets/shaders/wind_arrows.frag";
+
+/// 16×16 = 256 cells over 800 m centered at origin. Step (50 m) is large
+/// enough that arrows of length ARROW_SCALE_M (35 m) don't overlap, small
+/// enough that storm gradients (σ=300 m for the storm preset) span ~6 cells.
+const arrow_grid_dim: u32 = 16;
+const arrow_grid_step_m: f32 = 50.0;
+const arrow_count: u32 = arrow_grid_dim * arrow_grid_dim;
 const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
 const box_vert_shader_path = "assets/shaders/box.vert";
@@ -23,6 +32,7 @@ const box_frag_shader_path = "assets/shaders/box.frag";
 const Scene = struct {
     ocean: *render.Ocean,
     box: *render.Box,
+    arrows: *render.WindArrows,
 };
 
 pub fn main() !void {
@@ -71,7 +81,9 @@ pub fn main() !void {
 
     var box = try render.Box.init(&gpu, frame.render_pass, ocean.camera_ubo.handle);
     defer box.deinit();
-    var scene: Scene = .{ .ocean = &ocean, .box = &box };
+    var arrows = try render.WindArrows.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, arrow_count);
+    defer arrows.deinit();
+    var scene: Scene = .{ .ocean = &ocean, .box = &box, .arrows = &arrows };
 
     const wave_params = try loadWaves(gpa, wave_config_path);
     ocean.setWaveParams(wave_params);
@@ -161,7 +173,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &box, &hull, &buoy, &wind_params, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &box, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -220,6 +232,12 @@ pub fn main() !void {
         };
         ocean.updateCamera(camera);
         ocean.updateTime(t);
+
+        // Sample the wind on the debug grid and push to the arrows
+        // instance buffer. 256 windAt() calls / frame; cheap (~0.1 ms).
+        var arrow_instances: [arrow_count]render.wind_arrows.ArrowInstance = undefined;
+        sampleWindGrid(wind_params, t, &arrow_instances);
+        arrows.updateInstances(&arrow_instances);
 
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
@@ -302,6 +320,7 @@ fn handleReload(
     gpa: std.mem.Allocator,
     ocean: *render.Ocean,
     box: *render.Box,
+    arrows: *render.WindArrows,
     hull: *notatlas.hull_params.HullParams,
     buoy: *physics.Buoyancy,
     wind_params: *notatlas.wind_query.WindParams,
@@ -380,6 +399,15 @@ fn handleReload(
             return;
         };
 
+        const arrows_vert_spv = render.shader_compile.compileGlsl(gpa, arrows_vert_path, "wind_arrows.vert") catch return;
+        defer gpa.free(arrows_vert_spv);
+        const arrows_frag_spv = render.shader_compile.compileGlsl(gpa, arrows_frag_path, "wind_arrows.frag") catch return;
+        defer gpa.free(arrows_frag_spv);
+        arrows.reloadShaders(render_pass, arrows_vert_spv, arrows_frag_spv) catch |err| {
+            std.log.err("reload wind_arrows shaders: {s}", .{@errorName(err)});
+            return;
+        };
+
         std.log.info("reload shaders ({d} ms)", .{timer.lap() / std.time.ns_per_ms});
     }
 }
@@ -392,6 +420,28 @@ fn recordScene(
     const scene: *Scene = @ptrCast(@alignCast(ctx));
     scene.ocean.record(cb, extent);
     scene.box.record(cb, extent);
+    scene.arrows.record(cb, extent);
+}
+
+/// Fill `out` with `arrow_grid_dim²` windAt samples on a centered grid.
+fn sampleWindGrid(
+    wind_params: notatlas.wind_query.WindParams,
+    t: f32,
+    out: *[arrow_count]render.wind_arrows.ArrowInstance,
+) void {
+    const half: f32 = 0.5 * @as(f32, @floatFromInt(arrow_grid_dim - 1)) * arrow_grid_step_m;
+    var idx: usize = 0;
+    var i: u32 = 0;
+    while (i < arrow_grid_dim) : (i += 1) {
+        const x = -half + @as(f32, @floatFromInt(i)) * arrow_grid_step_m;
+        var j: u32 = 0;
+        while (j < arrow_grid_dim) : (j += 1) {
+            const z = -half + @as(f32, @floatFromInt(j)) * arrow_grid_step_m;
+            const w = notatlas.wind_query.windAt(wind_params, x, z, t);
+            out[idx] = .{ .pos_xz = .{ x, z }, .wind_xz = w };
+            idx += 1;
+        }
+    }
 }
 
 const Cli = struct {
