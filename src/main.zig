@@ -9,6 +9,7 @@
 const std = @import("std");
 const notatlas = @import("notatlas");
 const render = @import("render/render.zig");
+const jolt = @import("physics");
 
 const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
@@ -75,6 +76,29 @@ pub fn main() !void {
     });
     std.log.info("present mode = {s}", .{if (cli.uncap) "MAILBOX (uncapped)" else "FIFO (vsync)"});
 
+    // M3.1 smoke test: drop a 1×1×1 m box from y=20 onto a static floor
+    // at y=0. Confirms Jolt FFI works end-to-end — gravity pulls it down,
+    // collision halts it, body sleeps. Pose logged ~1 Hz.
+    jolt.init();
+    defer jolt.shutdown();
+    var phys = try jolt.System.init(.{});
+    defer phys.deinit();
+
+    _ = try phys.createBox(.{
+        .half_extents = .{ 50, 0.5, 50 },
+        .position = .{ 0, -0.5, 0 },
+        .motion = .static,
+        .activate = false,
+    });
+    const box_id = try phys.createBox(.{
+        .half_extents = .{ 1, 1, 1 },
+        .position = .{ 0, 20, 0 },
+        .motion = .dynamic,
+        .mass_override_kg = 100,
+    });
+    phys.optimizeBroadPhase();
+    var phys_log_accum: f32 = 0;
+
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
 
@@ -113,12 +137,27 @@ pub fn main() !void {
         t += dt;
         perf.tick(frame_ns);
 
+        // Physics step. Cap at 1/30 s so a hitch on the first frame (or a
+        // long capture pause) doesn't tunnel the dynamic box through the
+        // floor. M3.3 buoyancy will run the same way.
+        const phys_dt = @min(dt, 1.0 / 30.0);
+        phys.step(phys_dt, 1);
+        phys_log_accum += phys_dt;
+        if (phys_log_accum >= 1.0) {
+            const pos = phys.getPosition(box_id) orelse .{ 0, 0, 0 };
+            const vel = phys.getLinearVelocity(box_id) orelse .{ 0, 0, 0 };
+            std.log.info("phys: box pos=({d:.2},{d:.2},{d:.2}) vel=({d:.2},{d:.2},{d:.2})", .{
+                pos[0], pos[1], pos[2], vel[0], vel[1], vel[2],
+            });
+            phys_log_accum = 0;
+        }
+
         // Orbit at 80m radius, half a turn per 16 seconds. Altitude bobs
-        // between -8m and +20m so a stretch of every orbit is below the
-        // waterline — exercises the underwater fog path without input.
+        // between 12m and 24m — stays clear of storm-preset peaks (~8m)
+        // so the camera never submerges.
         const radius: f32 = 80.0;
         const angle = t * (std.math.tau / 16.0);
-        const altitude: f32 = 6.0 + 14.0 * @sin(angle);
+        const altitude: f32 = 18.0 + 6.0 * @sin(angle);
         const camera: render.Camera = .{
             .eye = notatlas.math.Vec3.init(@cos(angle) * radius, altitude, @sin(angle) * radius),
             .target = notatlas.math.Vec3.zero,
