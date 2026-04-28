@@ -19,10 +19,11 @@ const posix = std.posix;
 pub const Events = packed struct {
     wave: bool = false,
     ocean: bool = false,
+    hull: bool = false,
     shader: bool = false,
 
     pub fn any(self: Events) bool {
-        return self.wave or self.ocean or self.shader;
+        return self.wave or self.ocean or self.hull or self.shader;
     }
 };
 
@@ -30,18 +31,24 @@ pub const Watcher = struct {
     fd: i32,
     wd_data: i32,
     wd_waves: i32,
+    wd_ships: i32,
     wd_shaders: i32,
 
     /// Basename of the active wave config, e.g. "storm.yaml". The watcher
     /// only flags `wave` when an event matches this name; other files in
     /// data/waves/ are ignored.
     wave_basename: []const u8,
+    /// Basename of the active hull config, e.g. "box.yaml". Same filter
+    /// pattern as `wave_basename`.
+    hull_basename: []const u8,
 
     pub const Paths = struct {
         data_dir: [:0]const u8 = "data",
         waves_dir: [:0]const u8 = "data/waves",
+        ships_dir: [:0]const u8 = "data/ships",
         shaders_dir: [:0]const u8 = "assets/shaders",
         wave_basename: []const u8 = "storm.yaml",
+        hull_basename: []const u8 = "box.yaml",
     };
 
     pub fn init(paths: Paths) !Watcher {
@@ -51,14 +58,17 @@ pub const Watcher = struct {
         const mask: u32 = linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO;
         const wd_data = try posix.inotify_add_watch(fd, paths.data_dir, mask);
         const wd_waves = try posix.inotify_add_watch(fd, paths.waves_dir, mask);
+        const wd_ships = try posix.inotify_add_watch(fd, paths.ships_dir, mask);
         const wd_shaders = try posix.inotify_add_watch(fd, paths.shaders_dir, mask);
 
         return .{
             .fd = fd,
             .wd_data = wd_data,
             .wd_waves = wd_waves,
+            .wd_ships = wd_ships,
             .wd_shaders = wd_shaders,
             .wave_basename = paths.wave_basename,
+            .hull_basename = paths.hull_basename,
         };
     }
 
@@ -92,9 +102,13 @@ pub const Watcher = struct {
                     if (std.mem.eql(u8, name, "ocean.yaml")) events.ocean = true;
                 } else if (ev.wd == self.wd_waves) {
                     if (std.mem.eql(u8, name, self.wave_basename)) events.wave = true;
+                } else if (ev.wd == self.wd_ships) {
+                    if (std.mem.eql(u8, name, self.hull_basename)) events.hull = true;
                 } else if (ev.wd == self.wd_shaders) {
-                    if (std.mem.eql(u8, name, "water.frag") or
-                        std.mem.eql(u8, name, "fullscreen.vert"))
+                    // Match by extension so future passes (M5+ ships,
+                    // structures) auto-reload without an enumeration.
+                    if (std.mem.endsWith(u8, name, ".vert") or
+                        std.mem.endsWith(u8, name, ".frag"))
                     {
                         events.shader = true;
                     }

@@ -13,29 +13,11 @@ const physics = @import("physics");
 
 const wave_config_path = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
+const hull_config_path = "data/ships/box.yaml";
 const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
 const box_vert_shader_path = "assets/shaders/box.vert";
 const box_frag_shader_path = "assets/shaders/box.frag";
-
-/// 2m half-extents → 4m cube. Matches the Jolt body created below; renderer
-/// scales the unit-cube mesh by 2× this on every model matrix.
-const box_half_extents: [3]f32 = .{ 2, 2, 2 };
-
-/// Body-local sample positions (meters) for buoyancy. 2×2×2 grid at half-
-/// extent / 2; each sample owns a 2×2×2 m cell of the box's interior.
-const buoyancy_samples: [8][3]f32 = .{
-    .{ -1, -1, -1 }, .{ 1, -1, -1 },
-    .{ -1, -1, 1 },  .{ 1, -1, 1 },
-    .{ -1, 1, -1 },  .{ 1, 1, -1 },
-    .{ -1, 1, 1 },   .{ 1, 1, 1 },
-};
-
-/// 4m cube at 250 kg/m³ density (≈balsa) → floats with ~25% submerged
-/// (mass / (V·ρ_water) = 16000 / (64·1000) = 0.25). Heavy enough that the
-/// 9070 XT's float precision doesn't matter; light enough that the box
-/// rides clearly on top of the waves rather than swamping.
-const box_mass_kg: f32 = 16_000;
 
 const Scene = struct {
     ocean: *render.Ocean,
@@ -98,11 +80,13 @@ pub fn main() !void {
 
     var watcher = try render.file_watch.Watcher.init(.{
         .wave_basename = std.fs.path.basename(wave_config_path),
+        .hull_basename = std.fs.path.basename(hull_config_path),
     });
     defer watcher.deinit();
-    std.log.info("hot-reload watching {s}, {s}, assets/shaders/*", .{
+    std.log.info("hot-reload watching {s}, {s}, {s}, assets/shaders/*", .{
         ocean_config_path,
         wave_config_path,
+        hull_config_path,
     });
     std.log.info("present mode = {s}", .{if (cli.uncap) "MAILBOX (uncapped)" else "FIFO (vsync)"});
 
@@ -114,28 +98,27 @@ pub fn main() !void {
     var phys = try physics.System.init(.{});
     defer phys.deinit();
 
+    // Hull params — half-extents, mass, sample points, drag — all live in
+    // data/ships/box.yaml. Hot-reloadable below for buoyancy fields; mass
+    // and shape changes still need a restart since Jolt has no recompute-
+    // mass-properties path through our wrapper yet.
+    var hull = try loadHull(gpa, hull_config_path);
+    defer hull.deinit(gpa);
+
     // M3.3: no static floor — the box floats on the wave heightfield,
     // which is the same scalar function the GPU raymarches. Body drops
     // from above SL onto the waves; buoyancy halts the fall. Modest drop
     // height keeps initial KE low so settle is visible.
     const box_id = try phys.createBox(.{
-        .half_extents = box_half_extents,
+        .half_extents = hull.half_extents,
         .position = .{ 0, 4, 0 },
         .motion = .dynamic,
-        .mass_override_kg = box_mass_kg,
+        .mass_override_kg = hull.mass_kg,
     });
     phys.optimizeBroadPhase();
     var phys_log_accum: f32 = 0;
 
-    // drag_per_point tuned to ~0.6 of critical damping at half-submerged
-    // equilibrium (4 active samples × 15k = 60k N·s/m vs 100k critical).
-    // Gives a visible 1-2 cycle bob before settling, not a swamp.
-    const buoy = physics.Buoyancy.init(.{
-        .sample_points = &buoyancy_samples,
-        .cell_half_height = 1.0, // each cell extends ±1m around its sample's y
-        .cell_cross_section = 4.0, // 4 columns sharing a 4×4 m top → 4 m² each
-        .drag_per_point = 15_000,
-    });
+    var buoy = physics.Buoyancy.init(buoyancyConfigFromHull(hull));
 
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
@@ -168,7 +151,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &box, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &box, &hull, &buoy, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -193,15 +176,14 @@ pub fn main() !void {
         }
 
         // Drive box renderer from current Jolt pose. Mesh is a unit cube;
-        // scale by 2× the half-extents to recover a 2m cube matching the
-        // Jolt shape. Quaternion comes back identity-ish until something
-        // tips the box.
+        // scale by 2× the half-extents from the hull config to recover the
+        // 4m cube. Quaternion comes back identity-ish until waves tip it.
         const box_pos = phys.getPosition(box_id) orelse .{ 0, 0, 0 };
         const box_quat = phys.getRotation(box_id) orelse .{ 0, 0, 0, 1 };
         const box_model = notatlas.math.Mat4.trs(
             notatlas.math.Vec3.init(box_pos[0], box_pos[1], box_pos[2]),
             box_quat,
-            notatlas.math.Vec3.init(2 * box_half_extents[0], 2 * box_half_extents[1], 2 * box_half_extents[2]),
+            notatlas.math.Vec3.init(2 * hull.half_extents[0], 2 * hull.half_extents[1], 2 * hull.half_extents[2]),
         );
         box.setModel(box_model.data);
 
@@ -261,6 +243,21 @@ fn loadOcean(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.ocean_param
     return notatlas.yaml_loader.loadOceanFromFile(gpa, abs);
 }
 
+fn loadHull(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.hull_params.HullParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadHullFromFile(gpa, abs);
+}
+
+fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.BuoyancyConfig {
+    return .{
+        .sample_points = hull.sample_points,
+        .cell_half_height = hull.cell_half_height,
+        .cell_cross_section = hull.cell_cross_section,
+        .drag_per_point = hull.drag_per_point,
+    };
+}
+
 /// Apply whatever the watcher flagged. Errors are logged and swallowed —
 /// a typo in YAML or a broken shader must not kill the running sandbox;
 /// the user fixes the file and saves again.
@@ -268,6 +265,8 @@ fn handleReload(
     gpa: std.mem.Allocator,
     ocean: *render.Ocean,
     box: *render.Box,
+    hull: *notatlas.hull_params.HullParams,
+    buoy: *physics.Buoyancy,
     render_pass: render.types.vk.VkRenderPass,
     events: render.file_watch.Events,
 ) void {
@@ -288,6 +287,25 @@ fn handleReload(
             std.log.info("reload {s} ({d} ms)", .{ wave_config_path, timer.lap() / std.time.ns_per_ms });
         } else |err| {
             std.log.err("reload {s}: {s}", .{ wave_config_path, @errorName(err) });
+        }
+    }
+
+    // Hull hot-reload only updates buoyancy params + render scale.
+    // mass_kg / half_extents changes need a restart — the Jolt body's
+    // mass properties and collision shape are baked at create time.
+    if (events.hull) {
+        if (loadHull(gpa, hull_config_path)) |new_hull| {
+            if (new_hull.mass_kg != hull.mass_kg or
+                !std.mem.eql(f32, &new_hull.half_extents, &hull.half_extents))
+            {
+                std.log.warn("hull mass/half_extents changed — restart sandbox to pick up", .{});
+            }
+            hull.deinit(gpa);
+            hull.* = new_hull;
+            buoy.cfg = buoyancyConfigFromHull(new_hull);
+            std.log.info("reload {s} ({d} ms)", .{ hull_config_path, timer.lap() / std.time.ns_per_ms });
+        } else |err| {
+            std.log.err("reload {s}: {s}", .{ hull_config_path, @errorName(err) });
         }
     }
 

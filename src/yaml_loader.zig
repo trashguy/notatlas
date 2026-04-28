@@ -9,6 +9,7 @@ const std = @import("std");
 const ymlz = @import("ymlz");
 const wave = @import("wave_query.zig");
 const ocean_params_mod = @import("ocean_params.zig");
+const hull_mod = @import("hull_params.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -104,6 +105,48 @@ pub fn loadOceanFromYaml(allocator: Allocator, yaml_text: []const u8) !ocean_par
 }
 
 // ------------------------------------------------------------
+// data/ships/*.yaml
+// ------------------------------------------------------------
+
+const RawSamplePoint = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+};
+
+const RawHullParams = struct {
+    half_extents_x: f32,
+    half_extents_y: f32,
+    half_extents_z: f32,
+    mass_kg: f32,
+    cell_half_height: f32,
+    cell_cross_section: f32,
+    drag_per_point: f32,
+    sample_points: []RawSamplePoint,
+};
+
+/// Parse a hull YAML and return params with sample points copied into a
+/// caller-owned slice. Caller frees via `HullParams.deinit(gpa)`.
+pub fn loadHullFromFile(gpa: Allocator, abs_path: []const u8) !hull_mod.HullParams {
+    var parser = try ymlz.Ymlz(RawHullParams).init(gpa);
+    const raw = try parser.loadFile(abs_path);
+    defer parser.deinit(raw);
+
+    const samples = try gpa.alloc([3]f32, raw.sample_points.len);
+    errdefer gpa.free(samples);
+    for (raw.sample_points, 0..) |p, i| samples[i] = .{ p.x, p.y, p.z };
+
+    return .{
+        .half_extents = .{ raw.half_extents_x, raw.half_extents_y, raw.half_extents_z },
+        .mass_kg = raw.mass_kg,
+        .cell_half_height = raw.cell_half_height,
+        .cell_cross_section = raw.cell_cross_section,
+        .drag_per_point = raw.drag_per_point,
+        .sample_points = samples,
+    };
+}
+
+// ------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------
 
@@ -155,6 +198,27 @@ test "loaded wave produces same heights as hand-coded fixture" {
             wave.waveHeight(wave.choppy, x, z, t),
             wave.waveHeight(lp, x, z, t),
         );
+    }
+}
+
+test "load box hull.yaml round-trips fields and 8 sample points" {
+    const abs = try std.fs.cwd().realpathAlloc(testing.allocator, "data/ships/box.yaml");
+    defer testing.allocator.free(abs);
+    const hull = try loadHullFromFile(testing.allocator, abs);
+    defer hull.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(f32, 2.0), hull.half_extents[0]);
+    try testing.expectEqual(@as(f32, 2.0), hull.half_extents[1]);
+    try testing.expectEqual(@as(f32, 2.0), hull.half_extents[2]);
+    try testing.expectEqual(@as(f32, 16000.0), hull.mass_kg);
+    try testing.expectEqual(@as(f32, 1.0), hull.cell_half_height);
+    try testing.expectEqual(@as(f32, 4.0), hull.cell_cross_section);
+    try testing.expectEqual(@as(f32, 15000.0), hull.drag_per_point);
+
+    // 2×2×2 grid: 8 corners of {±1,±1,±1}.
+    try testing.expectEqual(@as(usize, 8), hull.sample_points.len);
+    for (hull.sample_points) |p| {
+        for (p) |c| try testing.expect(c == 1.0 or c == -1.0);
     }
 }
 

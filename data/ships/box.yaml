@@ -1,0 +1,32 @@
+half_extents_x: 2.0
+half_extents_y: 2.0
+half_extents_z: 2.0
+mass_kg: 16000.0
+cell_half_height: 1.0
+cell_cross_section: 4.0
+drag_per_point: 15000.0
+sample_points:
+  - x: -1.0
+    y: -1.0
+    z: -1.0
+  - x: 1.0
+    y: -1.0
+    z: -1.0
+  - x: -1.0
+    y: -1.0
+    z: 1.0
+  - x: 1.0
+    y: -1.0
+    z: 1.0
+  - x: -1.0
+    y: 1.0
+    z: -1.0
+  - x: 1.0
+    y: 1.0
+    z: -1.0
+  - x: -1.0
+    y: 1.0
+    z: 1.0
+  - x: 1.0
+    y: 1.0
+    z: 1.0
