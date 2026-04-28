@@ -165,15 +165,20 @@ pub fn main() !void {
     var pose_curr_pos: [3]f32 = pose_prev_pos;
     var pose_curr_rot: [4]f32 = pose_prev_rot;
 
-    // M5.2 first-person camera. Initial pose places the player ~30 m back
-    // and 5 m up, looking at the origin where the box bobs. WASD walks
-    // (planar — looking up doesn't lift you), Space/Ctrl raise/lower for
-    // free-fly until M5.3/M5.4 swap this for boarded/walking modes.
-    var fly_cam: notatlas.fly_camera.FlyCamera = .{
-        .pos = notatlas.math.Vec3.init(0, 5, 30),
-        .yaw = 0, // looking down -Z toward origin
-        .pitch = std.math.degreesToRadians(-8.0),
+    // M5.3 player. Spawn pre-boarded on top of the box: feet at local
+    // y = +half_extents.y (deck surface), eye at +eye_height above. Yaw=0
+    // looks down local -Z; the orbit-cam-era box position (0, 4, 0) puts
+    // the bow toward -Z, so this faces "forward over the prow." When the
+    // box pitches, the camera rolls with the deck because the world
+    // composition rotates the local eye+forward by `ship_pose.rot`.
+    //
+    // attached_ship uses the Jolt BodyId since we have one ship and that's
+    // the natural opaque handle. M5.5 multi-pax will need a registry layer
+    // mapping ship handles to interpolated pose providers.
+    var player: notatlas.player.Player = .{
+        .pos = notatlas.math.Vec3.init(0, hull.half_extents[1], 0),
     };
+    player.boardShip(box_id, player.pos);
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -298,10 +303,10 @@ pub fn main() !void {
             if (last_cursor) |lc| {
                 const dx: f32 = @floatCast(cursor[0] - lc[0]);
                 const dy: f32 = @floatCast(cursor[1] - lc[1]);
-                fly_cam.applyMouseDelta(dx, dy);
+                player.applyMouseDelta(dx, dy);
             }
             const move = pollMove(&window);
-            fly_cam.applyMove(move, dt);
+            player.applyMove(move, dt);
         }
         last_cursor = cursor;
         if (cursor_captured and window.handle.getKey(.escape) == .press) {
@@ -314,10 +319,19 @@ pub fn main() !void {
             last_cursor = null;
         }
 
+        // M5.3 SoT-style world camera composition. Pass the *interpolated*
+        // ship pose (M5.1) so the camera stays smooth at high render rates;
+        // the player's local fields are static between input ticks, so any
+        // visible jitter on a pitching deck would have to come from the
+        // ship pose source. Standing still + watching the deck rock is the
+        // M5.3 headline gate.
+        const ship_pose: notatlas.player.Pose = .{ .pos = render_pos, .rot = render_rot };
+        const world_eye = player.worldEye(ship_pose);
+        const world_fwd = player.worldForward(ship_pose);
         const camera: render.Camera = .{
-            .eye = fly_cam.pos,
-            .target = notatlas.math.Vec3.add(fly_cam.pos, fly_cam.forward()),
-            .fov_y = fly_cam.fov_y,
+            .eye = world_eye,
+            .target = notatlas.math.Vec3.add(world_eye, world_fwd),
+            .fov_y = player.fov_y,
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
         ocean.updateCamera(camera);
@@ -520,7 +534,7 @@ fn recordScene(
 /// the difference of two boolean keys, so chord cancellation works the same
 /// as any FPS (W+S = 0, A+D = 0). Diagonal (W+D) is unnormalized — gives
 /// the classic √2× bonus on diagonals; not worth normalizing for sandbox.
-fn pollMove(window: *render.Window) notatlas.fly_camera.FlyCamera.Move {
+fn pollMove(window: *render.Window) notatlas.player.Move {
     const fw: f32 = if (window.handle.getKey(.w) == .press) 1 else 0;
     const bw: f32 = if (window.handle.getKey(.s) == .press) 1 else 0;
     const lf: f32 = if (window.handle.getKey(.a) == .press) 1 else 0;
