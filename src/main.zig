@@ -240,7 +240,7 @@ pub fn main() !void {
         sampleWindGrid(wind_params, t, &arrow_instances);
         arrows.updateInstances(&arrow_instances);
 
-        if (cli.soak_seconds > 0) wind_soak.observe(wind_params, t, &arrow_instances);
+        if (cli.soak_seconds > 0) wind_soak.observe(wind_params, t);
 
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
@@ -532,19 +532,31 @@ const SoakStats = struct {
     }
 };
 
-/// M4.4 stability gate for the wind field. Observes the same 16×16 grid
-/// that the arrows renderer is already filling each frame, plus the per-
-/// storm centers (via `stormCenter`), and reports aggregate stats at the
-/// end of the soak.
+/// M4.4 stability gate for the wind field. Each tick: samples a 16×16 grid
+/// covering the entire toroidal storm world (so the σ rings are periodically
+/// intersected as storms drift) and probes each storm's eye directly (so
+/// peak / anti-peak magnitudes show up in the range regardless of where
+/// storms happen to be). Tracks per-storm wrap-aware path length to verify
+/// `stormCenter` translates linearly. Reports aggregate stats at end.
+///
+/// The renderer's arrow grid is intentionally NOT reused: it's centered on
+/// the box at ±375 m, which on a 4096 m storm world rarely overlaps any
+/// storm and would understate the magnitude range. The soak's job is to
+/// verify the kernel globally, not to mirror what the camera sees.
 ///
 /// Pass criteria (informal — the user reads the log):
 ///   - `nan_count` is 0
-///   - `mag_max` ≤ `base_speed_mps + Σ strength_mps` × small slack
-///   - For each storm: `path_length` ≈ `speed_mps × duration` (within ~1%
-///     for wrap-free runs; per-frame steps small relative to that average)
+///   - `mag_max` close to the analytic upper bound
+///     `base_speed_mps + max strength_mps` (depends on storm alignment;
+///     for the storm preset, ~22 m/s is achievable when a storm's gust
+///     aligns with the base wind direction at some moment)
+///   - For each storm: `path_length` ≈ `speed_mps × duration` (within
+///     a fraction of a meter over 5 min)
 ///   - `max_step` ≪ world size — no teleports / wrap discontinuities slip
 ///     through the wrap-aware delta
 const max_tracked_storms: usize = 8;
+const wind_soak_grid_dim: u32 = 16;
+
 const WindSoakStats = struct {
     samples: u64 = 0,
     nan_count: u64 = 0,
@@ -557,38 +569,52 @@ const WindSoakStats = struct {
     storm_max_step: [max_tracked_storms]f32 = .{0} ** max_tracked_storms,
     storm_path_length: [max_tracked_storms]f32 = .{0} ** max_tracked_storms,
 
-    fn observe(
-        self: *WindSoakStats,
-        p: notatlas.wind_query.WindParams,
-        t: f32,
-        grid: []const render.wind_arrows.ArrowInstance,
-    ) void {
+    fn observeMag(self: *WindSoakStats, w: [2]f32) void {
+        self.samples += 1;
+        if (std.math.isNan(w[0]) or std.math.isNan(w[1])) {
+            self.nan_count += 1;
+            return;
+        }
+        const m = @sqrt(w[0] * w[0] + w[1] * w[1]);
+        if (m < self.mag_min) self.mag_min = m;
+        if (m > self.mag_max) self.mag_max = m;
+    }
+
+    fn observe(self: *WindSoakStats, p: notatlas.wind_query.WindParams, t: f32) void {
         const first = self.samples == 0;
         if (first) self.storm_count = @intCast(@min(p.storms.len, max_tracked_storms));
 
-        for (grid) |inst| {
-            self.samples += 1;
-            const wx = inst.wind_xz[0];
-            const wz = inst.wind_xz[1];
-            if (std.math.isNan(wx) or std.math.isNan(wz)) {
-                self.nan_count += 1;
-                continue;
+        // Wide grid — covers the full storm world. Step ≈ world / 16 ≈ 256 m
+        // for the 4096 m default, slightly under σ=300 m, so as storms drift
+        // the grid passes through their σ rings and we observe peak magnitudes
+        // every few seconds.
+        const half = p.storm_world_m * 0.5;
+        const step = p.storm_world_m / @as(f32, @floatFromInt(wind_soak_grid_dim));
+        var i: u32 = 0;
+        while (i < wind_soak_grid_dim) : (i += 1) {
+            const x = -half + (@as(f32, @floatFromInt(i)) + 0.5) * step;
+            var j: u32 = 0;
+            while (j < wind_soak_grid_dim) : (j += 1) {
+                const z = -half + (@as(f32, @floatFromInt(j)) + 0.5) * step;
+                const w = notatlas.wind_query.windAt(p, x, z, t);
+                self.observeMag(w);
             }
-            const m = @sqrt(wx * wx + wz * wz);
-            if (m < self.mag_min) self.mag_min = m;
-            if (m > self.mag_max) self.mag_max = m;
         }
 
-        const half = p.storm_world_m * 0.5;
-        var i: usize = 0;
-        while (i < self.storm_count) : (i += 1) {
-            const c = notatlas.wind_query.stormCenter(p, i, t);
+        // Probe each storm's eye directly — guarantees peak / anti-peak
+        // contribution shows up in the magnitude range every frame.
+        var s: usize = 0;
+        while (s < self.storm_count) : (s += 1) {
+            const c = notatlas.wind_query.stormCenter(p, s, t);
+            const w_eye = notatlas.wind_query.windAt(p, c[0], c[1], t);
+            self.observeMag(w_eye);
+
             if (first) {
-                self.storm_first_center[i] = c;
-                self.storm_last_center[i] = c;
+                self.storm_first_center[s] = c;
+                self.storm_last_center[s] = c;
                 continue;
             }
-            const last = self.storm_last_center[i];
+            const last = self.storm_last_center[s];
             // Wrap-aware delta — when a storm crosses the world edge the
             // raw c-last jump looks like ±world_m; subtracting the world
             // size folds it back to the true short-path step.
@@ -598,10 +624,10 @@ const WindSoakStats = struct {
             if (dx < -half) dx += p.storm_world_m;
             if (dz > half) dz -= p.storm_world_m;
             if (dz < -half) dz += p.storm_world_m;
-            const step = @sqrt(dx * dx + dz * dz);
-            if (step > self.storm_max_step[i]) self.storm_max_step[i] = step;
-            self.storm_path_length[i] += step;
-            self.storm_last_center[i] = c;
+            const step_dist = @sqrt(dx * dx + dz * dz);
+            if (step_dist > self.storm_max_step[s]) self.storm_max_step[s] = step_dist;
+            self.storm_path_length[s] += step_dist;
+            self.storm_last_center[s] = c;
         }
     }
 
