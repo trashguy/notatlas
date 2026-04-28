@@ -144,6 +144,7 @@ pub fn main() !void {
     var timer = try std.time.Timer.start();
     var t: f32 = 0.0;
     var soak_stats: SoakStats = .{};
+    var wind_soak: WindSoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -239,6 +240,8 @@ pub fn main() !void {
         sampleWindGrid(wind_params, t, &arrow_instances);
         arrows.updateInstances(&arrow_instances);
 
+        if (cli.soak_seconds > 0) wind_soak.observe(wind_params, t, &arrow_instances);
+
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
 
@@ -266,7 +269,10 @@ pub fn main() !void {
     // VUID-vkDestroyPipeline-pipeline-00765 on clean shutdown.
     _ = render.types.vk.vkDeviceWaitIdle(gpu.device);
 
-    if (cli.soak_seconds > 0) soak_stats.report(t);
+    if (cli.soak_seconds > 0) {
+        soak_stats.report(t);
+        wind_soak.report(wind_params, t);
+    }
 }
 
 fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.WaveParams {
@@ -523,6 +529,100 @@ const SoakStats = struct {
             self.speed_max,
             self.angvel_max,
         });
+    }
+};
+
+/// M4.4 stability gate for the wind field. Observes the same 16×16 grid
+/// that the arrows renderer is already filling each frame, plus the per-
+/// storm centers (via `stormCenter`), and reports aggregate stats at the
+/// end of the soak.
+///
+/// Pass criteria (informal — the user reads the log):
+///   - `nan_count` is 0
+///   - `mag_max` ≤ `base_speed_mps + Σ strength_mps` × small slack
+///   - For each storm: `path_length` ≈ `speed_mps × duration` (within ~1%
+///     for wrap-free runs; per-frame steps small relative to that average)
+///   - `max_step` ≪ world size — no teleports / wrap discontinuities slip
+///     through the wrap-aware delta
+const max_tracked_storms: usize = 8;
+const WindSoakStats = struct {
+    samples: u64 = 0,
+    nan_count: u64 = 0,
+    mag_min: f32 = std.math.floatMax(f32),
+    mag_max: f32 = -std.math.floatMax(f32),
+
+    storm_count: u32 = 0,
+    storm_first_center: [max_tracked_storms][2]f32 = .{.{ 0, 0 }} ** max_tracked_storms,
+    storm_last_center: [max_tracked_storms][2]f32 = .{.{ 0, 0 }} ** max_tracked_storms,
+    storm_max_step: [max_tracked_storms]f32 = .{0} ** max_tracked_storms,
+    storm_path_length: [max_tracked_storms]f32 = .{0} ** max_tracked_storms,
+
+    fn observe(
+        self: *WindSoakStats,
+        p: notatlas.wind_query.WindParams,
+        t: f32,
+        grid: []const render.wind_arrows.ArrowInstance,
+    ) void {
+        const first = self.samples == 0;
+        if (first) self.storm_count = @intCast(@min(p.storms.len, max_tracked_storms));
+
+        for (grid) |inst| {
+            self.samples += 1;
+            const wx = inst.wind_xz[0];
+            const wz = inst.wind_xz[1];
+            if (std.math.isNan(wx) or std.math.isNan(wz)) {
+                self.nan_count += 1;
+                continue;
+            }
+            const m = @sqrt(wx * wx + wz * wz);
+            if (m < self.mag_min) self.mag_min = m;
+            if (m > self.mag_max) self.mag_max = m;
+        }
+
+        const half = p.storm_world_m * 0.5;
+        var i: usize = 0;
+        while (i < self.storm_count) : (i += 1) {
+            const c = notatlas.wind_query.stormCenter(p, i, t);
+            if (first) {
+                self.storm_first_center[i] = c;
+                self.storm_last_center[i] = c;
+                continue;
+            }
+            const last = self.storm_last_center[i];
+            // Wrap-aware delta — when a storm crosses the world edge the
+            // raw c-last jump looks like ±world_m; subtracting the world
+            // size folds it back to the true short-path step.
+            var dx = c[0] - last[0];
+            var dz = c[1] - last[1];
+            if (dx > half) dx -= p.storm_world_m;
+            if (dx < -half) dx += p.storm_world_m;
+            if (dz > half) dz -= p.storm_world_m;
+            if (dz < -half) dz += p.storm_world_m;
+            const step = @sqrt(dx * dx + dz * dz);
+            if (step > self.storm_max_step[i]) self.storm_max_step[i] = step;
+            self.storm_path_length[i] += step;
+            self.storm_last_center[i] = c;
+        }
+    }
+
+    fn report(self: WindSoakStats, p: notatlas.wind_query.WindParams, duration_s: f32) void {
+        std.log.info(
+            \\wind soak: {d:.1}s, {d} samples, {d} NaN
+            \\  mag range: [{d:.3}, {d:.3}] m/s
+            \\  storms tracked: {d}/{d}
+        , .{
+            duration_s,    self.samples,
+            self.nan_count, self.mag_min,
+            self.mag_max,   self.storm_count,
+            p.storms.len,
+        });
+        var i: usize = 0;
+        while (i < self.storm_count) : (i += 1) {
+            const expected = p.storms[i].speed_mps * duration_s;
+            std.log.info("  storm[{d}]: path={d:.1} m, max-step={d:.4} m, expected drift={d:.1} m", .{
+                i, self.storm_path_length[i], self.storm_max_step[i], expected,
+            });
+        }
     }
 };
 
