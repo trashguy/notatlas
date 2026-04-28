@@ -67,6 +67,31 @@ pub const Vec3 = extern struct {
     }
 };
 
+/// Single-axis yaw rotation around world +Y, returned as a unit quaternion
+/// in `(x, y, z, w)` order (Jolt convention). Used for per-passenger local
+/// orientation in the M5.5 multi-pax composition — each passenger faces a
+/// fixed direction in ship-local frame, then the ship's rotation carries
+/// them to world.
+pub fn quatYaw(yaw_rad: f32) [4]f32 {
+    const half = yaw_rad * 0.5;
+    return .{ 0, @sin(half), 0, @cos(half) };
+}
+
+/// Hamilton product of two quaternions in `(x, y, z, w)` order.
+/// `quatMul(a, b)` applied to a vector rotates by `b` first, then `a` —
+/// the convention `quatSlerp` and `Vec3.rotateByQuat` already use. M5.5
+/// composes per-passenger world orientation as
+/// `ship_rot · local_yaw_quat`: yaw the passenger in ship-local frame,
+/// then carry the result through the ship's own rotation.
+pub fn quatMul(a: [4]f32, b: [4]f32) [4]f32 {
+    return .{
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    };
+}
+
 /// Spherical-linear interpolation between two unit quaternions in
 /// `(x, y, z, w)` order (Jolt convention). Used for sub-tick rendering
 /// of physics bodies — at frame time we slerp between `pose_prev` and
@@ -309,6 +334,46 @@ test "Vec3.rotateByQuat identity preserves vector" {
     try std.testing.expectApproxEqAbs(v.x, r.x, 1e-5);
     try std.testing.expectApproxEqAbs(v.y, r.y, 1e-5);
     try std.testing.expectApproxEqAbs(v.z, r.z, 1e-5);
+}
+
+test "quatYaw at zero is identity" {
+    const q = quatYaw(0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), q[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), q[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), q[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), q[3], 1e-6);
+}
+
+test "quatYaw 90deg rotates +x to -z" {
+    const q = quatYaw(std.math.pi * 0.5);
+    const v = Vec3.rotateByQuat(Vec3.init(1, 0, 0), q);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), v.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), v.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), v.z, 1e-5);
+}
+
+test "quatMul identity is no-op" {
+    const id: [4]f32 = .{ 0, 0, 0, 1 };
+    const q: [4]f32 = .{ 0.1, 0.2, 0.3, 0.927362 }; // unit-ish
+    const r = quatMul(id, q);
+    for (0..4) |i| try std.testing.expectApproxEqAbs(q[i], r[i], 1e-5);
+    const r2 = quatMul(q, id);
+    for (0..4) |i| try std.testing.expectApproxEqAbs(q[i], r2[i], 1e-5);
+}
+
+test "quatMul composes rotations: yaw 90 then pitch 90 around X" {
+    const s2 = @sqrt(@as(f32, 0.5));
+    const yaw: [4]f32 = .{ 0, s2, 0, s2 }; // 90° around +Y
+    const pitch: [4]f32 = .{ s2, 0, 0, s2 }; // 90° around +X
+    // Apply yaw then pitch (in that order via Hamilton product
+    // quatMul(pitch, yaw)) to (1,0,0):
+    // After yaw 90°y: (1,0,0) → (0,0,-1)
+    // After pitch 90°x: (0,0,-1) → (0,1,0)
+    const composed = quatMul(pitch, yaw);
+    const v = Vec3.rotateByQuat(Vec3.init(1, 0, 0), composed);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), v.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), v.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), v.z, 1e-5);
 }
 
 test "quatSlerp endpoints return inputs (up to sign)" {

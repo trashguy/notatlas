@@ -11,6 +11,7 @@
 
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_world_normal;
+layout(location = 2) in vec3 v_albedo;
 layout(location = 0) out vec4 o_color;
 
 layout(set = 0, binding = 0) uniform Camera {
@@ -20,7 +21,6 @@ layout(set = 0, binding = 0) uniform Camera {
 } cam;
 
 const vec3 SUN_DIR = normalize(vec3(-0.0773502691896258, 0.6, 0.5773502691896258));
-const vec3 BOX_ALBEDO = vec3(0.72, 0.66, 0.55); // warm sand — visible against blue water
 const float FOG_DENSITY = 0.003; // mostly atmospheric — kicks in past ~150 m
 
 vec3 extra_cheap_atmosphere(vec3 raydir, vec3 sundir) {
@@ -74,7 +74,7 @@ void main() {
     // shadowed faces both stay readable against the sea.
     float n_dot_l = max(0.0, dot(N, SUN_DIR));
     vec3 sky_ambient = getAtmosphere(vec3(0.0, 1.0, 0.0));
-    vec3 lit = BOX_ALBEDO * (0.25 + 0.85 * n_dot_l) + sky_ambient * 0.05;
+    vec3 lit = v_albedo * (0.25 + 0.85 * n_dot_l) + sky_ambient * 0.05;
 
     vec3 atmo = getAtmosphere(FOG_REF_DIR);
     float fog_t = 1.0 - exp(-FOG_DENSITY * dist);

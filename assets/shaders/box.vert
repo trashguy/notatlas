@@ -18,14 +18,17 @@ layout(set = 0, binding = 0) uniform Camera {
 
 layout(push_constant) uniform Push {
     mat4 model;
+    vec4 albedo; // xyz = sRGB-ish color, w = unused (std140 padding)
 } push;
 
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_world_normal;
+layout(location = 2) out vec3 v_albedo;
 
 void main() {
     vec4 wp = push.model * vec4(i_pos, 1.0);
     v_world_pos = wp.xyz;
     v_world_normal = mat3(push.model) * i_normal;
+    v_albedo = push.albedo.xyz;
     gl_Position = cam.proj * cam.view * wp;
 }

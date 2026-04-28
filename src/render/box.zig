@@ -1,17 +1,26 @@
 //! M3.2 debug box pass. Renders a unit cube (±0.5 in object space) with
-//! a vertex+fragment pipeline; the model matrix arrives as a vertex-stage
-//! push constant so a single Box can render any TRS-transformed instance.
+//! a vertex+fragment pipeline; the model matrix + albedo color arrive as a
+//! vertex-stage push constant so a single Box can render any
+//! TRS-transformed, recolored instance.
+//!
+//! M5.5 split `record` into `bind` (one-shot pipeline+descriptor setup)
+//! plus `draw(model, albedo)` (per-instance push + drawIndexed). Caller
+//! binds once per frame, then issues one draw per ship/passenger; same
+//! pipeline + same mesh, varying transform and color. Cheap (push constants
+//! bypass descriptor updates entirely) and avoids spinning up a separate
+//! capsule renderer for the M5.5 multi-pax demo.
 //!
 //! Pipeline differences from `Ocean`:
 //!   - Vertex input: 1 binding, 2 attributes (pos vec3 + normal vec3).
 //!   - Descriptor set: 1 UBO (camera) at vertex+fragment stage. Buffer is
 //!     supplied by caller — typically the same `Ocean.camera_ubo` so the
 //!     two passes always agree on view/proj/eye without duplicate uploads.
-//!   - Push constant: 64 B mat4 in the vertex stage.
+//!   - Push constant: 80 B (mat4 model + vec4 albedo). std140-compatible —
+//!     vec4 starts on a 16 B boundary at offset 64.
 //!   - Depth: test+write, COMPARE_OP_LESS (strict — frag does not write
 //!     gl_FragDepth, unlike the water pass).
-//!   - Cull: NONE for M3.2. Vulkan's y-flipped projection inverts world
-//!     winding into NDC; we'll commit to a winding+cull pair when M5
+//!   - Cull: NONE. Vulkan's y-flipped projection inverts world winding
+//!     into NDC; we'll commit to a winding+cull pair when M5 / Phase 1
 //!     adds proper ship meshes.
 
 const std = @import("std");
@@ -31,6 +40,20 @@ pub const Vertex = extern struct {
     pos: [3]f32,
     normal: [3]f32,
 };
+
+/// 80-byte push constant: column-major model matrix + RGB albedo (vec4 with
+/// w padding for std140). Layout MUST match the `Push { mat4 model; vec4
+/// albedo; }` block in box.vert.
+pub const PushConstants = extern struct {
+    model: [16]f32,
+    albedo: [4]f32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(PushConstants) == 80);
+    std.debug.assert(@offsetOf(PushConstants, "model") == 0);
+    std.debug.assert(@offsetOf(PushConstants, "albedo") == 64);
+}
 
 /// 24-vertex unit cube (±0.5). Faces share corner positions but each face
 /// gets its own normal, so we duplicate corners 3× across faces.
@@ -85,9 +108,11 @@ pub const Box = struct {
     vertex_buffer: buffer_mod.Buffer,
     index_buffer: buffer_mod.Buffer,
 
-    /// Most recent model matrix. `record` reads this and pushes it; `setModel`
-    /// just stores. Avoids needing a per-frame UBO for a single transform.
+    /// Default model + albedo for the convenience `record` path. Multi-draw
+    /// callers (M5.5+) skip these and pass values to `draw(cb, model, albedo)`
+    /// after a single `bind(cb, extent)`.
     model: [16]f32,
+    albedo: [4]f32,
 
     pub fn init(
         gpu: *const gpu_mod.GpuContext,
@@ -140,6 +165,7 @@ pub const Box = struct {
             .vertex_buffer = vbo,
             .index_buffer = ibo,
             .model = identity_mat,
+            .albedo = ship_albedo,
         };
     }
 
@@ -156,6 +182,10 @@ pub const Box = struct {
     /// major, matching `notatlas.math.Mat4`.
     pub fn setModel(self: *Box, data: [16]f32) void {
         self.model = data;
+    }
+
+    pub fn setAlbedo(self: *Box, rgb: [3]f32) void {
+        self.albedo = .{ rgb[0], rgb[1], rgb[2], 0 };
     }
 
     /// Hot-reload entry: rebuild the pipeline against fresh SPIR-V. Mirrors
@@ -184,7 +214,10 @@ pub const Box = struct {
         self.pipeline = new_handle;
     }
 
-    pub fn record(self: *Box, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void {
+    /// One-shot pipeline + descriptor + buffer setup. Caller invokes once
+    /// per frame, then issues N `draw` calls — the pipeline state and bound
+    /// resources persist across draws within the same render pass.
+    pub fn bind(self: *Box, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void {
         vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
 
         const viewport = vk.VkViewport{
@@ -217,17 +250,35 @@ pub const Box = struct {
         const offset: vk.VkDeviceSize = 0;
         vk.vkCmdBindVertexBuffers(cb, 0, 1, &self.vertex_buffer.handle, &offset);
         vk.vkCmdBindIndexBuffer(cb, self.index_buffer.handle, 0, vk.VK_INDEX_TYPE_UINT16);
+    }
 
+    /// Push the per-instance model + albedo and issue one indexed draw.
+    /// Must be preceded by `bind` in the same render pass.
+    pub fn draw(
+        self: *Box,
+        cb: vk.VkCommandBuffer,
+        model: [16]f32,
+        albedo: [4]f32,
+    ) void {
+        const push: PushConstants = .{ .model = model, .albedo = albedo };
         vk.vkCmdPushConstants(
             cb,
             self.pipeline_layout,
             vk.VK_SHADER_STAGE_VERTEX_BIT,
             0,
-            @sizeOf([16]f32),
-            &self.model,
+            @sizeOf(PushConstants),
+            &push,
         );
-
         vk.vkCmdDrawIndexed(cb, cube_indices.len, 1, 0, 0, 0);
+    }
+
+    /// Convenience: bind + draw with `self.model` / `self.albedo`. Use this
+    /// for single-instance callers (e.g., the ship's own draw); use
+    /// `bind` + repeated `draw(model, albedo)` for the multi-draw path
+    /// (M5.5 ship + N passengers).
+    pub fn record(self: *Box, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void {
+        self.bind(cb, extent);
+        self.draw(cb, self.model, self.albedo);
     }
 };
 
@@ -237,6 +288,13 @@ const identity_mat: [16]f32 = .{
     0, 0, 1, 0,
     0, 0, 0, 1,
 };
+
+/// Default ship-box albedo. Saturated wood-brown — boat-appropriate and
+/// dark enough that the `* 2.0` exposure + ACES tonemap don't push the
+/// sun-lit top face to near-white (which is what happened with the prior
+/// 0.72,0.66,0.55 "warm sand" — ACES highlight desaturation made the
+/// deck look cream-white in M5.5 first-person view).
+pub const ship_albedo: [4]f32 = .{ 0.38, 0.22, 0.12, 0 };
 
 fn createSetLayout(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
     const bindings = [_]vk.VkDescriptorSetLayoutBinding{.{
@@ -268,7 +326,7 @@ fn createPipelineLayout(
     const push_range = vk.VkPushConstantRange{
         .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
         .offset = 0,
-        .size = @sizeOf([16]f32),
+        .size = @sizeOf(PushConstants),
     };
     const ci = vk.VkPipelineLayoutCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

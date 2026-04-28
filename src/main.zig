@@ -30,10 +30,22 @@ const frag_shader_path = "assets/shaders/water.frag";
 const box_vert_shader_path = "assets/shaders/box.vert";
 const box_frag_shader_path = "assets/shaders/box.frag";
 
+/// Passenger count for the M5.5 multi-pax demo. Three NPCs scattered on
+/// the deck at fixed local poses with distinct colors. Every frame their
+/// world models are composed from the interpolated ship pose so they stick
+/// to the deck through pitches/rolls — the same SoT-style composition the
+/// player camera uses, but rendered as actual visible bodies.
+const npc_pax_count: u32 = 3;
+
 const Scene = struct {
     ocean: *render.Ocean,
     box: *render.Box,
     arrows: *render.WindArrows,
+    /// Combined ship + passenger draws share the Box pipeline. Index 0 is
+    /// the ship itself; 1..=npc_pax_count are the NPC passengers. main.zig
+    /// repopulates these every frame from the interpolated ship pose.
+    box_models: [1 + npc_pax_count][16]f32,
+    box_albedos: [1 + npc_pax_count][4]f32,
 };
 
 pub fn main() !void {
@@ -84,7 +96,13 @@ pub fn main() !void {
     defer box.deinit();
     var arrows = try render.WindArrows.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, arrow_count);
     defer arrows.deinit();
-    var scene: Scene = .{ .ocean = &ocean, .box = &box, .arrows = &arrows };
+    var scene: Scene = .{
+        .ocean = &ocean,
+        .box = &box,
+        .arrows = &arrows,
+        .box_models = .{[_]f32{0} ** 16} ** (1 + npc_pax_count),
+        .box_albedos = .{.{ 0, 0, 0, 0 }} ** (1 + npc_pax_count),
+    };
 
     const wave_params = try loadWaves(gpa, wave_config_path);
     ocean.setWaveParams(wave_params);
@@ -179,6 +197,31 @@ pub fn main() !void {
         .pos = notatlas.math.Vec3.init(0, hull.half_extents[1], 0),
     };
     player.boardShip(box_id, player.pos);
+
+    // M5.5 NPC passengers — three fixed poses on the deck, distinct colors,
+    // facing different directions. They demonstrate that the SoT-style
+    // composition handles multiple visible bodies on a pitching ship without
+    // jitter or z-fighting; same math the player camera uses, rendered as
+    // 0.5 × 1.7 × 0.5 m capsule-stand-ins (the existing Box mesh, scaled).
+    var npc_pax: [npc_pax_count]notatlas.player.Player = undefined;
+    // Spread across the new ship-like deck (4 m beam × 6 m length, hull
+    // is half_extents 2 × 1.25 × 3). All three within the deck-clamp
+    // walkable area (±(half - 0.3) inset).
+    const npc_init: [npc_pax_count]struct { local_pos: notatlas.math.Vec3, yaw: f32 } = .{
+        .{ .local_pos = notatlas.math.Vec3.init(1.2, hull.half_extents[1], -2.0), .yaw = 0 },
+        .{ .local_pos = notatlas.math.Vec3.init(0.0, hull.half_extents[1], 2.0), .yaw = std.math.pi },
+        .{ .local_pos = notatlas.math.Vec3.init(-1.2, hull.half_extents[1], -0.5), .yaw = std.math.pi * 0.5 },
+    };
+    const npc_albedo: [npc_pax_count][4]f32 = .{
+        .{ 0.85, 0.30, 0.30, 0 }, // red
+        .{ 0.30, 0.55, 0.90, 0 }, // blue
+        .{ 0.40, 0.75, 0.40, 0 }, // green
+    };
+    for (0..npc_pax_count) |i| {
+        npc_pax[i] = .{};
+        npc_pax[i].boardShip(box_id, npc_init[i].local_pos);
+        npc_pax[i].yaw = npc_init[i].yaw;
+    }
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -284,12 +327,43 @@ pub fn main() !void {
             pose_prev_pos[2] + (pose_curr_pos[2] - pose_prev_pos[2]) * alpha,
         );
         const render_rot = notatlas.math.quatSlerp(pose_prev_rot, pose_curr_rot, alpha);
-        const box_model = notatlas.math.Mat4.trs(
+
+        // Index 0 = ship itself: scaled to 4×4×4 m by the hull half-extents.
+        const ship_model = notatlas.math.Mat4.trs(
             render_pos,
             render_rot,
             notatlas.math.Vec3.init(2 * hull.half_extents[0], 2 * hull.half_extents[1], 2 * hull.half_extents[2]),
         );
-        box.setModel(box_model.data);
+        scene.box_models[0] = ship_model.data;
+        scene.box_albedos[0] = render.box.ship_albedo;
+
+        // Indices 1.. = NPC passengers, composed as ship_pose ⊗ pax_local.
+        // ship_pose_only is unscaled (identity scale); the per-pax scale
+        // (0.5 × 1.7 × 0.5 m) lives in the pax local model alongside the
+        // local yaw. Feet sit on local y = +half_extents.y; the cube mesh is
+        // ±0.5 in object space, so we lift its center by half the height
+        // (1.7/2 = 0.85) to put the feet on the deck.
+        const ship_pose_only = notatlas.math.Mat4.trs(
+            render_pos,
+            render_rot,
+            notatlas.math.Vec3.init(1, 1, 1),
+        );
+        const pax_half_height: f32 = 0.85;
+        for (0..npc_pax_count) |i| {
+            const p = npc_pax[i];
+            const local_offset = notatlas.math.Vec3.init(
+                p.pos.x,
+                p.pos.y + pax_half_height,
+                p.pos.z,
+            );
+            const local_model = notatlas.math.Mat4.trs(
+                local_offset,
+                notatlas.math.quatYaw(p.yaw),
+                notatlas.math.Vec3.init(0.5, 1.7, 0.5),
+            );
+            scene.box_models[1 + i] = notatlas.math.Mat4.mul(ship_pose_only, local_model).data;
+            scene.box_albedos[1 + i] = npc_albedo[i];
+        }
 
         if (cli.soak_seconds > 0 and t >= cli.soak_seconds) break;
 
@@ -536,7 +610,12 @@ fn recordScene(
 ) void {
     const scene: *Scene = @ptrCast(@alignCast(ctx));
     scene.ocean.record(cb, extent);
-    scene.box.record(cb, extent);
+    // Single Box bind, multiple draws: ship + N passengers share the
+    // pipeline and mesh; only push constants change per draw.
+    scene.box.bind(cb, extent);
+    for (0..scene.box_models.len) |i| {
+        scene.box.draw(cb, scene.box_models[i], scene.box_albedos[i]);
+    }
     scene.arrows.record(cb, extent);
 }
 
