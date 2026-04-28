@@ -16,6 +16,7 @@ Atlas (Grapeshot Games' pirate MMO). Reading order:
 | R1 | [research/atlas-features.md](research/atlas-features.md) | Consolidated feature research |
 | R2 | [research/atlas-postmortem.md](research/atlas-postmortem.md) | Why Atlas failed (lessons learned) |
 | R3 | [research/atlas-server-tech.md](research/atlas-server-tech.md) | Original Atlas server architecture for reference |
+| B  | [build-windows.md](build-windows.md) | Cross-compiling the sandbox from Linux to Windows |
 
 ## TL;DR for someone new to the project
 

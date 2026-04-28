@@ -11,8 +11,12 @@
 //! `poll()` is non-blocking and intended to run once per frame. Multiple
 //! events for the same target within a single poll coalesce into one
 //! flag.
+//!
+//! On non-Linux targets (Windows cross-compile for soak builds) `Watcher`
+//! is a no-op stub with the same API — hot-reload is a dev-only feature.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -28,7 +32,18 @@ pub const Events = packed struct {
     }
 };
 
-pub const Watcher = struct {
+pub const Paths = struct {
+    data_dir: [:0]const u8 = "data",
+    waves_dir: [:0]const u8 = "data/waves",
+    ships_dir: [:0]const u8 = "data/ships",
+    shaders_dir: [:0]const u8 = "assets/shaders",
+    wave_basename: []const u8 = "storm.yaml",
+    hull_basename: []const u8 = "box.yaml",
+};
+
+pub const Watcher = if (builtin.os.tag == .linux) LinuxWatcher else StubWatcher;
+
+const LinuxWatcher = struct {
     fd: i32,
     wd_data: i32,
     wd_waves: i32,
@@ -43,16 +58,7 @@ pub const Watcher = struct {
     /// pattern as `wave_basename`.
     hull_basename: []const u8,
 
-    pub const Paths = struct {
-        data_dir: [:0]const u8 = "data",
-        waves_dir: [:0]const u8 = "data/waves",
-        ships_dir: [:0]const u8 = "data/ships",
-        shaders_dir: [:0]const u8 = "assets/shaders",
-        wave_basename: []const u8 = "storm.yaml",
-        hull_basename: []const u8 = "box.yaml",
-    };
-
-    pub fn init(paths: Paths) !Watcher {
+    pub fn init(paths: Paths) !LinuxWatcher {
         const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
         errdefer posix.close(fd);
 
@@ -73,12 +79,12 @@ pub const Watcher = struct {
         };
     }
 
-    pub fn deinit(self: *Watcher) void {
+    pub fn deinit(self: *LinuxWatcher) void {
         posix.close(self.fd);
     }
 
     /// Drain the event queue and return what was touched. Never blocks.
-    pub fn poll(self: *Watcher) Events {
+    pub fn poll(self: *LinuxWatcher) Events {
         var events: Events = .{};
         // 4 KiB holds ~250 events worst case — far more than a single
         // editor save produces. If a flood ever exceeds this, the next
@@ -117,5 +123,15 @@ pub const Watcher = struct {
                 }
             }
         }
+    }
+};
+
+const StubWatcher = struct {
+    pub fn init(_: Paths) !StubWatcher {
+        return .{};
+    }
+    pub fn deinit(_: *StubWatcher) void {}
+    pub fn poll(_: *StubWatcher) Events {
+        return .{};
     }
 };

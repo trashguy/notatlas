@@ -1,13 +1,47 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    // Pin glibc_version so Zig builds its bundled glibc (incl. crt1.o)
-    // instead of pulling Arch's system Scrt1.o, whose .sframe section
-    // currently trips Zig 0.15.2's bundled LLD on linux-gnu native targets.
-    const target = b.standardTargetOptions(.{
-        .default_target = .{ .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 38, .patch = 0 } },
-    });
+    // Pin glibc_version on Linux hosts so Zig builds its bundled glibc
+    // (incl. crt1.o) instead of pulling Arch's system Scrt1.o, whose
+    // .sframe section currently trips Zig 0.15.2's bundled LLD on
+    // linux-gnu native targets. Outside Linux hosts the field is
+    // meaningless, so leave default_target empty and let standardTargetOptions
+    // resolve to the host (or whatever -Dtarget the user passes).
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 38, .patch = 0 } }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+
+    const is_windows = target.result.os.tag == .windows;
+
+    // Windows cross-compile: vulkan-1.lib import library lives under
+    // libs/windows/. Fetched via `make setup-windows`.
+    const vulkan_lib_path: ?std.Build.LazyPath = if (is_windows) b.path("libs/windows/vulkan/lib") else null;
+    if (is_windows) {
+        const lib_path = b.path("libs/windows/vulkan/lib/vulkan-1.lib").getPath(b);
+        std.fs.cwd().access(lib_path, .{}) catch {
+            std.log.err(
+                \\
+                \\=================================================================
+                \\  Missing Windows Vulkan library!
+                \\=================================================================
+                \\
+                \\  vulkan-1.lib not found at: libs/windows/vulkan/lib/
+                \\
+                \\  Run this to download it:
+                \\    make setup-windows
+                \\  or:
+                \\    python3 scripts/fetch_windows_deps.py
+                \\
+                \\=================================================================
+                \\
+            , .{});
+            std.process.exit(1);
+        };
+    }
 
     const ymlz_dep = b.dependency("ymlz", .{
         .target = target,
@@ -48,7 +82,14 @@ pub fn build(b: *std.Build) void {
     // the C wrapper includes them. The wrapper itself (src/physics/
     // jolt_c_api.cpp) is bundled into the same library so libJolt.a is the
     // single physics artifact downstream code links.
-    const jolt = buildJolt(b, target, optimize) catch @panic("jolt source enumeration failed");
+    //
+    // Jolt's intrinsics need SSE3+/AVX2 in the *codegen* target, not just in
+    // -m flags. On native Linux, mcpu=native already covers it; for any
+    // cross-compile (incl. x86_64-windows), -mcpu defaults to baseline (SSE2),
+    // so we explicitly add the features Jolt's CMake assumes for the AVX2
+    // configuration.
+    const jolt_target = joltTarget(b, target);
+    const jolt = buildJolt(b, jolt_target, optimize) catch @panic("jolt source enumeration failed");
     b.installArtifact(jolt);
 
     // Zig-side physics module: Jolt FFI + buoyancy. Buoyancy imports
@@ -72,10 +113,15 @@ pub fn build(b: *std.Build) void {
     sandbox_mod.addIncludePath(vulkan_include);
     sandbox_mod.linkLibrary(zglfw_dep.artifact("glfw"));
     sandbox_mod.linkLibrary(jolt);
-    // Pinned glibc makes Zig treat this as cross-compile; add system dirs
-    // back so it can resolve libvulkan/libX11.
-    sandbox_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    sandbox_mod.linkSystemLibrary("vulkan", .{});
+    if (is_windows) {
+        if (vulkan_lib_path) |p| sandbox_mod.addLibraryPath(p);
+        sandbox_mod.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        // Pinned glibc makes Zig treat this as cross-compile; add system dirs
+        // back so it can resolve libvulkan/libX11.
+        sandbox_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        sandbox_mod.linkSystemLibrary("vulkan", .{});
+    }
     sandbox_mod.link_libc = true;
 
     // Compile GLSL → SPIR-V via system glslc and embed each blob into the
@@ -115,6 +161,23 @@ fn embedShader(
 }
 
 const jolt_root = "vendor/JoltPhysics";
+
+/// Return a target identical to `base` but with x86 SIMD features (SSE3
+/// through AVX2 + BMI/LZCNT/POPCNT/F16C/FMA) explicitly enabled. Required
+/// when `base` resolves to `mcpu=baseline` (any non-native target), since
+/// Jolt's intrinsics won't compile against SSE2-only.
+fn joltTarget(b: *std.Build, base: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+    if (base.result.cpu.arch != .x86_64) return base;
+    var query = base.query;
+    const Feature = std.Target.x86.Feature;
+    const features = [_]Feature{
+        .sse3, .ssse3, .sse4_1, .sse4_2,
+        .avx,  .avx2,  .bmi,    .bmi2,
+        .lzcnt, .popcnt, .f16c, .fma,
+    };
+    for (features) |f| query.cpu_features_add.addFeature(@intFromEnum(f));
+    return b.resolveTargetQuery(query);
+}
 
 /// Build Jolt as a static library. Mirrors Jolt's `Jolt/Jolt.cmake` for the
 /// default x86_64 Linux non-MSVC configuration: AVX2 instruction set, asserts

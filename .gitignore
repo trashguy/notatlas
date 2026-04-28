@@ -3,3 +3,8 @@ zig-out/
 .serena/
 captures/
 .idea/
+
+# Windows cross-compilation libs (downloaded by scripts/fetch_windows_deps.py)
+libs/windows/vulkan/lib/*.lib
+libs/windows/vulkan/lib/*.dll
+libs/windows/vulkan/lib/*.def
