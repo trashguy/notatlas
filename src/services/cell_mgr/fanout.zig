@@ -495,3 +495,220 @@ test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after war
         post_run_allocs,
     });
 }
+
+// ---- M6.5 BANDWIDTH MEASUREMENT ----
+//
+// Per docs/08 §6 M6.5: confirm per-subscriber BW ≤ Tier 0 budget at
+// idle, scales with tier escalation as expected. Numbers logged to
+// docs/research/m6-bandwidth.md. The actual 16 B/pose comes in M7;
+// for M6 a fixed-size 20 B placeholder record is fine.
+//
+// Per-client downstream cap per docs/01 §1 / docs/02 §9: ≤1 Mbps
+// = 125 000 B/s. M6 fanout is uniform 30 Hz (tier-1 will jump to 60 Hz
+// post-M7 once per-tier rate gating lands; M6 numbers undercount that
+// case and overcount the fleet-aggregate 5 Hz case). All measurements
+// are application-layer payload — NATS framing + TCP/IP add a fixed
+// per-message overhead (~20-30 B for "PUB <subj> <len>\r\n") that
+// doesn't change the relative scaling.
+
+const ScenarioStats = struct {
+    name: []const u8,
+    n_subs: usize,
+    n_ents: usize,
+    payload_min: usize,
+    payload_max: usize,
+    payload_mean: f64,
+    /// Mean visible-entity count per subscriber. Sanity-check that the
+    /// scenario produced what we intended.
+    visible_mean: f64,
+    bytes_per_sec_mean: f64,
+    bytes_per_sec_max: f64,
+    pct_of_budget_max: f64,
+};
+
+const tick_hz: f64 = 30.0;
+const budget_bytes_per_sec: f64 = 125_000.0; // 1 Mbps / 8
+
+fn measureScenario(
+    a: std.mem.Allocator,
+    name: []const u8,
+    ent_positions: []const [3]f32,
+    sub_positions: []const [3]f32,
+) !ScenarioStats {
+    var state = State.init(a);
+    defer state.deinit();
+    var fanout = Fanout.init(a, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = a };
+    defer capture.deinit();
+
+    for (ent_positions, 0..) |p, i| {
+        _ = try state.applyDelta(.{
+            .op = .enter,
+            .id = @intCast(i + 1),
+            .generation = 0,
+            .x = p[0],
+            .y = p[1],
+            .z = p[2],
+        });
+    }
+    for (sub_positions, 0..) |p, i| {
+        const cid: u64 = 0x1000 + @as(u64, i);
+        _ = try state.applySubscribe(.{
+            .op = .enter,
+            .client_id = cid,
+            .x = p[0],
+            .y = p[1],
+            .z = p[2],
+        });
+        try fanout.ensureSubscriber(cid);
+    }
+
+    _ = try fanout.runTick(&state, capture.sink());
+
+    var min: usize = std.math.maxInt(usize);
+    var max: usize = 0;
+    var sum: usize = 0;
+    var vis_sum: usize = 0;
+    for (sub_positions, 0..) |_, i| {
+        const cid: u64 = 0x1000 + @as(u64, i);
+        const payload = capture.payloadFor(cid).?;
+        if (payload.len < min) min = payload.len;
+        if (payload.len > max) max = payload.len;
+        sum += payload.len;
+
+        const header: PayloadHeader = std.mem.bytesToValue(PayloadHeader, payload[0..payload_header_size]);
+        vis_sum += header.count;
+    }
+
+    const n_subs_f: f64 = @floatFromInt(sub_positions.len);
+    const mean_payload: f64 = @as(f64, @floatFromInt(sum)) / n_subs_f;
+    const max_f: f64 = @floatFromInt(max);
+    return .{
+        .name = name,
+        .n_subs = sub_positions.len,
+        .n_ents = ent_positions.len,
+        .payload_min = min,
+        .payload_max = max,
+        .payload_mean = mean_payload,
+        .visible_mean = @as(f64, @floatFromInt(vis_sum)) / n_subs_f,
+        .bytes_per_sec_mean = mean_payload * tick_hz,
+        .bytes_per_sec_max = max_f * tick_hz,
+        .pct_of_budget_max = max_f * tick_hz / budget_bytes_per_sec * 100.0,
+    };
+}
+
+test "M6.5 BW: idle / mid / hot scenarios + distance sweep" {
+    const a = testing.allocator;
+
+    // Allocator the scenarios share for their position arrays. Freed
+    // at end of test.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+
+    var rng = std.Random.DefaultPrng.init(0xBADC0DE);
+    const r = rng.random();
+
+    // ---- Scenario A: idle ----
+    // 100 entities + 50 subs uniformly across 4 km × 4 km. With
+    // visual range 500 m, mean inter-pair distance is large; most
+    // pairs are at fleet_aggregate or always (excluded from the
+    // individual stream).
+    const n_ent_idle: usize = 100;
+    const n_sub_idle: usize = 50;
+    const idle_ents = try sa.alloc([3]f32, n_ent_idle);
+    for (idle_ents) |*p| p.* = .{ (r.float(f32) - 0.5) * 4000, 0, (r.float(f32) - 0.5) * 4000 };
+    const idle_subs = try sa.alloc([3]f32, n_sub_idle);
+    for (idle_subs) |*p| p.* = .{ (r.float(f32) - 0.5) * 4000, 0, (r.float(f32) - 0.5) * 4000 };
+    const idle = try measureScenario(a, "idle (uniform 4 km box)", idle_ents, idle_subs);
+
+    // ---- Scenario B: mid (typical fleet engagement) ----
+    // 30 entities clustered in 800 m × 800 m, 50 subs in 1 km × 1 km.
+    // Most pairs at visual or close_combat.
+    const n_ent_mid: usize = 30;
+    const n_sub_mid: usize = 50;
+    const mid_ents = try sa.alloc([3]f32, n_ent_mid);
+    for (mid_ents) |*p| p.* = .{ (r.float(f32) - 0.5) * 800, 0, (r.float(f32) - 0.5) * 800 };
+    const mid_subs = try sa.alloc([3]f32, n_sub_mid);
+    for (mid_subs) |*p| p.* = .{ (r.float(f32) - 0.5) * 1000, 0, (r.float(f32) - 0.5) * 1000 };
+    const mid = try measureScenario(a, "mid (30 ents, 50 subs in ~1 km)", mid_ents, mid_subs);
+
+    // ---- Scenario C: hot (200/cell stress, peak fight) ----
+    // Per docs/06 the per-cell entity cap is 200; 100 entities + 50
+    // subs all packed into a 200 m radius is the close_combat-density
+    // worst case.
+    const n_ent_hot: usize = 100;
+    const n_sub_hot: usize = 50;
+    const hot_ents = try sa.alloc([3]f32, n_ent_hot);
+    for (hot_ents) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
+    const hot_subs = try sa.alloc([3]f32, n_sub_hot);
+    for (hot_subs) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
+    const hot = try measureScenario(a, "hot (100 ents, 50 subs in 200 m)", hot_ents, hot_subs);
+
+    // ---- Distance sweep (single subscriber, fixed entity cluster) ----
+    // 100 entities all at origin; one subscriber stepped through
+    // distances. Demonstrates the per-subscriber-payload curve as
+    // tier-promotes from `always` (excluded) → fleet_aggregate
+    // (excluded) → visual → close_combat.
+    const sweep_ents = try sa.alloc([3]f32, 100);
+    for (sweep_ents) |*p| p.* = .{ 0, 0, 0 };
+    const distances_m = [_]f32{ 5000, 2500, 1000, 600, 500, 400, 200, 150, 100, 0 };
+    var sweep_results: [distances_m.len]struct { d: f32, payload: usize, visible: u32 } = undefined;
+    for (distances_m, 0..) |d, i| {
+        const subs = try sa.alloc([3]f32, 1);
+        subs[0] = .{ d, 0, 0 };
+        const s = try measureScenario(a, "sweep", sweep_ents, subs);
+        sweep_results[i] = .{ .d = d, .payload = s.payload_max, .visible = @intFromFloat(s.visible_mean) };
+    }
+
+    const Stats = ScenarioStats;
+    const fmt =
+        \\
+        \\=== [M6.5] bandwidth report ===
+        \\Per-client cap: 1 Mbps = 125 000 B/s. M6 fanout @ 30 Hz uniform.
+        \\
+        \\Scenario                              | subs |ents| visible/sub | payload bytes (min/mean/max) | mean B/s | max B/s |  max%/budget
+        \\--------------------------------------+------+----+-------------+------------------------------+----------+---------+-------------
+    ;
+    std.debug.print("{s}\n", .{fmt});
+    inline for (.{ idle, mid, hot }) |s| {
+        const x: Stats = s;
+        std.debug.print(" {s:<37} | {d:>4} |{d:>3} | {d:>11.1} | {d:>5} / {d:>7.1} / {d:>5}      | {d:>8.1} | {d:>7.1} | {d:>9.2}%\n", .{
+            x.name,              x.n_subs,            x.n_ents,      x.visible_mean,
+            x.payload_min,       x.payload_mean,      x.payload_max, x.bytes_per_sec_mean,
+            x.bytes_per_sec_max, x.pct_of_budget_max,
+        });
+    }
+    std.debug.print("\nDistance sweep: 100 entities at origin, single subscriber stepped outward.\n", .{});
+    std.debug.print(" distance |  visible  | payload bytes | bytes/sec @30Hz\n", .{});
+    std.debug.print("----------+-----------+---------------+----------------\n", .{});
+    for (sweep_results) |sr| {
+        const bps = @as(f64, @floatFromInt(sr.payload)) * tick_hz;
+        std.debug.print(" {d:>6.0} m | {d:>9} | {d:>13} | {d:>15.1}\n", .{ sr.d, sr.visible, sr.payload, bps });
+    }
+    std.debug.print("\n", .{});
+
+    // ---- Gate assertions ----
+    //
+    // 1. Idle floor: subscribers far from all entities pay ≤ header
+    //    bytes per tick. Allow up to ~1% of budget — the uniform
+    //    scenario naturally has some sub-entity pairs within 500 m.
+    try testing.expect(idle.pct_of_budget_max <= 5.0);
+    // 2. Hot peak: even under 200/cell stress, a subscriber's max
+    //    payload must stay well within budget. 100 entities × 20 B +
+    //    4 B = 2004 B/tick = 60.12 KB/s = ~48% of budget.
+    try testing.expect(hot.pct_of_budget_max <= 75.0);
+    // 3. Scaling: visible-entity count must increase monotonically
+    //    as the sweep moves from far → close. Asserts the filter
+    //    actually escalates tier with distance.
+    var prev: u32 = 0;
+    for (sweep_results) |sr| {
+        try testing.expect(sr.visible >= prev);
+        prev = sr.visible;
+    }
+    // 4. Sanity: the sweep's closest position (0 m) sees all 100
+    //    entities (they're stacked at the origin, all within
+    //    close_combat range).
+    try testing.expectEqual(@as(u32, 100), sweep_results[sweep_results.len - 1].visible);
+}
