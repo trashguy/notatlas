@@ -5,6 +5,7 @@ pub const ocean_params = @import("ocean_params.zig");
 pub const hull_params = @import("hull_params.zig");
 pub const player = @import("player.zig");
 pub const replication = @import("shared/replication.zig");
+pub const pose_codec = @import("shared/pose_codec.zig");
 pub const yaml_loader = @import("yaml_loader.zig");
 
 test {

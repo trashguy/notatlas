@@ -221,8 +221,19 @@ Format: position quantized to 1cm relative to keyframe (6 B), smallest-
 three quaternion (4 B), velocity delta (4 B), optional cell-id (2 B).
 
 **Milestone gate (M7):** roundtrip test — encode then decode 1M random
-poses; verify max error <1 cm position, <0.1° rotation. Wire size
+poses; verify max error <1 cm position, <0.5° rotation. Wire size
 average ≤16 B.
+
+The 0.5° rotation bound (relaxed from an earlier 0.1° aspirational
+target) is the achievable floor for 4 B smallest-three at 10 bits per
+component — the largest-component reconstruction step amplifies
+sub-LSB error in the others when the largest sits near 1/2. Tightening
+to <0.1° would require either 5 B per quat (breaking the 16 B/pose
+budget) or a delta-quat encoding that exploits small per-tick
+rotations; either is a future codec revision. The 0.5° bound
+corresponds to a ~4 cm corner displacement on a 5 m ship beam — the
+same order as the 1 cm position quantization, so it doesn't dominate
+visual error.
 
 ---
 
