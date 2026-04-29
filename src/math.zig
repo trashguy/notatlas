@@ -230,13 +230,13 @@ pub const Mat4 = extern struct {
         return .{
             .data = .{
                 // col 0 = R · (sx, 0, 0, 0)
-                (1 - 2 * (yy + zz)) * sx, (2 * (xy + wz)) * sx, (2 * (xz - wy)) * sx, 0,
+                (1 - 2 * (yy + zz)) * sx, (2 * (xy + wz)) * sx,     (2 * (xz - wy)) * sx,     0,
                 // col 1 = R · (0, sy, 0, 0)
-                (2 * (xy - wz)) * sy, (1 - 2 * (xx + zz)) * sy, (2 * (yz + wx)) * sy, 0,
+                (2 * (xy - wz)) * sy,     (1 - 2 * (xx + zz)) * sy, (2 * (yz + wx)) * sy,     0,
                 // col 2 = R · (0, 0, sz, 0)
-                (2 * (xz + wy)) * sz, (2 * (yz - wx)) * sz, (1 - 2 * (xx + yy)) * sz, 0,
+                (2 * (xz + wy)) * sz,     (2 * (yz - wx)) * sz,     (1 - 2 * (xx + yy)) * sz, 0,
                 // col 3 = translation
-                translation.x, translation.y, translation.z, 1,
+                translation.x,            translation.y,            translation.z,            1,
             },
         };
     }

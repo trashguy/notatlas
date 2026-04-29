@@ -47,6 +47,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const nats_dep = b.dependency("nats_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const zglfw_dep = b.dependency("zglfw", .{
         .target = target,
         .optimize = optimize,
@@ -145,6 +149,80 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_sandbox.addArgs(args);
     const run_step = b.step("run", "Run the notatlas sandbox");
     run_step.dependOn(&run_sandbox.step);
+
+    // ----- M6.3 services: cell-mgr + cell-mgr-harness -----
+    //
+    // Headless service binaries — no graphics deps. Both link the
+    // notatlas library (for the replication module) and nats-zig.
+    // Service binaries skip libc unless the underlying platform
+    // demands it; nats-zig is std-only and works without it.
+    const nats_mod = nats_dep.module("nats");
+
+    const cell_mgr_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cell_mgr_mod.addImport("notatlas", notatlas_mod);
+    cell_mgr_mod.addImport("nats", nats_mod);
+    const cell_mgr = b.addExecutable(.{
+        .name = "cell-mgr",
+        .root_module = cell_mgr_mod,
+    });
+    b.installArtifact(cell_mgr);
+
+    const run_cell_mgr = b.addRunArtifact(cell_mgr);
+    if (b.args) |args| run_cell_mgr.addArgs(args);
+    const cell_mgr_step = b.step("cell-mgr", "Run the cell-mgr service");
+    cell_mgr_step.dependOn(&run_cell_mgr.step);
+
+    // The harness shares wire.zig with cell-mgr — register that file
+    // as a named "wire" import so the harness can reach it without
+    // climbing back into the cell-mgr/ tree on every import.
+    const wire_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const harness_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr_harness/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    harness_mod.addImport("notatlas", notatlas_mod);
+    harness_mod.addImport("nats", nats_mod);
+    harness_mod.addImport("wire", wire_mod);
+    const harness = b.addExecutable(.{
+        .name = "cell-mgr-harness",
+        .root_module = harness_mod,
+    });
+    b.installArtifact(harness);
+
+    const run_harness = b.addRunArtifact(harness);
+    if (b.args) |args| run_harness.addArgs(args);
+    const harness_step = b.step("cell-mgr-harness", "Run the cell-mgr test harness");
+    harness_step.dependOn(&run_harness.step);
+
+    // cell-mgr unit tests (wire + state). Live outside the notatlas
+    // module since they depend on the cell-mgr-only `wire` import.
+    // Wired under the existing `test` step so `make test` covers them.
+    const wire_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wire_tests = b.addTest(.{ .root_module = wire_test_mod });
+    test_step.dependOn(&b.addRunArtifact(wire_tests).step);
+
+    const state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    state_test_mod.addImport("notatlas", notatlas_mod);
+    const state_tests = b.addTest(.{ .root_module = state_test_mod });
+    test_step.dependOn(&b.addRunArtifact(state_tests).step);
 }
 
 fn embedShader(
@@ -171,9 +249,9 @@ fn joltTarget(b: *std.Build, base: std.Build.ResolvedTarget) std.Build.ResolvedT
     var query = base.query;
     const Feature = std.Target.x86.Feature;
     const features = [_]Feature{
-        .sse3, .ssse3, .sse4_1, .sse4_2,
-        .avx,  .avx2,  .bmi,    .bmi2,
-        .lzcnt, .popcnt, .f16c, .fma,
+        .sse3,  .ssse3,  .sse4_1, .sse4_2,
+        .avx,   .avx2,   .bmi,    .bmi2,
+        .lzcnt, .popcnt, .f16c,   .fma,
     };
     for (features) |f| query.cpu_features_add.addFeature(@intFromEnum(f));
     return b.resolveTargetQuery(query);
@@ -213,7 +291,12 @@ fn buildJolt(
 
     const cpp_flags: []const []const u8 = &.{
         "-std=c++17",
-        "-mavx2", "-mbmi", "-mpopcnt", "-mlzcnt", "-mf16c", "-mfma",
+        "-mavx2",
+        "-mbmi",
+        "-mpopcnt",
+        "-mlzcnt",
+        "-mf16c",
+        "-mfma",
         "-mfpmath=sse",
         "-pthread",
         // Vendored code; warnings here aren't actionable for us. Mirror

@@ -1,0 +1,33 @@
+# Dev NATS broker for notatlas services. Run via:
+#   make nats-up        # podman compose -f infra/compose.yml up -d
+#   make nats-down
+#   make nats-logs
+#
+# Single-node, JetStream enabled, host port 4222 (client) + 8222 (monitor).
+# Standalone — sharing a NATS cluster with fallen-runes is forbidden per
+# docs/08 §4. The service mesh prefix split (sim/env/idx/gw/admin/chat
+# vs fallen-runes' fr.*) makes wildcard subscriptions collide opaquely.
+#
+# JetStream storage is in a named volume so streams survive container
+# restarts during dev iteration. Wipe with `podman volume rm
+# notatlas_nats_data` if you want a clean slate.
+services:
+  nats:
+    image: docker.io/nats:2.10
+    container_name: notatlas-nats
+    command:
+      - "--name=notatlas-dev"
+      - "--http_port=8222"
+      - "--jetstream"
+      - "--store_dir=/data/jetstream"
+    # Host networking so we don't depend on rootless pasta /
+    # slirp4netns being functional. The Makefile recipe matches.
+    # If you need port isolation later, switch back to:
+    #   ports: ["4222:4222", "8222:8222"]
+    network_mode: host
+    volumes:
+      - notatlas_nats_data:/data
+    restart: unless-stopped
+
+volumes:
+  notatlas_nats_data:

@@ -16,6 +16,13 @@
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.341.0.tar.gz",
             .hash = "N-V-__8AABJ5QgLfX-rcpaOGlg1YXcabW-m5cl5HEKkRsi3f",
         },
+        // We maintain nats-zig at https://github.com/trashguy/nats-zig.
+        // Tagged release; bump tag + re-fetch hash via `zig fetch --save`
+        // when the upstream client changes.
+        .nats_zig = .{
+            .url = "https://github.com/trashguy/nats-zig/archive/refs/tags/v0.2.1.tar.gz",
+            .hash = "nats_zig-0.1.0-Il_iJF0EAgCzlyL1iHUIeSHar2MBo5LdiwDqWfVufxDV",
+        },
     },
     .paths = .{
         "build.zig",

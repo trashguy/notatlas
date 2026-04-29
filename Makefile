@@ -1,5 +1,6 @@
 .PHONY: all build run test test-release release fmt fmt-check clean help \
-        setup-windows build-windows build-windows-debug
+        setup-windows build-windows build-windows-debug \
+        nats-up nats-down nats-logs cell-mgr cell-mgr-harness
 
 all: build
 
@@ -45,6 +46,43 @@ build-windows:
 build-windows-debug:
 	zig build -Dtarget=x86_64-windows
 
+# -----------------------------------------------------------------------------
+# Phase 1 services (M6.3+). Dev NATS broker runs in podman as a single
+# container. infra/compose.yml documents the canonical declarative shape but
+# we drive it through plain `podman run` to skip the podman-compose dep.
+# Keep the two in sync if you change image / ports / args.
+# -----------------------------------------------------------------------------
+
+PODMAN ?= podman
+NATS_NAME ?= notatlas-nats
+NATS_IMAGE ?= docker.io/nats:2.10
+NATS_VOLUME ?= notatlas_nats_data
+
+nats-up:
+	@$(PODMAN) container exists $(NATS_NAME) && \
+	    $(PODMAN) start $(NATS_NAME) >/dev/null || \
+	    $(PODMAN) run -d --name $(NATS_NAME) \
+	        --network host \
+	        -v $(NATS_VOLUME):/data \
+	        $(NATS_IMAGE) \
+	        --name=notatlas-dev --http_port=8222 \
+	        --jetstream --store_dir=/data/jetstream
+	@echo "nats listening on 127.0.0.1:4222 (monitor on :8222)"
+
+nats-down:
+	-@$(PODMAN) stop $(NATS_NAME) >/dev/null 2>&1
+	-@$(PODMAN) rm $(NATS_NAME) >/dev/null 2>&1
+	@echo "nats stopped"
+
+nats-logs:
+	$(PODMAN) logs -f $(NATS_NAME)
+
+cell-mgr:
+	zig build cell-mgr -- $(ARGS)
+
+cell-mgr-harness:
+	zig build cell-mgr-harness -- $(ARGS)
+
 help:
 	@echo "make build               — debug build"
 	@echo "make run                 — debug build + run sandbox"
@@ -57,3 +95,8 @@ help:
 	@echo "make setup-windows       — download vulkan-1.lib for Windows cross-compile"
 	@echo "make build-windows       — cross-compile sandbox.exe (ReleaseSafe)"
 	@echo "make build-windows-debug — cross-compile sandbox.exe (Debug)"
+	@echo "make nats-up             — start dev nats-server in podman"
+	@echo "make nats-down           — stop the dev nats-server"
+	@echo "make nats-logs           — tail the dev nats-server logs"
+	@echo "make cell-mgr            — run cell-mgr (pass args via ARGS=...)"
+	@echo "make cell-mgr-harness    — run cell-mgr-harness (pass args via ARGS=...)"

@@ -749,12 +749,11 @@ const SoakStats = struct {
             \\  max |lin v|: {d:.2} m/s
             \\  max |ang v|: {d:.2} rad/s
         , .{
-            duration_s,           self.samples,
-            self.nan_count,
-            self.pos_min[0],      self.pos_max[0],
-            self.pos_min[1],      self.pos_max[1],
-            self.pos_min[2],      self.pos_max[2],
-            self.speed_max,
+            duration_s,      self.samples,
+            self.nan_count,  self.pos_min[0],
+            self.pos_max[0], self.pos_min[1],
+            self.pos_max[1], self.pos_min[2],
+            self.pos_max[2], self.speed_max,
             self.angvel_max,
         });
     }
@@ -865,7 +864,7 @@ const WindSoakStats = struct {
             \\  mag range: [{d:.3}, {d:.3}] m/s
             \\  storms tracked: {d}/{d}
         , .{
-            duration_s,    self.samples,
+            duration_s,     self.samples,
             self.nan_count, self.mag_min,
             self.mag_max,   self.storm_count,
             p.storms.len,

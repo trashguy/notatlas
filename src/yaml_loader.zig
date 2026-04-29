@@ -11,7 +11,7 @@ const wave = @import("wave_query.zig");
 const wind = @import("wind_query.zig");
 const ocean_params_mod = @import("ocean_params.zig");
 const hull_mod = @import("hull_params.zig");
-const replication = @import("replication.zig");
+const replication = @import("shared/replication.zig");
 
 const Allocator = std.mem.Allocator;
 
