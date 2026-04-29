@@ -223,6 +223,15 @@ pub fn build(b: *std.Build) void {
     state_test_mod.addImport("notatlas", notatlas_mod);
     const state_tests = b.addTest(.{ .root_module = state_test_mod });
     test_step.dependOn(&b.addRunArtifact(state_tests).step);
+
+    const fanout_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/cell_mgr/fanout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fanout_test_mod.addImport("notatlas", notatlas_mod);
+    const fanout_tests = b.addTest(.{ .root_module = fanout_test_mod });
+    test_step.dependOn(&b.addRunArtifact(fanout_tests).step);
 }
 
 fn embedShader(

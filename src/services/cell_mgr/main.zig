@@ -19,6 +19,8 @@ const nats = @import("nats");
 
 const wire = @import("wire.zig");
 const cm_state = @import("state.zig");
+const fanout_mod = @import("fanout.zig");
+const replication = @import("notatlas").replication;
 
 const tick_period_ns: u64 = std.time.ns_per_s / 30; // 30 Hz fanout
 
@@ -114,6 +116,12 @@ pub fn main() !void {
     var state = cm_state.State.init(allocator);
     defer state.deinit();
 
+    var fanout = fanout_mod.Fanout.init(allocator, replication.TierThresholds.default);
+    defer fanout.deinit();
+
+    var nats_sink_ctx: NatsSinkCtx = .{ .client = client };
+    const sink: fanout_mod.Sink = .{ .ctx = &nats_sink_ctx, .publishFn = NatsSinkCtx.publish };
+
     var last_tick_ns: u64 = @intCast(std.time.nanoTimestamp());
     var tick_n: u64 = 0;
 
@@ -121,22 +129,23 @@ pub fn main() !void {
         // Drain inbound socket — fills sub.pending lists for each
         // active subscription. processIncoming reads with a short
         // timeout (currently 100 ms in nats-zig); that gates our tick
-        // when the socket is idle. Acceptable for the M6.3 skeleton —
-        // tighter cadence under no-traffic is a nats-zig API issue
-        // (configurable poll budget) we'll address as load grows.
+        // when the socket is idle. M6.4 follow-up: patch nats-zig to
+        // expose a configurable poll budget so the fanout cadence is
+        // honest 30 Hz under no-traffic conditions.
         try client.processIncoming();
 
         try drainDeltaSub(allocator, sub_delta, &state);
-        try drainSubscribeSub(allocator, sub_sub, &state, .enter);
-        try drainSubscribeSub(allocator, sub_unsub, &state, .exit);
+        try drainSubscribeSub(allocator, sub_sub, &state, &fanout, .enter);
+        try drainSubscribeSub(allocator, sub_unsub, &state, &fanout, .exit);
 
         try client.maybeSendPing();
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_tick_ns >= tick_period_ns) {
             tick_n += 1;
-            std.debug.print("[cell {d}_{d}] tick {d}: {d} entities, {d} subscribers\n", .{
-                args.cell_x, args.cell_y, tick_n, state.entityCount(), state.subscriberCount(),
+            const publishes = try fanout.runTick(&state, sink);
+            std.debug.print("[cell {d}_{d}] tick {d}: {d} entities, {d} subscribers, {d} publishes\n", .{
+                args.cell_x, args.cell_y, tick_n, state.entityCount(), state.subscriberCount(), publishes,
             });
             // Catch-up rather than reset: if we missed several tick
             // boundaries (long log flush, GC pause) we still publish
@@ -148,6 +157,21 @@ pub fn main() !void {
 
     std.debug.print("cell-mgr [{d}_{d}]: shutting down\n", .{ args.cell_x, args.cell_y });
 }
+
+/// NATS-backed Sink: formats `gw.client.<id>.cmd` into a stack
+/// buffer, then publishes via the supplied client. No per-tick allocs
+/// — the subject buffer is a fixed array, and nats-zig's publish path
+/// uses its own internal write buffer.
+const NatsSinkCtx = struct {
+    client: *nats.Client,
+
+    fn publish(ctx: *anyopaque, client_id: u64, payload: []const u8) anyerror!void {
+        const self: *NatsSinkCtx = @ptrCast(@alignCast(ctx));
+        var subject_buf: [fanout_mod.max_subject_len]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buf, "gw.client.{d}.cmd", .{client_id});
+        try self.client.publish(subject, payload);
+    }
+};
 
 fn drainDeltaSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *cm_state.State) !void {
     while (sub.nextMsg()) |msg| {
@@ -166,8 +190,9 @@ fn drainDeltaSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *
 /// already encoded the intent (subscribe vs unsubscribe), so we
 /// override whatever the harness put in the body. Keeps the
 /// subscribe/unsubscribe paths from getting swapped by a buggy
-/// publisher.
-fn drainSubscribeSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *cm_state.State, expected_op: wire.Op) !void {
+/// publisher. Mirrors state changes into the fanout buffer pool so
+/// runTick can find a pre-grown buffer for every subscriber.
+fn drainSubscribeSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *cm_state.State, fanout: *fanout_mod.Fanout, expected_op: wire.Op) !void {
     while (sub.nextMsg()) |msg| {
         var owned = msg;
         defer owned.deinit();
@@ -178,6 +203,10 @@ fn drainSubscribeSub(allocator: std.mem.Allocator, sub: *nats.Subscription, stat
         defer parsed.deinit();
         var msg_value = parsed.value;
         msg_value.op = expected_op;
-        _ = try state.applySubscribe(msg_value);
+        const changed = try state.applySubscribe(msg_value);
+        if (changed) switch (expected_op) {
+            .enter => try fanout.ensureSubscriber(msg_value.client_id),
+            .exit => fanout.removeSubscriber(msg_value.client_id),
+        };
     }
 }
