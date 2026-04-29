@@ -8,9 +8,11 @@
 //! can exercise the count-correctness invariant without standing up
 //! the service.
 //!
-//! M6.1 scope: pure filter + cluster + per-subscriber view. The
-//! `replicated(T, tier)` field wrapper, change detection, and ECS-side
-//! glue land at M6.2.
+//! M6.1 scope: pure filter + cluster + per-subscriber view.
+//! M6.2 scope adds: `replicated(T, tier)` field wrapper with change
+//! detection (dirty bit + last-published snapshot), and a comptime
+//! `dirtyMask` for ECS-side iteration over a struct of replicated
+//! fields. Still pure — no I/O, no service code.
 
 const std = @import("std");
 
@@ -315,6 +317,112 @@ pub fn aggregateForSubscriber(
 fn containsId(haystack: []const EntityId, needle: EntityId) bool {
     for (haystack) |h| if (h.eq(needle)) return true;
     return false;
+}
+
+// ============================================================
+// M6.2 — replicated field wrapper + ECS-side glue
+// ============================================================
+
+/// Marker decl on the wrapper type so `dirtyMask` can recognize a field
+/// as `replicated(T, tier)` at comptime without a name-based check.
+/// Internal — callers introspect `Wrapper.tier` and `Wrapper.Inner`.
+const ReplicatedMarker = struct {};
+
+/// Field wrapper that pairs a value with its replication tier and a
+/// change-detection bit. Component declarations match the docs/03 §6
+/// shape exactly:
+///
+/// ```zig
+/// const ShipState = struct {
+///     hull_pose: replicated(Pose, .always),
+///     sail_state: replicated(SailState, .visual),
+///     plank_hp: replicated([]u16, .close_combat),
+///     below_deck: replicated(InventoryRef, .boarded),
+/// };
+/// ```
+///
+/// `last_published` is a snapshot of `value` at the last `markPublished`
+/// call; M7's pose codec will encode against it as the per-stream
+/// keyframe. M6.2 doesn't dedupe writes that produce equal values —
+/// equality on slices/non-trivial T has unbounded cost, so dirty is set
+/// unconditionally on `set`. Producers that already know "no real
+/// change" should simply skip the call.
+pub fn replicated(comptime T: type, comptime field_tier: Tier) type {
+    return struct {
+        const Self = @This();
+
+        /// Comptime constants for `dirtyMask` and downstream
+        /// introspection (e.g. M6.4 wire-format dispatch).
+        pub const Replicated: type = ReplicatedMarker;
+        pub const tier: Tier = field_tier;
+        pub const Inner = T;
+
+        value: T,
+        last_published: T,
+        dirty: bool,
+
+        pub fn init(v: T) Self {
+            return .{ .value = v, .last_published = v, .dirty = false };
+        }
+
+        pub fn set(self: *Self, v: T) void {
+            self.value = v;
+            self.dirty = true;
+        }
+
+        pub fn markPublished(self: *Self) void {
+            self.last_published = self.value;
+            self.dirty = false;
+        }
+    };
+}
+
+fn isReplicatedField(comptime FieldType: type) bool {
+    const info = @typeInfo(FieldType);
+    if (info != .@"struct") return false;
+    return @hasDecl(FieldType, "Replicated") and FieldType.Replicated == ReplicatedMarker;
+}
+
+/// Bitmask of `component` fields that are both dirty AND visible at
+/// `subscriber_tier`. Bit `i` corresponds to the i-th declared field
+/// of the struct (declaration order). Plain (non-`replicated`) fields
+/// always contribute 0 — replicated and plain fields can mix.
+///
+/// 64-field cap is comptime-asserted; production components are
+/// expected to stay well under it (the docs/03 §6 example has 4
+/// fields).
+pub fn dirtyMask(component: anytype, subscriber_tier: Tier) u64 {
+    const T = @TypeOf(component);
+    const fields = @typeInfo(T).@"struct".fields;
+    comptime std.debug.assert(fields.len <= 64);
+
+    var mask: u64 = 0;
+    inline for (fields, 0..) |f, i| {
+        if (comptime isReplicatedField(f.type)) {
+            const fv = @field(component, f.name);
+            if (fv.dirty and shouldReplicate(f.type.tier, subscriber_tier)) {
+                mask |= @as(u64, 1) << @as(u6, @intCast(i));
+            }
+        }
+    }
+    return mask;
+}
+
+/// Mark every `replicated` field of `component` published. Called by
+/// the producer after the per-tick fanout pass commits the component
+/// to all subscribers. Subscriber dispatch (cell-mgr, M6.4) decides
+/// what each peer actually receives at their tier; the dirty bit is
+/// just "changed since last fanout tick", so a single uniform clear
+/// after dispatch is correct.
+pub fn markPublishedAll(component: anytype) void {
+    const Ptr = @TypeOf(component);
+    const T = @typeInfo(Ptr).pointer.child;
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields) |f| {
+        if (comptime isReplicatedField(f.type)) {
+            (&@field(component, f.name)).markPublished();
+        }
+    }
 }
 
 // ============================================================
@@ -739,4 +847,186 @@ test "perf: clustering pass < 100 µs at N=50" {
     const us_per_iter = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(iterations)) / 1000.0;
     std.debug.print("[M6.1] buildClusters N=50 (arena, avg of {d}): {d:.2} µs\n", .{ iterations, us_per_iter });
     try testing.expect(us_per_iter < 100.0);
+}
+
+// ============================================================
+// M6.2 tests — replicated wrapper + dirtyMask roundtrip
+// ============================================================
+
+// Stand-in payload types for the docs/03 §6 ShipState example. We
+// don't need the real Pose/Inventory shapes — M6.2 is testing the
+// wrapper, not the inner T.
+const TestPose = struct { x: f32, y: f32, z: f32 };
+const TestSail = struct { hoist: f32, trim: f32 };
+
+// Fields chosen to cover all five tiers (close_combat is implicitly
+// covered by the `<= subscriber_tier` ordering through `boarded`).
+const TestShip = struct {
+    name: replicated([8]u8, .always),
+    fleet_summary: replicated(u32, .fleet_aggregate),
+    hull_pose: replicated(TestPose, .visual),
+    plank_hp: replicated(u16, .close_combat),
+    inv_count: replicated(u32, .boarded),
+
+    fn init() TestShip {
+        return .{
+            .name = .init([_]u8{ 'A', 'd', 'a', 'm', 0, 0, 0, 0 }),
+            .fleet_summary = .init(0),
+            .hull_pose = .init(.{ .x = 0, .y = 0, .z = 0 }),
+            .plank_hp = .init(1000),
+            .inv_count = .init(0),
+        };
+    }
+};
+
+// Field indices into the TestShip struct, declaration order. Used to
+// build expected-mask values without typing magic numbers.
+const F_NAME: u6 = 0;
+const F_FLEET: u6 = 1;
+const F_POSE: u6 = 2;
+const F_PLANK: u6 = 3;
+const F_INV: u6 = 4;
+
+fn bit(i: u6) u64 {
+    return @as(u64, 1) << i;
+}
+
+test "replicated: init -> not dirty, value == last_published" {
+    const ship = TestShip.init();
+    try testing.expect(!ship.name.dirty);
+    try testing.expect(!ship.hull_pose.dirty);
+    try testing.expect(!ship.inv_count.dirty);
+    try testing.expectEqual(ship.plank_hp.value, ship.plank_hp.last_published);
+}
+
+test "replicated: set marks dirty and updates value but not last_published" {
+    var ship = TestShip.init();
+    ship.plank_hp.set(900);
+    try testing.expect(ship.plank_hp.dirty);
+    try testing.expectEqual(@as(u16, 900), ship.plank_hp.value);
+    try testing.expectEqual(@as(u16, 1000), ship.plank_hp.last_published);
+}
+
+test "replicated: markPublished snapshots value and clears dirty" {
+    var ship = TestShip.init();
+    ship.plank_hp.set(900);
+    ship.plank_hp.markPublished();
+    try testing.expect(!ship.plank_hp.dirty);
+    try testing.expectEqual(@as(u16, 900), ship.plank_hp.value);
+    try testing.expectEqual(@as(u16, 900), ship.plank_hp.last_published);
+}
+
+test "dirtyMask: nothing dirty -> 0 at every tier" {
+    const ship = TestShip.init();
+    inline for (.{ Tier.always, Tier.fleet_aggregate, Tier.visual, Tier.close_combat, Tier.boarded }) |t| {
+        try testing.expectEqual(@as(u64, 0), dirtyMask(ship, t));
+    }
+}
+
+test "dirtyMask: visual subscriber sees only fields with tier <= visual" {
+    var ship = TestShip.init();
+    ship.fleet_summary.set(7);
+    ship.hull_pose.set(.{ .x = 1, .y = 2, .z = 3 });
+    ship.plank_hp.set(900);
+    ship.inv_count.set(42);
+    // Expected: fleet_summary (1) and hull_pose (visual). plank_hp
+    // (close_combat) and inv_count (boarded) are above the subscriber's
+    // tier, so they're excluded even though they're dirty.
+    const mask = dirtyMask(ship, .visual);
+    try testing.expectEqual(bit(F_FLEET) | bit(F_POSE), mask);
+}
+
+test "dirtyMask: boarded subscriber sees every dirty field" {
+    var ship = TestShip.init();
+    ship.name.set([_]u8{ 'M', 'a', 'r', 'y', 0, 0, 0, 0 });
+    ship.fleet_summary.set(7);
+    ship.hull_pose.set(.{ .x = 1, .y = 2, .z = 3 });
+    ship.plank_hp.set(900);
+    ship.inv_count.set(42);
+    const mask = dirtyMask(ship, .boarded);
+    try testing.expectEqual(
+        bit(F_NAME) | bit(F_FLEET) | bit(F_POSE) | bit(F_PLANK) | bit(F_INV),
+        mask,
+    );
+}
+
+test "dirtyMask: always subscriber sees only the always field" {
+    var ship = TestShip.init();
+    ship.name.set([_]u8{ 'M', 'a', 'r', 'y', 0, 0, 0, 0 });
+    ship.hull_pose.set(.{ .x = 1, .y = 2, .z = 3 });
+    ship.plank_hp.set(900);
+    const mask = dirtyMask(ship, .always);
+    try testing.expectEqual(bit(F_NAME), mask);
+}
+
+test "dirtyMask: close_combat subscriber excludes boarded field" {
+    var ship = TestShip.init();
+    ship.plank_hp.set(900);
+    ship.inv_count.set(42);
+    const mask = dirtyMask(ship, .close_combat);
+    try testing.expectEqual(bit(F_PLANK), mask);
+}
+
+test "dirtyMask: fleet_aggregate subscriber excludes visual+ fields" {
+    var ship = TestShip.init();
+    ship.fleet_summary.set(7);
+    ship.hull_pose.set(.{ .x = 1, .y = 2, .z = 3 });
+    ship.plank_hp.set(900);
+    const mask = dirtyMask(ship, .fleet_aggregate);
+    try testing.expectEqual(bit(F_FLEET), mask);
+}
+
+test "dirtyMask roundtrip: markPublishedAll clears every bit at every tier" {
+    var ship = TestShip.init();
+    ship.name.set([_]u8{ 'M', 'a', 'r', 'y', 0, 0, 0, 0 });
+    ship.fleet_summary.set(7);
+    ship.hull_pose.set(.{ .x = 1, .y = 2, .z = 3 });
+    ship.plank_hp.set(900);
+    ship.inv_count.set(42);
+    // Pre-publish: boarded subscriber sees all five.
+    try testing.expect(dirtyMask(ship, .boarded) != 0);
+    markPublishedAll(&ship);
+    inline for (.{ Tier.always, Tier.fleet_aggregate, Tier.visual, Tier.close_combat, Tier.boarded }) |t| {
+        try testing.expectEqual(@as(u64, 0), dirtyMask(ship, t));
+    }
+    // last_published snapshot took on the new values.
+    try testing.expectEqual(@as(u16, 900), ship.plank_hp.last_published);
+    try testing.expectEqual(@as(u32, 42), ship.inv_count.last_published);
+}
+
+test "dirtyMask roundtrip: re-set after publish dirties again" {
+    var ship = TestShip.init();
+    ship.hull_pose.set(.{ .x = 1, .y = 0, .z = 0 });
+    markPublishedAll(&ship);
+    try testing.expectEqual(@as(u64, 0), dirtyMask(ship, .boarded));
+    ship.hull_pose.set(.{ .x = 2, .y = 0, .z = 0 });
+    try testing.expectEqual(bit(F_POSE), dirtyMask(ship, .visual));
+}
+
+test "dirtyMask: plain (non-replicated) fields contribute 0" {
+    const Mixed = struct {
+        rep: replicated(u32, .visual),
+        // Plain field at index 1 — must not affect the mask.
+        plain_counter: u32,
+        rep2: replicated(u32, .close_combat),
+    };
+    var m: Mixed = .{
+        .rep = .init(0),
+        .plain_counter = 0,
+        .rep2 = .init(0),
+    };
+    m.rep.set(1);
+    m.plain_counter = 999; // would-be bit 1; must NOT appear
+    m.rep2.set(2);
+    const mask = dirtyMask(m, .close_combat);
+    // Bits 0 and 2 set; bit 1 (plain field) cleared.
+    try testing.expectEqual(@as(u64, 0b101), mask);
+}
+
+test "dirtyMask: comptime tier+Inner introspection round-trips" {
+    // Sanity check that downstream code (M6.4 wire-format dispatch)
+    // can read back tier and Inner from the wrapper type.
+    const F = replicated(TestPose, .visual);
+    try testing.expectEqual(Tier.visual, F.tier);
+    try testing.expectEqual(TestPose, F.Inner);
 }
