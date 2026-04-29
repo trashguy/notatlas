@@ -149,17 +149,23 @@ projectile observation.
 | `chat.*` | Core NATS | Tolerant to loss |
 | Voice | Separate WebRTC SFU | Off the gameplay path entirely |
 
-### 9. Replication tier system — 4 tiers
+### 9. Replication tier system — 5 tiers
 
 | Tier | Range | Rate | What's replicated |
 |---|---|---|---|
-| 0 (always) | any | 30 Hz | Hull pose, gross silhouette flags |
+| 0 (always) | any | 30 Hz | Hull pose, gross silhouette flags (own ship + radar contacts) |
+| 0.5 (fleet aggregate) | horizon (~2 km) | 5 Hz, per-cluster | Cluster centroid + count + heading + silhouette mask. Distant entities replicated as group summaries, not individually. See [08 §3.2a](08-phase1-architecture.md#32a-tier-05--fleet-aggregate-horizon-lod). |
 | 1 (visual) | <500 m | 60 Hz pose; on-change rest | Per-sail state, cannon-port armed flags, sail force |
 | 2 (close combat) | <150 m | On change | Per-plank damage, cannon orientations, visible crew |
-| 3 (boarded) | aboard same ship | On change | Below-deck contents, individual crew animations |
+| 3 (boarded) | aboard same ship | On change | Below-deck contents, individual crew animations, aboard-player local poses |
 
 Mechanism in code; thresholds in `data/tier_distances.yaml`. First-pass
 thresholds — tune from milestone-1.5 stress test.
+
+Tier 0.5 was added 2026-04-29 after the §1 BW math at 50 ships/cell
+showed individual-pose replication beyond 500 m breaks the ≤1 Mbps/client
+budget. See [08-phase1-architecture.md §3.2a](08-phase1-architecture.md#32a-tier-05--fleet-aggregate-horizon-lod)
+for mechanism, message shape, and promotion/demotion rules.
 
 ### 10. Voice transport — LiveKit SFU
 
@@ -176,7 +182,7 @@ Eight services. Two existing in fallen-runes; six new for notatlas.
 |---|---|---|---|
 | **gateway** | fallen-runes | per-client | Client connections, auth handoff, per-client interest set |
 | **auth** | fallen-runes | login event | Account, JWT, hardware-2FA for admins |
-| **ship-sim** | new | 60 Hz | Per-ship physics, hull/sail/cannon/damage state |
+| **ship-sim** | new | 60 Hz | All 60Hz rigid-body authority: per-ship physics (hull/sail/cannon/damage state) + free-agent player physics (Jolt body when not aboard a ship). Aboard-ship players live as ship-local passenger entries on the ship they're attached to. Board / disembark = one-shot transition at this service. See [08 §2A](08-phase1-architecture.md#2a-ship-sim-scope-ships-and-free-agent-players). |
 | **cell-mgr** | new | 10-30 Hz aggregation | Spatial interest within one cell region |
 | **spatial-index** | new | continuous | Entity → cell membership, radius queries |
 | **env** | new | 5 Hz, persisted | Wind field, weather, wave seed, time of day |

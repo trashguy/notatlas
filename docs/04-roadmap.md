@@ -16,9 +16,9 @@ M1 through M5. No networking, no combat. Single-player in sandbox.
 | M4: wind-field | Wind direction visible via debug arrows; storms travel across world |
 | M5: ship-as-vehicle | Player walks on pitching box without jitter; multiple players supported |
 
-**End-of-phase deliverable:** video of yourself walking around a pitching
-box on a beautiful ocean with wind blowing. If this isn't fun for 20
-minutes, no MMO frame fixes it.
+**End-of-phase fun check:** walk around a pitching box on a beautiful
+ocean with wind blowing for 20 minutes. If this isn't fun, no MMO
+frame fixes it. (Verified 2026-04-28 — gate held.)
 
 **Phase gate:** stop and verify each milestone hits its gate before
 moving on. M3 specifically — a box that floats wrong cascades through M5
