@@ -18,7 +18,9 @@
 //! the test module).
 
 const std = @import("std");
-const replication = @import("notatlas").replication;
+const notatlas = @import("notatlas");
+const replication = notatlas.replication;
+const pose_codec = notatlas.pose_codec;
 
 const State = @import("state.zig").State;
 
@@ -26,24 +28,32 @@ pub const Tier = replication.Tier;
 pub const TierThresholds = replication.TierThresholds;
 
 // ---- wire payload shapes ----
+//
+// Per-entity record on the wire:
+//   [0..4]   id          (u32, little-endian)
+//   [4..6]   generation  (u16, little-endian)
+//   [6..20]  pose codec  (14 B delta-mode payload)
+//
+// Total 20 B per record. Pose-codec runs in delta mode with the
+// entity's stored pose as the keyframe (delta is zero for the
+// synthetic static load — exercises the codec end-to-end without
+// requiring a separate keyframe-establishing message stream). Real
+// receivers will need a keyframe-message channel; that lives outside
+// the M6.4 fanout scope.
+//
+// Tier byte from the M6.4 placeholder is gone — receivers can
+// recompute it locally from the decoded position + their own
+// subscriber position. The 2 bytes saved hold the codec payload
+// without breaking the 20 B per-record budget that M6.5's BW report
+// is calibrated against.
 
-/// Per-entity record in a subscriber's per-tick payload. `extern
-/// struct` for a stable, alignment-safe layout we can `@memcpy`
-/// straight into the output buffer.
-pub const EntityRecord = extern struct {
-    id: u32,
-    generation: u16,
-    /// Effective tier for this subscriber × entity. M6.4 only writes
-    /// records for tier ≥ visual; receivers can still read the byte.
-    tier: u8,
-    _pad: u8 = 0,
-    pos: [3]f32,
-};
-pub const entity_record_size: usize = @sizeOf(EntityRecord);
+pub const record_header_size: usize = 6;
+pub const entity_record_size: usize = record_header_size + pose_codec.delta_size;
 
 comptime {
-    // 20 bytes is the budget assumed by initial_capacity below — a
-    // surprise size change would silently undersize buffers.
+    // 20 bytes is the budget assumed by initial_capacity below and
+    // by docs/research/m6-bandwidth.md — a surprise size change
+    // would silently invalidate the BW report.
     std.debug.assert(entity_record_size == 20);
 }
 
@@ -52,6 +62,19 @@ pub const PayloadHeader = extern struct {
     count: u32,
 };
 pub const payload_header_size: usize = @sizeOf(PayloadHeader);
+
+fn writeRecordHeader(buf: []u8, id: u32, generation: u16) void {
+    std.mem.writeInt(u32, buf[0..4], id, .little);
+    std.mem.writeInt(u16, buf[4..6], generation, .little);
+}
+
+pub fn readRecordId(buf: []const u8) u32 {
+    return std.mem.readInt(u32, buf[0..4], .little);
+}
+
+pub fn readRecordGeneration(buf: []const u8) u16 {
+    return std.mem.readInt(u16, buf[4..6], .little);
+}
 
 /// `gw.client.<id>.cmd` is at most "gw.client." (10) + u64 dec (20) +
 /// ".cmd" (4) = 34 chars. 64 leaves slack for alternate subject
@@ -143,14 +166,21 @@ pub const Fanout = struct {
                 const tier = replication.effectiveTier(sub, ent.pos, ent.aboard_ship, self.thresholds);
                 if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
 
-                const rec: EntityRecord = .{
-                    .id = ent.id.id,
-                    .generation = ent.id.generation,
-                    .tier = @intFromEnum(tier),
-                    .pos = ent.pos,
-                };
-                const rec_bytes = std.mem.asBytes(&rec);
-                try buf_ptr.appendSlice(self.allocator, rec_bytes);
+                // Reserve the full 20-byte slot, write header bytes,
+                // then have the codec fill the trailing 14 bytes
+                // in-place. Avoids an intermediate staging buffer.
+                const slot_start = buf_ptr.items.len;
+                try buf_ptr.appendNTimes(self.allocator, 0, entity_record_size);
+                const slot = buf_ptr.items[slot_start..][0..entity_record_size];
+                writeRecordHeader(slot[0..record_header_size], ent.id.id, ent.id.generation);
+
+                // Delta mode against the entity's own pose — for the
+                // synthetic static load the delta is zero. Real
+                // dynamic state will use a stored keyframe + periodic
+                // refresh; the codec API doesn't change.
+                const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
+                const n = pose_codec.encodePose(ent_pose, ent_pose, null, slot[record_header_size..]);
+                std.debug.assert(n == pose_codec.delta_size);
                 count += 1;
             }
 
@@ -251,7 +281,7 @@ test "fanout: distant entity (>visual) is excluded" {
     try testing.expectEqual(@as(u32, 0), header.count);
 }
 
-test "fanout: tier ordering — close_combat at 50m, visual at 300m" {
+test "fanout: codec roundtrip — payload pose decodes back to entity pose" {
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -268,21 +298,22 @@ test "fanout: tier ordering — close_combat at 50m, visual at 300m" {
     const records_bytes = payload[payload_header_size..];
     try testing.expectEqual(@as(usize, 2 * entity_record_size), records_bytes.len);
 
-    // Walk both records; verify each entity got its expected tier.
-    var saw_close: bool = false;
-    var saw_visual: bool = false;
+    var saw_50: bool = false;
+    var saw_300: bool = false;
     var i: usize = 0;
     while (i < records_bytes.len) : (i += entity_record_size) {
-        const rec: EntityRecord = std.mem.bytesToValue(EntityRecord, records_bytes[i..][0..entity_record_size]);
-        if (rec.id == 1) {
-            try testing.expectEqual(@intFromEnum(Tier.close_combat), rec.tier);
-            saw_close = true;
-        } else if (rec.id == 2) {
-            try testing.expectEqual(@intFromEnum(Tier.visual), rec.tier);
-            saw_visual = true;
-        }
+        const slot = records_bytes[i..][0..entity_record_size];
+        const id = readRecordId(slot);
+        const ent = state.entities.get(id).?;
+        // Decode against the same keyframe the encoder used (the
+        // entity's own pose); the delta is zero so we should land
+        // back on the keyframe within codec precision.
+        const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
+        const decoded = pose_codec.decodePose(slot[record_header_size..], ent_pose);
+        try testing.expectApproxEqAbs(@as(f32, ent.pos[0]), decoded.pos[0], 0.01);
+        if (id == 1) saw_50 = true else if (id == 2) saw_300 = true;
     }
-    try testing.expect(saw_close and saw_visual);
+    try testing.expect(saw_50 and saw_300);
 }
 
 test "fanout: removeSubscriber drops them from the next tick" {
@@ -459,7 +490,10 @@ test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after war
         const records_bytes = payload[payload_header_size..];
         try testing.expectEqual(@as(usize, header.count) * entity_record_size, records_bytes.len);
 
-        // Build expected = { ent_id → expected_tier } for sub i.
+        // Build expected = { ent_id → expected_tier } for sub i. Tier
+        // is independently recomputed in the verifier, not read off
+        // the wire (M7 codec doesn't carry it; receivers compute
+        // tier locally from decoded position + own subscriber pos).
         var expected: std.AutoHashMapUnmanaged(u32, Tier) = .empty;
         defer expected.deinit(a);
         for (0..N_ENT) |j| {
@@ -469,18 +503,21 @@ test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after war
 
         // Walk the captured records; tick off each one against the
         // expected set. Anything left over = false negative; anything
-        // extra in the payload = false positive.
+        // extra in the payload = false positive. Just the id is
+        // needed — the codec bytes carry the pose but the verifier
+        // doesn't redecode it (the M7 1M-roundtrip gate already
+        // covers codec correctness).
         var seen: u32 = 0;
         var k: usize = 0;
         while (k < records_bytes.len) : (k += entity_record_size) {
-            const rec: EntityRecord = std.mem.bytesToValue(EntityRecord, records_bytes[k..][0..entity_record_size]);
-            const exp_tier = expected.get(rec.id) orelse {
-                std.debug.print("client {d}: payload contains entity {d} that should not be visible\n", .{ cid, rec.id });
+            const slot = records_bytes[k..][0..entity_record_size];
+            const id = readRecordId(slot);
+            if (!expected.contains(id)) {
+                std.debug.print("client {d}: payload contains entity {d} that should not be visible\n", .{ cid, id });
                 return error.UnexpectedEntityInPayload;
-            };
-            try testing.expectEqual(@intFromEnum(exp_tier), rec.tier);
+            }
             seen += 1;
-            _ = expected.remove(rec.id);
+            _ = expected.remove(id);
         }
         if (expected.count() != 0) {
             std.debug.print("client {d}: {d} expected entities missing from payload\n", .{ cid, expected.count() });

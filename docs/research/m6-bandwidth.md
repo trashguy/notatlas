@@ -21,10 +21,29 @@ Per docs/08 §6 M6.5: confirm per-subscriber payload sizes are within the per-cl
 - **M6 simplification:** fanout is uniform 30 Hz for all tiers. Per-tier rate gating is M7 work — these numbers undercount tier 1 (60 Hz post-M7) and overcount fleet aggregate (5 Hz post-M7).
 - **Layer scope:** all numbers are application-layer payload bytes. NATS framing (`PUB <subj> <len>\r\n` ≈ 20–30 B/msg) and TCP/IP headers are below the measurement; they don't change the relative scaling.
 
-## Wire shape (M6.4 placeholder)
+## Wire shape
+
+**As of the M7 codec integration** (post-`9d00323`):
 
 ```
-PayloadHeader   = u32 count                                      ( 4 B)
+PayloadHeader     = u32 count                                    ( 4 B)
+EntityRecord[N]   = { u32 id, u16 generation, codec[14] }        (20 B)
+                       — codec is pose_codec.encodePose delta-mode
+                         (no cell): 6 B i16-cm pos delta + 4 B
+                         smallest-three quat + 4 B vel delta.
+```
+
+Same 20 B/record budget as the original M6.4 placeholder, but the
+trailing 14 B now encodes the *full 6-DoF pose* (pos + rot + vel)
+through the M7 codec instead of three naked f32s for position only.
+Receivers decode via `pose_codec.decodePose` against the same keyframe
+the encoder used. M6.4 fanout uses the entity's stored pose as the
+keyframe (delta is zero for the synthetic load) — production will
+need a separate keyframe-establishing message stream, out of M6 scope.
+
+**Original M6.4 placeholder** (pre-codec, kept here for the diff):
+
+```
 EntityRecord[N] = { u32 id, u16 generation, u8 tier, u8 _pad,    (20 B)
                     [3]f32 pos }
 ```

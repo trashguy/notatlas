@@ -29,6 +29,13 @@ pub const DeltaMsg = struct {
     x: f32,
     y: f32,
     z: f32,
+    /// Unit quaternion (x, y, z, w). Defaulted to identity for
+    /// harness scenarios that don't carry orientation.
+    rot: [4]f32 = .{ 0, 0, 0, 1 },
+    /// Linear velocity, m/s.
+    vx: f32 = 0,
+    vy: f32 = 0,
+    vz: f32 = 0,
     ship_id: u32 = 0,
     ship_gen: u16 = 0,
 };

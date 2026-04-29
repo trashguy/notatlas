@@ -16,6 +16,12 @@ const wire = @import("wire.zig");
 pub const EntityState = struct {
     id: EntityId,
     pos: [3]f32,
+    /// Unit quaternion in (x, y, z, w). Identity by default — the
+    /// harness defaults to it; real producers (ship-sim) supply real
+    /// orientation.
+    rot: [4]f32 = .{ 0, 0, 0, 1 },
+    /// Linear velocity, m/s. Zero by default.
+    vel: [3]f32 = .{ 0, 0, 0 },
     /// Ship the entity is aboard, if any. `null` for free agents and
     /// for ships themselves.
     aboard_ship: ?EntityId,
@@ -66,6 +72,8 @@ pub const State = struct {
                 try self.entities.put(msg.id, .{
                     .id = new_id,
                     .pos = .{ msg.x, msg.y, msg.z },
+                    .rot = msg.rot,
+                    .vel = .{ msg.vx, msg.vy, msg.vz },
                     .aboard_ship = aboard,
                 });
                 return true;
