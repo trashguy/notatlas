@@ -36,6 +36,12 @@ pub const DeltaMsg = struct {
     vx: f32 = 0,
     vy: f32 = 0,
     vz: f32 = 0,
+    /// Heading on the xz plane in radians (CCW from +x). Used by the
+    /// cluster builder for mean-heading aggregation.
+    heading_rad: f32 = 0,
+    /// Silhouette class — 0 sloop, 1 schooner, 2 brigantine. JSON
+    /// carries it as u8; state truncates to u3.
+    silhouette: u8 = 0,
     ship_id: u32 = 0,
     ship_gen: u16 = 0,
 };

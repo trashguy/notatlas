@@ -22,6 +22,14 @@ pub const EntityState = struct {
     rot: [4]f32 = .{ 0, 0, 0, 1 },
     /// Linear velocity, m/s. Zero by default.
     vel: [3]f32 = .{ 0, 0, 0 },
+    /// Heading on the xz plane in radians (CCW from +x). Used by the
+    /// cluster builder for the per-cluster mean-heading aggregate.
+    /// Defaulted to 0; real producers derive from `rot`.
+    heading_rad: f32 = 0,
+    /// Silhouette class — 0 sloop, 1 schooner, 2 brigantine. Folded
+    /// into `FleetAggregate.silhouette_mask` by the cluster builder.
+    /// Defaulted to 0 (sloop).
+    silhouette: u3 = 0,
     /// Ship the entity is aboard, if any. `null` for free agents and
     /// for ships themselves.
     aboard_ship: ?EntityId,
@@ -74,6 +82,8 @@ pub const State = struct {
                     .pos = .{ msg.x, msg.y, msg.z },
                     .rot = msg.rot,
                     .vel = .{ msg.vx, msg.vy, msg.vz },
+                    .heading_rad = msg.heading_rad,
+                    .silhouette = @intCast(msg.silhouette & 0b111),
                     .aboard_ship = aboard,
                 });
                 return true;
