@@ -303,12 +303,37 @@ pub const Fanout = struct {
     /// caller (cell-mgr's `sim.entity.*.state` subscription) invokes
     /// this on every inbound state msg.
     ///
+    /// Pose + aboard_ship come from the inbound msg, not from the
+    /// cell's entity table — so subscribers near a cell boundary
+    /// receive state for entities in neighbour cells too. The entity
+    /// table membership filter only gates the slow-lane (cluster
+    /// pathway is per-cell); the fast-lane works on pure geometry.
+    /// This is the cleanest fix to the cross-cell visibility
+    /// limitation noted in docs/08 §2A.3 — entity ownership stays
+    /// decoupled from spatial location, and visibility is a
+    /// per-(sub × pose) computation independent of any cell.
+    ///
+    /// Stale-generation guard: when the entity *is* in this cell's
+    /// table at a higher generation, skip — the inbound msg is from
+    /// a now-recycled instance. Cross-cell msgs (entity unknown to
+    /// this cell) bypass the guard since we have no reference to
+    /// compare against.
+    ///
     /// Allocation-free: builds a single-record payload in `relay_buf`
     /// (28 B used out of 64 B), publishes via `sink`. nats-zig's
     /// publish path itself is alloc-free (fixed PUB header buffer).
     /// Returns the number of forwards made.
-    pub fn relayState(self: *Fanout, state: *const State, ent_id: u32, sink: Sink) !usize {
-        const ent = state.entities.get(ent_id) orelse return 0;
+    pub fn relayState(
+        self: *Fanout,
+        state: *const State,
+        ent_id: replication.EntityId,
+        pose: pose_codec.Pose,
+        aboard_ship: ?replication.EntityId,
+        sink: Sink,
+    ) !usize {
+        if (state.entities.get(ent_id.id)) |existing| {
+            if (existing.id.generation != ent_id.generation) return 0;
+        }
 
         // Build the per-record bytes once — same value goes to every
         // subscriber.
@@ -316,16 +341,15 @@ pub const Fanout = struct {
         const header: PayloadHeader = .{ .entity_count = 1, .cluster_count = 0 };
         @memcpy(slot[0..payload_header_size], std.mem.asBytes(&header));
         const rec_slot = slot[payload_header_size..];
-        writeEntityHeader(rec_slot[0..record_header_size], ent.id.id, ent.id.generation);
-        const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
-        const n = pose_codec.encodePose(ent_pose, ent_pose, null, rec_slot[record_header_size..][0..pose_codec.delta_size]);
+        writeEntityHeader(rec_slot[0..record_header_size], ent_id.id, ent_id.generation);
+        const n = pose_codec.encodePose(pose, pose, null, rec_slot[record_header_size..][0..pose_codec.delta_size]);
         std.debug.assert(n == pose_codec.delta_size);
 
         var forwards: usize = 0;
         var sub_it = state.subscribers.iterator();
         while (sub_it.next()) |sub_entry| {
             const sub = sub_entry.value_ptr.*;
-            const tier = replication.effectiveTier(sub, ent.pos, ent.aboard_ship, self.thresholds);
+            const tier = replication.effectiveTier(sub, pose.pos, aboard_ship, self.thresholds);
             if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
             try sink.publish(sub.client_id, slot);
             forwards += 1;
@@ -626,6 +650,10 @@ test "fanout: cluster aggregates over all members regardless of fast-lane activi
     try testing.expectEqual(@as(u8, 10), rec.count);
 }
 
+fn poseAt(x: f32, z: f32) pose_codec.Pose {
+    return .{ .pos = .{ x, 0, z }, .rot = .{ 0, 0, 0, 1 }, .vel = .{ 0, 0, 0 } };
+}
+
 test "fanout: relayState forwards only to visual+ subscribers" {
     var state = State.init(testing.allocator);
     defer state.deinit();
@@ -642,7 +670,8 @@ test "fanout: relayState forwards only to visual+ subscribers" {
     try applySubscribe(&state, &fanout, 0xBB, 300, 0);
     try applySubscribe(&state, &fanout, 0xCC, 1000, 0);
 
-    const forwards = try fanout.relayState(&state, 1, capture.sink());
+    const ent_id: EntityId = .{ .id = 1, .generation = 0 };
+    const forwards = try fanout.relayState(&state, ent_id, poseAt(0, 0), null, capture.sink());
     try testing.expectEqual(@as(usize, 2), forwards);
 
     try testing.expect(capture.payloadFor(0xAA) != null);
@@ -658,7 +687,13 @@ test "fanout: relayState forwards only to visual+ subscribers" {
     try testing.expectEqual(@as(u32, 1), readRecordId(payload[payload_header_size..]));
 }
 
-test "fanout: relayState on unknown entity is a 0-forward no-op" {
+test "fanout: relayState forwards cross-cell entities (not in local entity table)" {
+    // Entity NOT registered in this cell's table (simulates a state
+    // msg arriving for a ship in a neighbour cell). Sub at the
+    // origin is in close_combat from the entity's pose. The relay
+    // must still fire — fast-lane works on pure geometry, not cell
+    // membership. Closes the docs/08 §2A.3 cross-cell visibility
+    // gap that the previous `state.entities.get` guard left open.
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -667,8 +702,31 @@ test "fanout: relayState on unknown entity is a 0-forward no-op" {
     defer capture.deinit();
 
     try applySubscribe(&state, &fanout, 0xAA, 0, 0);
-    const forwards = try fanout.relayState(&state, 99, capture.sink());
+    try testing.expectEqual(@as(usize, 0), state.entityCount());
+
+    const ent_id: EntityId = .{ .id = 99, .generation = 0 };
+    const forwards = try fanout.relayState(&state, ent_id, poseAt(50, 0), null, capture.sink());
+    try testing.expectEqual(@as(usize, 1), forwards);
+    try testing.expect(capture.payloadFor(0xAA) != null);
+}
+
+test "fanout: relayState rejects stale-generation msg for known entity" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    try applyEnter(&state, 1, 5, 0, 0);
+    try applySubscribe(&state, &fanout, 0xAA, 50, 0);
+
+    // Inbound msg from generation 4 of an entity we know at
+    // generation 5 — stale, drop it.
+    const stale: EntityId = .{ .id = 1, .generation = 4 };
+    const forwards = try fanout.relayState(&state, stale, poseAt(0, 0), null, capture.sink());
     try testing.expectEqual(@as(usize, 0), forwards);
+    try testing.expect(capture.payloadFor(0xAA) == null);
 }
 
 // ---- M6.4 GATE: 100 entities × 50 subscribers, 1800 ticks, 0 allocs ----

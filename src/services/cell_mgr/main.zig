@@ -20,7 +20,9 @@ const nats = @import("nats");
 const wire = @import("wire.zig");
 const cm_state = @import("state.zig");
 const fanout_mod = @import("fanout.zig");
-const replication = @import("notatlas").replication;
+const notatlas = @import("notatlas");
+const replication = notatlas.replication;
+const pose_codec = notatlas.pose_codec;
 
 const tick_period_ns: u64 = std.time.ns_per_s / 30; // 30 Hz fanout
 
@@ -203,9 +205,10 @@ fn drainDeltaSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *
 
 /// Drain `sim.entity.*.state` msgs: parse the entity id from each
 /// subject, decode the JSON payload, update the entity's pose in
-/// `state`, then immediately fan out a single-record relay payload
-/// to every visual+ subscriber via `sink`. Returns counters so the
-/// per-tick log can show the fast-lane volume.
+/// `state` if known (no-op otherwise — cross-cell entities aren't in
+/// our table), then unconditionally call `relayState` to fan out to
+/// every visual+ subscriber based on the msg's pose. Returns
+/// counters so the per-tick log can show the fast-lane volume.
 const StateDrainCounts = struct { msgs: u64, forwards: u64 };
 
 fn drainStateSub(
@@ -220,7 +223,7 @@ fn drainStateSub(
     while (sub.nextMsg()) |msg| {
         var owned = msg;
         defer owned.deinit();
-        const ent_id = wire.parseEntityIdFromSubject(owned.subject) catch |err| {
+        const ent_id_raw = wire.parseEntityIdFromSubject(owned.subject) catch |err| {
             std.debug.print("cell-mgr: bad state subject ({s}): {s}\n", .{ @errorName(err), owned.subject });
             continue;
         };
@@ -230,8 +233,21 @@ fn drainStateSub(
         };
         defer parsed.deinit();
         msgs += 1;
-        if (!state.applyState(ent_id, parsed.value)) continue;
-        forwards += try fanout.relayState(state, ent_id, sink);
+
+        // Update local entity table if the entity belongs to this
+        // cell. Returns false for unknown ids (cross-cell case) and
+        // for stale-generation msgs — neither blocks the relay.
+        // Stale-generation gating happens inside relayState so it
+        // applies uniformly across cell-bounded and cross-cell cases.
+        _ = state.applyState(ent_id_raw, parsed.value);
+
+        const ent_id: replication.EntityId = .{ .id = ent_id_raw, .generation = parsed.value.generation };
+        const pose: pose_codec.Pose = .{
+            .pos = .{ parsed.value.x, parsed.value.y, parsed.value.z },
+            .rot = parsed.value.rot,
+            .vel = .{ parsed.value.vx, parsed.value.vy, parsed.value.vz },
+        };
+        forwards += try fanout.relayState(state, ent_id, pose, null, sink);
     }
     return .{ .msgs = msgs, .forwards = forwards };
 }
