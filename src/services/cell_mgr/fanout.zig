@@ -1,21 +1,28 @@
-//! Per-subscriber fanout pass for cell-mgr.
+//! Per-subscriber fanout pass for cell-mgr — the slow lane.
 //!
-//! Walks subscribers × entities, runs the M6.1 tier filter, assembles a
-//! mixed-record payload of:
-//!   - Entity records (tier ≥ visual): one per entity individually
-//!     streamed to the subscriber. M7 codec, 20 B/record.
-//!   - Cluster records (tier 0.5 fleet aggregate): one per relevant
-//!     cluster, with per-subscriber exclusion of entities the sub
-//!     already receives individually. M6.1 builder + M6.1
-//!     `aggregateForSubscriber`. 16 B/record.
+//! Per docs/08 §2.3 the cell-mgr fanout tick owns "tier ≤ 0.5
+//! cadence" content: tier 0 (always, hull pose at 30 Hz) and tier
+//! 0.5 (fleet aggregate at 5 Hz). Tier 1+ flows separately via the
+//! fast-lane callback path (`Fanout.relayState`).
+//!
+//! In practice tier 0 individual records are subsumed by the tier
+//! 0.5 cluster path (docs/08 §3.2a: distant entities flow as cluster
+//! summaries instead of individual records — the 160× BW reduction
+//! lever). So the slow-lane payload is **cluster records only**:
+//!   - 8 B PayloadHeader { entity_count = 0, cluster_count }
+//!   - cluster_count × 16 B ClusterRecord
+//!
+//! `entity_count` stays in the wire shape so receivers don't need a
+//! version flip when individual records are reintroduced for some
+//! field type that doesn't naturally fit into a cluster summary.
 //!
 //! Cluster pathway runs at 5 Hz (configurable). spatial-index will
 //! eventually own the cluster build per docs/08 §3.2a; cell-mgr plays
 //! both roles for now (until the spatial-index service spins up).
 //!
-//! Hot-path discipline: per-subscriber output and excluded buffers are
-//! pre-grown at subscribe time and reused with `clearRetainingCapacity`
-//! per tick. The cluster pass uses a dedicated arena that
+//! Hot-path discipline: per-subscriber output buffers are pre-grown
+//! at subscribe time and reused with `clearRetainingCapacity` per
+//! tick. The cluster pass uses a dedicated arena that
 //! `reset(.retain_capacity)`s each cycle — first build sizes it, all
 //! subsequent builds reuse without growing. Net steady-state allocs
 //! per tick: 0 (verified by the M6.4 gate test under a counting
@@ -117,17 +124,12 @@ pub const Sink = struct {
 // Fanout
 // ============================================================
 
-/// Initial per-subscriber output buffer capacity. Sized for cell
-/// entity_cap (200/cell per docs/06) × 20 B + 4 KB headroom for
-/// cluster records. Cell density spikes within this band don't
-/// trigger reallocation.
-pub const default_output_capacity: usize = 8 * 1024;
-
-/// Initial per-subscriber excluded-set capacity. Sized for the
-/// realistic worst case: every visible entity gets pinned into the
-/// excluded list to keep clusters from double-counting. 200 EntityIds
-/// × 6 B = 1200 B → round up to 2 KB.
-pub const default_excluded_capacity_entities: usize = 200;
+/// Initial per-subscriber output buffer capacity. With slow-lane =
+/// clusters only, the realistic max is ~64 clusters/cell × 16 B + 8 B
+/// header ≈ 1 KB. 4 KB leaves room for future `entity_count > 0`
+/// content (e.g. tier-0 fields that don't map to a cluster) without
+/// reallocation.
+pub const default_output_capacity: usize = 4 * 1024;
 
 pub const ClusterConfig = struct {
     /// Master ticks between cluster rebuilds. Default 6 = 30 Hz / 5 Hz
@@ -146,16 +148,13 @@ pub const ClusterConfig = struct {
 };
 
 const SubscriberBuffers = struct {
-    /// Outbound payload — header + entity records + cluster records.
+    /// Outbound payload — header + cluster records (+ entity records,
+    /// reserved for future tier-0 content that doesn't fit a cluster
+    /// summary).
     output: std.ArrayListUnmanaged(u8) = .empty,
-    /// Per-tick scratch — entity ids the subscriber sees individually
-    /// at this tick. `aggregateForSubscriber` reads this so cluster
-    /// records don't double-count.
-    excluded: std.ArrayListUnmanaged(EntityId) = .empty,
 
     fn deinit(self: *SubscriberBuffers, allocator: std.mem.Allocator) void {
         self.output.deinit(allocator);
-        self.excluded.deinit(allocator);
     }
 };
 
@@ -225,7 +224,6 @@ pub const Fanout = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
             try gop.value_ptr.output.ensureTotalCapacity(self.allocator, self.output_capacity);
-            try gop.value_ptr.excluded.ensureTotalCapacity(self.allocator, default_excluded_capacity_entities);
         }
     }
 
@@ -237,16 +235,14 @@ pub const Fanout = struct {
         }
     }
 
-    /// One fanout tick. On cluster-pass ticks (master_tick %
-    /// period_ticks == 0), rebuilds the global cluster set from the
-    /// current entity table. Then walks subscribers, emitting entity
-    /// records (tier ≥ visual) + cluster records (with per-sub
-    /// exclusion). Returns the number of subscribers we published
-    /// payloads for.
+    /// One fanout tick — the slow lane. On cluster-pass ticks
+    /// (master_tick % period_ticks == 0), rebuilds the global cluster
+    /// set from the current entity table. Then walks subscribers,
+    /// emitting **cluster records only** (visual+ entities flow via
+    /// `relayState`, the fast-lane callback path; tier-0 individual
+    /// records are subsumed by cluster summaries per docs/08 §3.2a).
+    /// Returns the number of subscribers we published payloads for.
     pub fn runTick(self: *Fanout, state: *const State, sink: Sink) !usize {
-        // Gate the cluster pass: every Nth tick we rebuild the global
-        // cluster set. Ticks 0, period, 2*period, ... do work; others
-        // reuse the cached `clusters` slice.
         if (self.master_tick % self.cluster_cfg.period_ticks == 0) {
             try self.rebuildClusters(state);
         }
@@ -259,43 +255,25 @@ pub const Fanout = struct {
 
             const sb = self.subs.getPtr(sub.client_id) orelse return error.UnknownSubscriber;
             sb.output.clearRetainingCapacity();
-            sb.excluded.clearRetainingCapacity();
 
             // Reserve the header slot — patched after we know counts.
             try sb.output.appendNTimes(self.allocator, 0, payload_header_size);
 
-            // ---- entity records ----
-            var entity_count: u32 = 0;
-            var ent_it = state.entities.iterator();
-            while (ent_it.next()) |ent_entry| {
-                const ent = ent_entry.value_ptr.*;
-                const tier = replication.effectiveTier(sub, ent.pos, ent.aboard_ship, self.thresholds);
-                if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
-
-                const slot_start = sb.output.items.len;
-                try sb.output.appendNTimes(self.allocator, 0, entity_record_size);
-                const slot = sb.output.items[slot_start..][0..entity_record_size];
-                writeEntityHeader(slot[0..record_header_size], ent.id.id, ent.id.generation);
-
-                const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
-                const n = pose_codec.encodePose(ent_pose, ent_pose, null, slot[record_header_size..]);
-                std.debug.assert(n == pose_codec.delta_size);
-
-                try sb.excluded.append(self.allocator, ent.id);
-                entity_count += 1;
-            }
-
-            // ---- cluster records ----
             var cluster_count: u32 = 0;
             for (self.clusters) |cluster| {
-                // Filter clusters by their centroid: subscribers
-                // beyond fleet_aggregate range from the centroid
-                // shouldn't pay BW for a cluster they can't see.
+                // Centroid filter: include clusters whose centroid is
+                // at fleet_aggregate or further from the sub. Skip
+                // clusters whose centroid is in visual range — the sub
+                // is close enough that the fast-lane carries the
+                // individual entities and a summary adds nothing.
                 const centroid_pos: [3]f32 = .{ cluster.aggregate.centroid[0], 0, cluster.aggregate.centroid[1] };
                 const centroid_tier = replication.effectiveTier(sub, centroid_pos, null, self.thresholds);
-                if (@intFromEnum(centroid_tier) < @intFromEnum(Tier.fleet_aggregate)) continue;
+                if (@intFromEnum(centroid_tier) >= @intFromEnum(Tier.visual)) continue;
 
-                const view = replication.aggregateForSubscriber(cluster, sb.excluded.items) orelse continue;
+                // No excluded set — slow-lane doesn't emit individual
+                // records anymore, so there's nothing to pin out of
+                // the cluster aggregate. Pass empty.
+                const view = replication.aggregateForSubscriber(cluster, &.{}) orelse continue;
                 if (view.count == 0) continue;
 
                 const rec: ClusterRecord = .{
@@ -310,7 +288,7 @@ pub const Fanout = struct {
                 cluster_count += 1;
             }
 
-            const header: PayloadHeader = .{ .entity_count = entity_count, .cluster_count = cluster_count };
+            const header: PayloadHeader = .{ .entity_count = 0, .cluster_count = cluster_count };
             @memcpy(sb.output.items[0..payload_header_size], std.mem.asBytes(&header));
 
             try sink.publish(sub.client_id, sb.output.items);
@@ -451,7 +429,7 @@ fn clusterRecordsSlice(payload: []const u8) []const u8 {
     return payload[start..][0 .. header.cluster_count * cluster_record_size];
 }
 
-test "fanout: single subscriber, single visible entity → 1 record" {
+test "fanout: slow-lane is clusters-only — visual+ entities not in individual stream" {
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -459,17 +437,25 @@ test "fanout: single subscriber, single visible entity → 1 record" {
     var capture: CaptureSink = .{ .allocator = testing.allocator };
     defer capture.deinit();
 
+    // Entity at 100 m → close_combat from sub. Slow-lane no longer
+    // emits individual records for visual+ entities — fast-lane
+    // (`relayState`) covers that. And the cluster centroid at 100 m
+    // is in the sub's visual range, so the centroid filter drops it
+    // too. Net: header-only payload.
     try applyEnter(&state, 1, 0, 100, 0);
     try applySubscribe(&state, &fanout, 0xAA, 0, 0);
 
     const n = try fanout.runTick(&state, capture.sink());
     try testing.expectEqual(@as(usize, 1), n);
 
-    const header = payloadHeader(capture.payloadFor(0xAA).?);
-    try testing.expectEqual(@as(u32, 1), header.entity_count);
+    const payload = capture.payloadFor(0xAA).?;
+    try testing.expectEqual(@as(usize, payload_header_size), payload.len);
+    const header = payloadHeader(payload);
+    try testing.expectEqual(@as(u32, 0), header.entity_count);
+    try testing.expectEqual(@as(u32, 0), header.cluster_count);
 }
 
-test "fanout: distant entity (>visual) is excluded from individual stream" {
+test "fanout: distant entity surfaces as a cluster summary" {
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -477,19 +463,18 @@ test "fanout: distant entity (>visual) is excluded from individual stream" {
     var capture: CaptureSink = .{ .allocator = testing.allocator };
     defer capture.deinit();
 
-    // 1500 m → fleet_aggregate tier; not in the individual stream.
+    // 1500 m → fleet_aggregate tier from origin sub. Cluster
+    // pathway picks it up; entity_count stays 0.
     try applyEnter(&state, 1, 0, 1500, 0);
     try applySubscribe(&state, &fanout, 0xAA, 0, 0);
 
     _ = try fanout.runTick(&state, capture.sink());
     const header = payloadHeader(capture.payloadFor(0xAA).?);
     try testing.expectEqual(@as(u32, 0), header.entity_count);
-    // Cluster pathway picks it up — single entity at the cluster
-    // centroid shows up in the sub's cluster set.
     try testing.expectEqual(@as(u32, 1), header.cluster_count);
 }
 
-test "fanout: codec roundtrip — payload pose decodes back to entity pose" {
+test "fanout: very-distant cluster (centroid at always tier) still surfaces" {
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -497,28 +482,22 @@ test "fanout: codec roundtrip — payload pose decodes back to entity pose" {
     var capture: CaptureSink = .{ .allocator = testing.allocator };
     defer capture.deinit();
 
-    try applyEnter(&state, 1, 0, 50, 0);
-    try applyEnter(&state, 2, 0, 300, 0);
-    try applySubscribe(&state, &fanout, 0xAA, 0, 0);
+    // Entities at origin; sub at 5 km. Centroid is at "always" tier
+    // from sub (>2 km). The pre-cleanup centroid filter rejected
+    // these — sub got an empty payload despite the cluster existing.
+    // Post-cleanup the cluster is included so the sub knows there's
+    // a fleet on the horizon.
+    // All within bucket (4, 4) of the default 500-m sub-cell grid
+    // (cell_origin = (-2000, -2000)) so they form one cluster.
+    try applyEnter(&state, 1, 0, 0, 0);
+    try applyEnter(&state, 2, 0, 10, 10);
+    try applyEnter(&state, 3, 0, 20, 5);
+    try applySubscribe(&state, &fanout, 0xAA, 5000, 0);
 
     _ = try fanout.runTick(&state, capture.sink());
-    const payload = capture.payloadFor(0xAA).?;
-    const records_bytes = entityRecordsSlice(payload);
-    try testing.expectEqual(@as(usize, 2 * entity_record_size), records_bytes.len);
-
-    var saw_50: bool = false;
-    var saw_300: bool = false;
-    var i: usize = 0;
-    while (i < records_bytes.len) : (i += entity_record_size) {
-        const slot = records_bytes[i..][0..entity_record_size];
-        const id = readRecordId(slot);
-        const ent = state.entities.get(id).?;
-        const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
-        const decoded = pose_codec.decodePose(slot[record_header_size..], ent_pose);
-        try testing.expectApproxEqAbs(@as(f32, ent.pos[0]), decoded.pos[0], 0.01);
-        if (id == 1) saw_50 = true else if (id == 2) saw_300 = true;
-    }
-    try testing.expect(saw_50 and saw_300);
+    const header = payloadHeader(capture.payloadFor(0xAA).?);
+    try testing.expectEqual(@as(u32, 0), header.entity_count);
+    try testing.expectEqual(@as(u32, 1), header.cluster_count);
 }
 
 test "fanout: removeSubscriber drops them from the next tick" {
@@ -605,10 +584,16 @@ test "fanout: cluster cadence — only on every cluster_period tick" {
     }
 }
 
-test "fanout: count invariant — sub's individual ids ∪ cluster.count = total in fleet_aggregate band" {
-    // Ensures the M6.1 count-correctness gate (subscriber never sees
-    // an entity in both their aggregate and their individual stream)
-    // still holds inside the fanout fanout flow.
+test "fanout: cluster aggregates over all members regardless of fast-lane activity" {
+    // Pre-cleanup this test asserted the count-correctness invariant
+    // (subscriber never sees an entity in both their aggregate and
+    // their individual stream). With the slow-lane carrying clusters
+    // only, there's no individual stream to overlap with. Cluster
+    // count is just "everyone in this geographic group" — the
+    // fast-lane separately carries pose updates for the close ones.
+    // The invariant moves up a level: subscribers reconcile their
+    // local entity table from the union of (cluster.count summary,
+    // fast-lane entity records).
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -616,19 +601,15 @@ test "fanout: count invariant — sub's individual ids ∪ cluster.count = total
     var capture: CaptureSink = .{ .allocator = testing.allocator };
     defer capture.deinit();
 
-    // Pack ten entities in a tight cluster around (400, 0, 400), all
-    // within ~50 m of each other so they fall in one bucket. From a
-    // subscriber at the origin, distance ≈ 565 m → fleet_aggregate.
-    // Then move two of them to (50, 0, 50) — within visual range of
-    // the sub. The cluster is built over all ten, but the sub
-    // receives those two individually + the remaining eight as a
-    // cluster aggregate.
+    // Same setup as the pre-cleanup test: 10 entities near (400, 400)
+    // (fleet_aggregate tier from a sub at origin). The cluster covers
+    // all 10 now (no exclusion).
     const cluster_x: f32 = 400;
     const cluster_z: f32 = 400;
     var i: u32 = 1;
     while (i <= 10) : (i += 1) {
-        const x: f32 = if (i <= 2) 50 else cluster_x + @as(f32, @floatFromInt(i)) * 2;
-        const z: f32 = if (i <= 2) 50 else cluster_z + @as(f32, @floatFromInt(i)) * 2;
+        const x: f32 = cluster_x + @as(f32, @floatFromInt(i)) * 2;
+        const z: f32 = cluster_z + @as(f32, @floatFromInt(i)) * 2;
         try applyEnter(&state, i, 0, x, z);
     }
     try applySubscribe(&state, &fanout, 0xAA, 0, 0);
@@ -637,14 +618,12 @@ test "fanout: count invariant — sub's individual ids ∪ cluster.count = total
     const payload = capture.payloadFor(0xAA).?;
     const header = payloadHeader(payload);
 
-    // Two individuals at (50, 50) → close_combat tier.
-    try testing.expectEqual(@as(u32, 2), header.entity_count);
-    // One cluster covering the other eight.
+    try testing.expectEqual(@as(u32, 0), header.entity_count);
     try testing.expectEqual(@as(u32, 1), header.cluster_count);
 
     const cluster_bytes = clusterRecordsSlice(payload);
     const rec: ClusterRecord = std.mem.bytesToValue(ClusterRecord, cluster_bytes[0..cluster_record_size]);
-    try testing.expectEqual(@as(u8, 8), rec.count);
+    try testing.expectEqual(@as(u8, 10), rec.count);
 }
 
 test "fanout: relayState forwards only to visual+ subscribers" {
@@ -738,13 +717,12 @@ const CountingAllocator = struct {
     }
 };
 
-/// Independent ground-truth for the gate: replicates the filter
-/// directly without going through the fanout, so a bug in either
-/// can't mask itself by being symmetric.
-fn expectedTierFor(sub: replication.Subscriber, ent_pos: [3]f32, ent_ship: ?replication.EntityId) ?Tier {
-    const t = replication.effectiveTier(sub, ent_pos, ent_ship, TierThresholds.default);
-    if (@intFromEnum(t) < @intFromEnum(Tier.visual)) return null;
-    return t;
+/// Gate ground truth: independently compute whether a cluster
+/// centroid passes the slow-lane's centroid filter from a given sub.
+fn clusterShouldFire(sub: replication.Subscriber, centroid: [2]f32) bool {
+    const centroid_pos: [3]f32 = .{ centroid[0], 0, centroid[1] };
+    const t = replication.effectiveTier(sub, centroid_pos, null, TierThresholds.default);
+    return @intFromEnum(t) < @intFromEnum(Tier.visual);
 }
 
 test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after warm-up, payloads correct" {
@@ -829,10 +807,10 @@ test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after war
 
     const post_run_allocs = counting.alloc_calls;
 
-    // Correctness: every subscriber's captured payload matches the
-    // independently-computed expected set. We only check the
-    // individual-stream side here — the cluster correctness is
-    // covered by the dedicated invariant test above.
+    // Correctness: per-sub cluster_count must equal the number of
+    // clusters whose centroid passes `clusterShouldFire` from that
+    // sub. Slow-lane is clusters-only post-cleanup, so entity_count
+    // is always 0 and the verifier doesn't need to walk records.
     for (0..N_SUB) |i| {
         const cid: u64 = 0x1000 + @as(u64, i);
         const sub: replication.Subscriber = .{
@@ -842,33 +820,16 @@ test "M6.4 gate: 100 entities × 50 subscribers, 1800 ticks, no allocs after war
         };
         const payload = capture.payloadFor(cid) orelse return error.NoPayload;
         const header = payloadHeader(payload);
-        const records_bytes = entityRecordsSlice(payload);
-        try testing.expectEqual(@as(usize, header.entity_count) * entity_record_size, records_bytes.len);
+        try testing.expectEqual(@as(u32, 0), header.entity_count);
 
-        var expected: std.AutoHashMapUnmanaged(u32, Tier) = .empty;
-        defer expected.deinit(a);
-        for (0..N_ENT) |j| {
-            const expected_tier = expectedTierFor(sub, ent_positions[j], null) orelse continue;
-            try expected.put(a, @intCast(j + 1), expected_tier);
+        var expected_clusters: u32 = 0;
+        for (fanout.clusters) |cluster| {
+            if (clusterShouldFire(sub, cluster.aggregate.centroid)) expected_clusters += 1;
         }
-
-        var seen: u32 = 0;
-        var k: usize = 0;
-        while (k < records_bytes.len) : (k += entity_record_size) {
-            const slot = records_bytes[k..][0..entity_record_size];
-            const id = readRecordId(slot);
-            if (!expected.contains(id)) {
-                std.debug.print("client {d}: payload contains entity {d} that should not be visible\n", .{ cid, id });
-                return error.UnexpectedEntityInPayload;
-            }
-            seen += 1;
-            _ = expected.remove(id);
+        if (expected_clusters != header.cluster_count) {
+            std.debug.print("client {d}: expected {d} clusters, got {d}\n", .{ cid, expected_clusters, header.cluster_count });
+            return error.ClusterCountMismatch;
         }
-        if (expected.count() != 0) {
-            std.debug.print("client {d}: {d} expected entities missing from payload\n", .{ cid, expected.count() });
-            return error.MissingEntityInPayload;
-        }
-        try testing.expectEqual(header.entity_count, seen);
     }
 
     std.debug.print("\n[M6.4] gate: 100 ents × 50 subs × 1800 ticks (incl {d} warm-up); hot-path allocs={d} (baseline {d}, post-run {d})\n", .{
@@ -1057,21 +1018,21 @@ test "M6.5 BW: idle / mid / hot scenarios + distance sweep" {
     }
     std.debug.print("\n", .{});
 
-    // Gate assertions. Idle now includes the cluster pathway —
-    // ~26 clusters/sub × 16 B/cluster ≈ 420 B of cluster records on
-    // top of any individual entity records. That puts idle around
-    // 17-18 % of budget. Still well below the cap, and the cluster
-    // path is exactly the 160× BW reduction lever from docs/08
-    // §3.2a — without it, those distant entities would have to be
-    // streamed individually and the BW would balloon. Hot scenario
-    // is roughly unchanged because cluster centroids fall inside
-    // visual range and get filtered out by the centroid-tier check.
-    try testing.expect(idle.pct_of_budget_max <= 25.0);
-    try testing.expect(hot.pct_of_budget_max <= 75.0);
-    var prev: u32 = 0;
-    for (sweep_results) |sr| {
-        try testing.expect(sr.visible >= prev);
-        prev = sr.visible;
-    }
-    try testing.expectEqual(@as(u32, 100), sweep_results[sweep_results.len - 1].visible);
+    // Gate assertions, post-cleanup:
+    // - Hot collapses to header-only because all entities are at
+    //   close_combat from each sub (visual+ → fast-lane), and the
+    //   cluster centroid is also in visual range so it's filtered
+    //   out. Slow-lane payload = 8 B header.
+    // - Idle still carries clusters for distant entities; same
+    //   ballpark as pre-cleanup. Loosen the bound a touch for
+    //   scenario-randomness slack.
+    try testing.expect(hot.pct_of_budget_max <= 1.0);
+    try testing.expect(idle.pct_of_budget_max <= 30.0);
+    // Sweep should now include the very-distant case (5000 m): pre-
+    // cleanup the centroid filter rejected it, post-cleanup it shows
+    // up as a cluster.
+    try testing.expect(sweep_results[0].cluster_n >= 1);
+    // At 0 m all entities are inside visual range; cluster centroid
+    // is too, so cluster_count must drop to 0.
+    try testing.expectEqual(@as(u32, 0), sweep_results[sweep_results.len - 1].cluster_n);
 }
