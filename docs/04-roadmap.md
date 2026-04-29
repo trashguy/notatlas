@@ -3,18 +3,24 @@
 Phased delivery plan with stress-test gates between phases. Phase 0 begins
 solo on the engine; later phases absorb additional devs.
 
+Status legend: ✓ shipped (commit) — ▢ pending — ◐ in progress.
+Status reflects engineering completion against the milestone's gate, not
+balance / polish. Cell-mgr enhancements built on top of M6/M7 (cluster
+pathway, fast-lane callback relay, slow-lane cleanup, cross-cell
+visibility) ship as separate commits — see `git log` for the full arc.
+
 ## Phase 0 — Engine water lift (solo, ~2-4 months)
 
 Build the new engine subsystems that fallen-runes doesn't have. Subsystems
 M1 through M5. No networking, no combat. Single-player in sandbox.
 
-| Milestone | Deliverable |
-|---|---|
-| M1: wave-query | Deterministic wave heights; client/server identical to float epsilon |
-| M2: ocean-render | Beautiful Gerstner ocean visible in sandbox at 60 fps |
-| M3: buoyancy | A box floats correctly on waves; pitches and rolls; stable for 5 min |
-| M4: wind-field | Wind direction visible via debug arrows; storms travel across world |
-| M5: ship-as-vehicle | Player walks on pitching box without jitter; multiple players supported |
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ✓ `a814d1f` | M1: wave-query | Deterministic wave heights; client/server identical to float epsilon |
+| ✓ `3bd0478` | M2: ocean-render | Beautiful Gerstner ocean visible in sandbox at 60 fps |
+| ✓ `93c0ae0` | M3: buoyancy | A box floats correctly on waves; pitches and rolls; stable for 5 min |
+| ✓ `68f8793` | M4: wind-field | Wind direction visible via debug arrows; storms travel across world |
+| ✓ `d1f4976` | M5: ship-as-vehicle | Player walks on pitching box without jitter; multiple players supported |
 
 **End-of-phase fun check:** walk around a pitching box on a beautiful
 ocean with wind blowing for 20 minutes. If this isn't fun, no MMO
@@ -29,14 +35,14 @@ and Phase 1.
 Wrap Phase 0's engine in the networking layer. Subsystems M6 through M9
 plus integration with fallen-runes' gateway / ship-sim service decomp.
 
-| Milestone | Deliverable |
-|---|---|
-| M6: tier-replication | Synthetic test passes — 100 entities, 50 subscribers, correct tier |
-| M7: pose-compression | 1M roundtrip poses; max <1cm error; ≤16 B wire |
-| M8: deterministic-projectile | Client prediction matches server hit res; pixel-accurate |
-| M9: lag-comp-rollback | Two-client hit reg accurate at 50ms / 200ms ping |
-| Integration | ship-sim service spun up; gateway routes; one cell |
-| Combat slice | One sloop with cannons, sails, planks, AI sloop opponent |
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ✓ `6ce6a33` | M6: tier-replication | Synthetic test passes — 100 entities, 50 subscribers, correct tier |
+| ✓ `c2e050d` | M7: pose-compression | 1M roundtrip poses; max <1cm error; ≤16 B wire (codec: `9d00323`; integration: `c2e050d`) |
+| ▢ | M8: deterministic-projectile | Client prediction matches server hit res; pixel-accurate |
+| ▢ | M9: lag-comp-rollback | Two-client hit reg accurate at 50ms / 200ms ping |
+| ▢ | Integration | ship-sim service spun up; gateway routes; one cell |
+| ▢ | Combat slice | One sloop with cannons, sails, planks, AI sloop opponent |
 
 **Milestone 1.5 stress test (gate before Phase 2):**
 - 30 boxes in one cell, each running buoyancy + a fake "I am firing
@@ -55,16 +61,16 @@ sloop, sinking it. Sub-100ms perceived latency, no stutter.
 The architectural payoff. Subsystems M10 through M12 plus cell-mgr,
 spatial-index, env, persistence-writer services.
 
-| Milestone | Deliverable |
-|---|---|
-| Cell-mgr service | Subscribes to entities in its region via spatial index |
-| Spatial-index service | Single process, sharded-ready, owns membership deltas |
-| Env service | Wind, weather, wave seed, time of day at 5 Hz |
-| Persistence-writer service | Sole PG writer, batches change streams |
-| Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter |
-| M10: gpu-driven-instancing | 5000 instances at 60 fps; ≤20 draw calls |
-| M11: structure-lod-merge | 500-piece anchorage merges <100 ms; far-LOD = 1 draw |
-| M12: animation-lod | 200 animated chars at varied distance; CPU ≤2 ms |
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ◐ skeleton at `30a3806` | Cell-mgr service | Subscribes to entities in its region via spatial index |
+| ▢ | Spatial-index service | Single process, sharded-ready, owns membership deltas |
+| ▢ | Env service | Wind, weather, wave seed, time of day at 5 Hz |
+| ▢ | Persistence-writer service | Sole PG writer, batches change streams |
+| ▢ | Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter |
+| ▢ | M10: gpu-driven-instancing | 5000 instances at 60 fps; ≤20 draw calls |
+| ▢ | M11: structure-lod-merge | 500-piece anchorage merges <100 ms; far-LOD = 1 draw |
+| ▢ | M12: animation-lod | 200 animated chars at varied distance; CPU ≤2 ms |
 
 **Milestone 1.6 stress test (gate before Phase 3):**
 - Synthetic harbor scene — 500 random structures + 30 box-ships + 200
@@ -82,6 +88,23 @@ The thing Grapeshot couldn't do.
 
 The actual game. With architecture proven and bottlenecks understood,
 content can land safely.
+
+**Content pipeline prerequisite (lands during Phase 2):** the team
+includes devs from a GTA 5 / FiveM RP modding background. Their
+content workflow — author in Blender → drop file → small manifest →
+hot-reload — sets the bar for the asset onboarding UX. By the time
+Phase 3 content scaling starts, the engine needs:
+
+- glTF mesh + KTX2 texture loaders (lift fallen-runes' `gltf_loader.zig` per the reference rules)
+- Hot-reload extended to meshes / textures (already established for shaders + YAML)
+- Per-content-unit YAML manifests (`data/ships/*.yaml`, `data/props/*.yaml` — one file per unit, no monolithic registries)
+- A worked-example onboarding doc — "how to add a new sail texture" — written for someone who's installed Zig once
+
+The shipping model can differ from FiveM's (we likely want pre-baked
+deterministic client builds with content versioning, not on-demand
+client downloads), but the **authoring** workflow should feel
+familiar. See memory `project_asset_pipeline_fivem_team.md` for the
+full set of tensions to manage.
 
 | System | Notes |
 |---|---|
@@ -129,13 +152,14 @@ Driven by playtest data and player demand. Possible additions:
 
 ## Stress-test gates summary
 
-| Gate | When | What it proves |
-|---|---|---|
-| M3 stable for 5 min | Phase 0 | Buoyancy doesn't diverge |
-| M5 multi-player | Phase 0 | Ship-as-vehicle works for >1 player |
-| Milestone 1.5 | Phase 1 → 2 | Server tick + replication scales |
-| Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
-| Closed playtest | Phase 4 | The loop is actually fun |
+| Status | Gate | When | What it proves |
+|---|---|---|---|
+| ✓ verified 2026-04-28 (`93c0ae0`) | M3 stable for 5 min | Phase 0 | Buoyancy doesn't diverge |
+| ✓ verified 2026-04-28 (`d1f4976`) | M5 multi-player | Phase 0 | Ship-as-vehicle works for >1 player |
+| ✓ verified 2026-04-29 (`6ce6a33`) | M6 phase gate (synthetic + BW) | Phase 1 | 100×50 fanout correct + ≤1 Mbps slow-lane budget held |
+| ▢ | Milestone 1.5 (live load) | Phase 1 → 2 | Server tick + replication scales under live ship-sim + gateway |
+| ▢ | Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
+| ▢ | Closed playtest | Phase 4 | The loop is actually fun |
 
 If any gate fails, **stop and fix before adding content**. This is the
 single most important discipline that Atlas lacked.
