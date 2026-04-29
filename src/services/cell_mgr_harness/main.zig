@@ -21,14 +21,20 @@ const Args = struct {
     cell_x: i32 = 0,
     cell_y: i32 = 0,
     nats_url: []const u8 = "nats://127.0.0.1:4222",
-    /// "static" = enter 5 entities + 3 subscribers and stay; "churn" =
-    /// repeated enter/exit with random ids; "oneshot" = enter, sleep,
-    /// exit, exit. Default is "oneshot".
+    /// `oneshot` = enter, sleep, exit. `static` = enter and hold.
+    /// `churn` = random enter/exit. `pose-stream` = enter N entities,
+    /// then publish per-entity state msgs at `--rate` Hz with simple
+    /// orbital trajectories (exercises cell-mgr's fast-lane callback
+    /// relay).
     scenario: Scenario = .oneshot,
     duration_s: u32 = 5,
+    /// `pose-stream` only: state-msg publish rate per entity (Hz).
+    state_rate_hz: u32 = 60,
+    /// `pose-stream` only: number of entities to spin around.
+    pose_n_entities: u32 = 5,
 };
 
-const Scenario = enum { oneshot, static, churn };
+const Scenario = enum { oneshot, static, churn, @"pose-stream" };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args = try std.process.argsWithAllocator(allocator);
@@ -52,6 +58,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.scenario = std.meta.stringToEnum(Scenario, v) orelse return error.BadScenario;
         } else if (std.mem.eql(u8, a, "--duration")) {
             out.duration_s = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--rate")) {
+            out.state_rate_hz = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--n")) {
+            out.pose_n_entities = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else {
             std.debug.print("harness: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -81,6 +91,14 @@ const Publisher = struct {
         defer self.allocator.free(buf);
         const subj = if (msg.op == .enter) self.sub_subj else self.unsub_subj;
         try self.client.publish(subj, buf);
+    }
+
+    fn pubState(self: *Publisher, ent_id: u32, msg: wire.StateMsg) !void {
+        var subject_buf: [64]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buf, "sim.entity.{d}.state", .{ent_id});
+        const buf = try wire.encodeState(self.allocator, msg);
+        defer self.allocator.free(buf);
+        try self.client.publish(subject, buf);
     }
 };
 
@@ -118,6 +136,7 @@ pub fn main() !void {
         .oneshot => try runOneshot(&pubr),
         .static => try runStatic(&pubr, args.duration_s),
         .churn => try runChurn(&pubr, args.duration_s),
+        .@"pose-stream" => try runPoseStream(&pubr, args.duration_s, args.pose_n_entities, args.state_rate_hz),
     }
 
     // Give the connection a moment to flush before close().
@@ -166,6 +185,80 @@ fn runStatic(p: *Publisher, duration_s: u32) !void {
         });
     }
     std.Thread.sleep(@as(u64, duration_s) * std.time.ns_per_s);
+}
+
+fn runPoseStream(p: *Publisher, duration_s: u32, n_ents: u32, rate_hz: u32) !void {
+    std.debug.print("harness: pose-stream — {d} entities orbiting, {d} Hz state msgs each, for {d}s\n", .{ n_ents, rate_hz, duration_s });
+
+    // Enter each entity at a unique starting position, plus one
+    // subscriber at the origin so we can watch the relay fire.
+    var i: u32 = 0;
+    while (i < n_ents) : (i += 1) {
+        const phase: f32 = @as(f32, @floatFromInt(i)) * (2.0 * std.math.pi / @as(f32, @floatFromInt(n_ents)));
+        const r = 100.0 + @as(f32, @floatFromInt(i)) * 30.0;
+        try p.pubDelta(.{
+            .op = .enter,
+            .id = i + 1,
+            .generation = 0,
+            .x = r * @cos(phase),
+            .y = 0,
+            .z = r * @sin(phase),
+        });
+    }
+    try p.pubSubscribe(.{ .op = .enter, .client_id = 0xCAFE, .x = 0, .y = 0, .z = 0 });
+
+    // Tight loop: every entity gets `rate_hz` state updates / second.
+    const tick_ns: u64 = std.time.ns_per_s / @as(u64, rate_hz);
+    const start_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const end_ns = start_ns + @as(u64, duration_s) * std.time.ns_per_s;
+    var next_tick_ns = start_ns + tick_ns;
+
+    var msgs_sent: u64 = 0;
+    var t_phase: f32 = 0;
+    while (@as(u64, @intCast(std.time.nanoTimestamp())) < end_ns) {
+        // Each entity moves on its own circular orbit, separated by
+        // phase + radius. Speed is enough to put visible motion in
+        // the per-tick samples without exceeding the codec's ±50 m/s
+        // velocity range.
+        var j: u32 = 0;
+        while (j < n_ents) : (j += 1) {
+            const base_phase: f32 = @as(f32, @floatFromInt(j)) * (2.0 * std.math.pi / @as(f32, @floatFromInt(n_ents)));
+            const r = 100.0 + @as(f32, @floatFromInt(j)) * 30.0;
+            const angle = base_phase + t_phase;
+            const x = r * @cos(angle);
+            const z = r * @sin(angle);
+            try p.pubState(j + 1, .{
+                .generation = 0,
+                .x = x,
+                .y = 0,
+                .z = z,
+                .heading_rad = angle + std.math.pi / 2.0, // tangent
+                .vx = -r * @sin(angle),
+                .vy = 0,
+                .vz = r * @cos(angle),
+            });
+            msgs_sent += 1;
+        }
+        t_phase += 0.1; // ~16°/tick at 60 Hz = ~6 sec per orbit
+
+        // Sleep until the next tick boundary. Skip if we're already
+        // late (loop body grew past one period — happens when N or
+        // rate is high enough that publishing alone exceeds the
+        // budget; behavior matches the production "best-effort 60 Hz"
+        // model).
+        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        if (next_tick_ns > now_ns) std.Thread.sleep(next_tick_ns - now_ns);
+        next_tick_ns += tick_ns;
+    }
+
+    std.debug.print("harness: pose-stream sent {d} state msgs over {d}s\n", .{ msgs_sent, duration_s });
+
+    // Tear down — exit all entities and the subscriber.
+    var k: u32 = 0;
+    while (k < n_ents) : (k += 1) {
+        try p.pubDelta(.{ .op = .exit, .id = k + 1, .generation = 0, .x = 0, .y = 0, .z = 0 });
+    }
+    try p.pubSubscribe(.{ .op = .exit, .client_id = 0xCAFE, .x = 0, .y = 0, .z = 0 });
 }
 
 fn runChurn(p: *Publisher, duration_s: u32) !void {

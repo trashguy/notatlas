@@ -61,7 +61,30 @@ pub const SubscribeMsg = struct {
     ship_gen: u16 = 0,
 };
 
+/// `sim.entity.<id>.state` payload — published by ship-sim (or the
+/// M-stack harness) at high rate per entity. The id comes from the
+/// subject path; the payload carries generation + the new pose. cell-
+/// mgr's fast-lane callback (docs/08 §2.3 "callback-to-publish")
+/// updates the entity table and forwards a single EntityRecord to
+/// each visual+ subscriber without waiting for the slow-lane fanout
+/// tick.
+pub const StateMsg = struct {
+    generation: u16,
+    x: f32,
+    y: f32,
+    z: f32,
+    rot: [4]f32 = .{ 0, 0, 0, 1 },
+    vx: f32 = 0,
+    vy: f32 = 0,
+    vz: f32 = 0,
+    heading_rad: f32 = 0,
+};
+
 pub fn encodeDelta(allocator: std.mem.Allocator, msg: DeltaMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn encodeState(allocator: std.mem.Allocator, msg: StateMsg) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, msg, .{});
 }
 
@@ -75,6 +98,24 @@ pub fn decodeDelta(allocator: std.mem.Allocator, payload: []const u8) !std.json.
 
 pub fn decodeSubscribe(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(SubscribeMsg) {
     return std.json.parseFromSlice(SubscribeMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+pub fn decodeState(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(StateMsg) {
+    return std.json.parseFromSlice(StateMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the entity id encoded as the third token of a
+/// `sim.entity.<id>.state` subject. Returns error if the subject
+/// doesn't match that shape.
+pub fn parseEntityIdFromSubject(subject: []const u8) !u32 {
+    const prefix = "sim.entity.";
+    const suffix = ".state";
+    if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
+    const id_str = subject[prefix.len .. subject.len - suffix.len];
+    if (id_str.len == 0) return error.BadSubject;
+    return std.fmt.parseInt(u32, id_str, 10);
 }
 
 const testing = std.testing;
@@ -95,6 +136,35 @@ test "wire: delta roundtrip" {
     const parsed = try decodeDelta(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: state roundtrip" {
+    const orig: StateMsg = .{
+        .generation = 7,
+        .x = 100,
+        .y = 0,
+        .z = -50,
+        .rot = .{ 0, 0.7071, 0, 0.7071 },
+        .vx = 1,
+        .vy = 0,
+        .vz = -2,
+        .heading_rad = 1.5,
+    };
+    const buf = try encodeState(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeState(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig.generation, parsed.value.generation);
+    try testing.expectEqual(orig.x, parsed.value.x);
+    try testing.expectEqual(orig.heading_rad, parsed.value.heading_rad);
+}
+
+test "wire: parseEntityIdFromSubject" {
+    try testing.expectEqual(@as(u32, 42), try parseEntityIdFromSubject("sim.entity.42.state"));
+    try testing.expectEqual(@as(u32, 1), try parseEntityIdFromSubject("sim.entity.1.state"));
+    try testing.expectError(error.BadSubject, parseEntityIdFromSubject("sim.entity.state"));
+    try testing.expectError(error.BadSubject, parseEntityIdFromSubject("sim.entity..state"));
+    try testing.expectError(error.BadSubject, parseEntityIdFromSubject("idx.spatial.cell.0_0.delta"));
 }
 
 test "wire: subscribe roundtrip with boarded ship" {

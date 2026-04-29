@@ -97,6 +97,21 @@ pub const State = struct {
         }
     }
 
+    /// Apply a high-rate state update for an existing entity (the
+    /// fast-lane callback path per docs/08 §2.3). Returns true if the
+    /// entity exists and the generation matches; false on stale-
+    /// generation or unknown id (both common during enter/exit
+    /// sequencing — the relay caller should treat false as a no-op).
+    pub fn applyState(self: *State, ent_id: u32, msg: wire.StateMsg) bool {
+        const existing = self.entities.getPtr(ent_id) orelse return false;
+        if (existing.id.generation != msg.generation) return false;
+        existing.pos = .{ msg.x, msg.y, msg.z };
+        existing.rot = msg.rot;
+        existing.vel = .{ msg.vx, msg.vy, msg.vz };
+        existing.heading_rad = msg.heading_rad;
+        return true;
+    }
+
     /// Apply a subscriber registration / deregistration.
     pub fn applySubscribe(self: *State, msg: wire.SubscribeMsg) !bool {
         switch (msg.op) {
@@ -150,6 +165,35 @@ test "state: re-enter with newer generation overwrites" {
     const e = s.entities.get(1).?;
     try testing.expectEqual(@as(u16, 6), e.id.generation);
     try testing.expectEqual(@as(f32, 100), e.pos[0]);
+}
+
+test "state: applyState updates pose for existing entity" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.applyDelta(.{ .op = .enter, .id = 1, .generation = 5, .x = 0, .y = 0, .z = 0 });
+    const ok = s.applyState(1, .{ .generation = 5, .x = 100, .y = 0, .z = 200, .vx = 5 });
+    try testing.expect(ok);
+    const e = s.entities.get(1).?;
+    try testing.expectEqual(@as(f32, 100), e.pos[0]);
+    try testing.expectEqual(@as(f32, 200), e.pos[2]);
+    try testing.expectEqual(@as(f32, 5), e.vel[0]);
+}
+
+test "state: applyState rejects stale generation" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.applyDelta(.{ .op = .enter, .id = 1, .generation = 5, .x = 0, .y = 0, .z = 0 });
+    const ok = s.applyState(1, .{ .generation = 4, .x = 100, .y = 0, .z = 200 });
+    try testing.expect(!ok);
+    const e = s.entities.get(1).?;
+    try testing.expectEqual(@as(f32, 0), e.pos[0]);
+}
+
+test "state: applyState on unknown id is a no-op" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    const ok = s.applyState(99, .{ .generation = 0, .x = 100, .y = 0, .z = 200 });
+    try testing.expect(!ok);
 }
 
 test "state: subscribe + unsubscribe" {

@@ -189,6 +189,12 @@ pub const Fanout = struct {
     /// the next cluster pass (when the arena resets).
     clusters: []replication.Cluster,
 
+    /// Fixed-size scratch buffer for the fast-lane relay path
+    /// (`relayState`). One single-record payload fits in
+    /// payload_header_size + entity_record_size = 28 B; 64 B leaves
+    /// room without forcing a per-call allocation.
+    relay_buf: [64]u8 = undefined,
+
     pub fn init(allocator: std.mem.Allocator, thresholds: TierThresholds) Fanout {
         return .{
             .allocator = allocator,
@@ -311,6 +317,42 @@ pub const Fanout = struct {
             publishes += 1;
         }
         return publishes;
+    }
+
+    /// Fast-lane callback path per docs/08 §2.3. Forward a single
+    /// entity's state to every subscriber whose effective tier is
+    /// ≥ visual — without waiting for the slow-lane fanout tick. The
+    /// caller (cell-mgr's `sim.entity.*.state` subscription) invokes
+    /// this on every inbound state msg.
+    ///
+    /// Allocation-free: builds a single-record payload in `relay_buf`
+    /// (28 B used out of 64 B), publishes via `sink`. nats-zig's
+    /// publish path itself is alloc-free (fixed PUB header buffer).
+    /// Returns the number of forwards made.
+    pub fn relayState(self: *Fanout, state: *const State, ent_id: u32, sink: Sink) !usize {
+        const ent = state.entities.get(ent_id) orelse return 0;
+
+        // Build the per-record bytes once — same value goes to every
+        // subscriber.
+        const slot = self.relay_buf[0 .. payload_header_size + entity_record_size];
+        const header: PayloadHeader = .{ .entity_count = 1, .cluster_count = 0 };
+        @memcpy(slot[0..payload_header_size], std.mem.asBytes(&header));
+        const rec_slot = slot[payload_header_size..];
+        writeEntityHeader(rec_slot[0..record_header_size], ent.id.id, ent.id.generation);
+        const ent_pose: pose_codec.Pose = .{ .pos = ent.pos, .rot = ent.rot, .vel = ent.vel };
+        const n = pose_codec.encodePose(ent_pose, ent_pose, null, rec_slot[record_header_size..][0..pose_codec.delta_size]);
+        std.debug.assert(n == pose_codec.delta_size);
+
+        var forwards: usize = 0;
+        var sub_it = state.subscribers.iterator();
+        while (sub_it.next()) |sub_entry| {
+            const sub = sub_entry.value_ptr.*;
+            const tier = replication.effectiveTier(sub, ent.pos, ent.aboard_ship, self.thresholds);
+            if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
+            try sink.publish(sub.client_id, slot);
+            forwards += 1;
+        }
+        return forwards;
     }
 
     /// Cluster-pass body: snapshot entities into the cluster-builder
@@ -603,6 +645,51 @@ test "fanout: count invariant — sub's individual ids ∪ cluster.count = total
     const cluster_bytes = clusterRecordsSlice(payload);
     const rec: ClusterRecord = std.mem.bytesToValue(ClusterRecord, cluster_bytes[0..cluster_record_size]);
     try testing.expectEqual(@as(u8, 8), rec.count);
+}
+
+test "fanout: relayState forwards only to visual+ subscribers" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    // Entity at the origin. Three subs at 50 m (close_combat),
+    // 300 m (visual), 1000 m (fleet_aggregate). The first two should
+    // get the relay; the third shouldn't.
+    try applyEnter(&state, 1, 0, 0, 0);
+    try applySubscribe(&state, &fanout, 0xAA, 50, 0);
+    try applySubscribe(&state, &fanout, 0xBB, 300, 0);
+    try applySubscribe(&state, &fanout, 0xCC, 1000, 0);
+
+    const forwards = try fanout.relayState(&state, 1, capture.sink());
+    try testing.expectEqual(@as(usize, 2), forwards);
+
+    try testing.expect(capture.payloadFor(0xAA) != null);
+    try testing.expect(capture.payloadFor(0xBB) != null);
+    try testing.expect(capture.payloadFor(0xCC) == null);
+
+    // Payload shape: 8B header + 1 × 20B record = 28 B.
+    const payload = capture.payloadFor(0xAA).?;
+    try testing.expectEqual(@as(usize, payload_header_size + entity_record_size), payload.len);
+    const header = payloadHeader(payload);
+    try testing.expectEqual(@as(u32, 1), header.entity_count);
+    try testing.expectEqual(@as(u32, 0), header.cluster_count);
+    try testing.expectEqual(@as(u32, 1), readRecordId(payload[payload_header_size..]));
+}
+
+test "fanout: relayState on unknown entity is a 0-forward no-op" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    try applySubscribe(&state, &fanout, 0xAA, 0, 0);
+    const forwards = try fanout.relayState(&state, 99, capture.sink());
+    try testing.expectEqual(@as(usize, 0), forwards);
 }
 
 // ---- M6.4 GATE: 100 entities × 50 subscribers, 1800 ticks, 0 allocs ----
