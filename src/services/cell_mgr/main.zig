@@ -126,13 +126,12 @@ pub fn main() !void {
     var tick_n: u64 = 0;
 
     while (g_running.load(.acquire)) {
-        // Drain inbound socket — fills sub.pending lists for each
-        // active subscription. processIncoming reads with a short
-        // timeout (currently 100 ms in nats-zig); that gates our tick
-        // when the socket is idle. M6.4 follow-up: patch nats-zig to
-        // expose a configurable poll budget so the fanout cadence is
-        // honest 30 Hz under no-traffic conditions.
-        try client.processIncoming();
+        // 5 ms poll budget keeps the tight-loop floor at ~200 Hz, well
+        // above the 30 Hz fanout tick and any callback-driven relay
+        // path we'll layer on later. nats-zig v0.2.2 introduced
+        // processIncomingTimeout — pre-v0.2.2 only had the 100 ms
+        // hardcoded path which capped this loop at ~10 Hz.
+        try client.processIncomingTimeout(5);
 
         try drainDeltaSub(allocator, sub_delta, &state);
         try drainSubscribeSub(allocator, sub_sub, &state, &fanout, .enter);

@@ -20,8 +20,8 @@
         // Tagged release; bump tag + re-fetch hash via `zig fetch --save`
         // when the upstream client changes.
         .nats_zig = .{
-            .url = "https://github.com/trashguy/nats-zig/archive/refs/tags/v0.2.1.tar.gz",
-            .hash = "nats_zig-0.1.0-Il_iJF0EAgCzlyL1iHUIeSHar2MBo5LdiwDqWfVufxDV",
+            .url = "https://github.com/trashguy/nats-zig/archive/refs/tags/v0.2.2.tar.gz",
+            .hash = "nats_zig-0.2.2-Il_iJIEGAgA0mVcEGNqnpIp4dqLJOgbe_HRzSCvMiHvw",
         },
     },
     .paths = .{
