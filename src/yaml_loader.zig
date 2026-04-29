@@ -11,6 +11,7 @@ const wave = @import("wave_query.zig");
 const wind = @import("wind_query.zig");
 const ocean_params_mod = @import("ocean_params.zig");
 const hull_mod = @import("hull_params.zig");
+const replication = @import("replication.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -196,6 +197,30 @@ pub fn loadWindFromFile(gpa: Allocator, abs_path: []const u8) !wind.WindParams {
 }
 
 // ------------------------------------------------------------
+// data/tier_distances.yaml
+// ------------------------------------------------------------
+
+const RawTierThresholds = struct {
+    fleet_aggregate_range_m: f32,
+    visual_range_m: f32,
+    close_combat_range_m: f32,
+};
+
+pub fn loadTierThresholdsFromFile(
+    allocator: Allocator,
+    abs_path: []const u8,
+) !replication.TierThresholds {
+    var parser = try ymlz.Ymlz(RawTierThresholds).init(allocator);
+    const raw = try parser.loadFile(abs_path);
+    defer parser.deinit(raw);
+    return .{
+        .fleet_aggregate_range_m = raw.fleet_aggregate_range_m,
+        .visual_range_m = raw.visual_range_m,
+        .close_combat_range_m = raw.close_combat_range_m,
+    };
+}
+
+// ------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------
 
@@ -313,6 +338,16 @@ test "loaded wind produces same windAt as preset" {
         try testing.expectEqual(a[0], b[0]);
         try testing.expectEqual(a[1], b[1]);
     }
+}
+
+test "load tier_distances.yaml matches TierThresholds.default" {
+    const abs = try std.fs.cwd().realpathAlloc(testing.allocator, "data/tier_distances.yaml");
+    defer testing.allocator.free(abs);
+    const loaded = try loadTierThresholdsFromFile(testing.allocator, abs);
+    const want = replication.TierThresholds.default;
+    try testing.expectEqual(want.fleet_aggregate_range_m, loaded.fleet_aggregate_range_m);
+    try testing.expectEqual(want.visual_range_m, loaded.visual_range_m);
+    try testing.expectEqual(want.close_combat_range_m, loaded.close_combat_range_m);
 }
 
 test "load ocean.yaml matches OceanParams.default" {

@@ -4,6 +4,7 @@ pub const wind_query = @import("wind_query.zig");
 pub const ocean_params = @import("ocean_params.zig");
 pub const hull_params = @import("hull_params.zig");
 pub const player = @import("player.zig");
+pub const replication = @import("replication.zig");
 pub const yaml_loader = @import("yaml_loader.zig");
 
 test {

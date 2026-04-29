@@ -1,4 +1,4 @@
-.PHONY: all build run test release fmt fmt-check clean help \
+.PHONY: all build run test test-release release fmt fmt-check clean help \
         setup-windows build-windows build-windows-debug
 
 all: build
@@ -11,6 +11,11 @@ run:
 
 test:
 	zig build test
+
+# ReleaseFast tests — needed to verify perf gates that are skipped in
+# Debug (e.g. M6.1's filter <500 ns / clustering <100 µs targets).
+test-release:
+	zig build test -Doptimize=ReleaseFast --summary all
 
 release:
 	zig build -Doptimize=ReleaseFast
@@ -44,6 +49,7 @@ help:
 	@echo "make build               — debug build"
 	@echo "make run                 — debug build + run sandbox"
 	@echo "make test                — run unit tests"
+	@echo "make test-release        — run unit tests in ReleaseFast (verifies perf gates)"
 	@echo "make release             — ReleaseFast build"
 	@echo "make fmt                 — format all sources"
 	@echo "make fmt-check           — verify formatting (non-zero on diff)"

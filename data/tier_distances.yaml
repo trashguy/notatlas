@@ -1,0 +1,12 @@
+# Tier replication thresholds. First-pass values from
+# docs/08-phase1-architecture.md §3.2; tune from the Milestone 1.5 stress
+# gate (200 players × 30 ships × ~1000 projectiles), not from synthetic
+# M6 numbers.
+#
+# Distances are xz-plane horizontal range in meters from the subscriber.
+# The "always" tier has no distance gate and the "boarded" tier is gated
+# by ship attachment, not range — neither appears here. rate_hz fields
+# from §3.2 will land alongside cell-mgr at M6.3.
+fleet_aggregate_range_m: 2000.0
+visual_range_m: 500.0
+close_combat_range_m: 150.0
