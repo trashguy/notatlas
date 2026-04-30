@@ -39,8 +39,8 @@ plus integration with fallen-runes' gateway / ship-sim service decomp.
 |---|---|---|
 | ✓ `6ce6a33` | M6: tier-replication | Synthetic test passes — 100 entities, 50 subscribers, correct tier |
 | ✓ `c2e050d` | M7: pose-compression | 1M roundtrip poses; max <1cm error; ≤16 B wire (codec: `9d00323`; integration: `c2e050d`) |
-| ✓ (uncommitted) | M8: deterministic-projectile | 1000 fires; closed-form predict matches Euler-ref within 0.15 m (~3× O(dt) drift). Vacuum ballistic v1; data/ammo/cannonball.yaml; sim.entity.<weapon>.fire wire format; integration with cell-mgr/gateway is a separate step |
-| ▢ | M9: lag-comp-rollback | Two-client hit reg accurate at 50ms / 200ms ping |
+| ✓ `97e8049` | M8: deterministic-projectile | 1000 fires; closed-form predict matches Euler-ref within 0.15 m (~3× O(dt) drift). Vacuum ballistic v1; data/ammo/cannonball.yaml; sim.entity.<weapon>.fire wire format; integration with cell-mgr/gateway is a separate step |
+| ✓ (uncommitted) | M9: lag-comp-rollback | 60 Hz rewind buffer; 50 ms / 200 ms ping rewind matches target view to one-tick precision (~8 cm @ 5 m/s); 250 ms cap rejects "shot around corners." Hit-test routine lives at the caller; module is the rewind primitive |
 | ▢ | Integration | ship-sim service spun up; gateway routes; one cell |
 | ▢ | Combat slice | One sloop with cannons, sails, planks, AI sloop opponent |
 
