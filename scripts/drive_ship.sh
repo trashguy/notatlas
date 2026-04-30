@@ -40,7 +40,7 @@ trap cleanup EXIT
 zig-out/bin/cell-mgr --cell 0_0 > "$LOG/cellmgr.log" 2>&1 &
 PIDS+=($!)
 
-zig-out/bin/gateway --client-id 256 --player-id 1 --listen-port 9000 > "$LOG/gateway.log" 2>&1 &
+zig-out/bin/gateway --listen-port 9000 > "$LOG/gateway.log" 2>&1 &
 PIDS+=($!)
 
 sleep 0.5

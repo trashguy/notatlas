@@ -3,46 +3,47 @@
 //! Stateless client-facing service that bridges TCP-connected
 //! clients into the NATS service mesh. Per-client this means:
 //!   - **inbound** (NATS → TCP): subscribe to `gw.client.<id>.cmd`
-//!     (cell-mgr's per-client fanout subject) and forward every
-//!     batched payload to the client's socket
+//!     and forward every cell-mgr fanout payload to the client's
+//!     socket
 //!   - **outbound** (TCP → NATS): read framed input messages from
 //!     the client's socket and publish to
 //!     `sim.entity.<player_id>.input`
 //!
-//! Sub-step 3 scope: bidirectional byte pipe. Inbound was sub-step
-//! 2; this adds the symmetric outbound direction. Conn socket is
-//! flipped to non-blocking after accept; per-loop iteration reads
-//! whatever bytes are pending into a 64 KB conn buffer, then drains
-//! complete length-prefixed frames out of the buffer one at a time
-//! and publishes each frame's payload bytes to
-//! `sim.entity.<--player-id>.input`. Pure passthrough — gateway
-//! never inspects payload bytes; framing is the only contract.
+//! Sub-step 4+5 scope: JWT-validated multi-client gateway.
+//! ONE gateway process handles up to `max_conns` concurrent TCP
+//! connections; each one identifies itself with a JWT (HS256) as
+//! its first length-prefixed frame. The token's `client_id` +
+//! `player_id` claims drive that connection's NATS subscription
+//! and outbound input subject. Replaces the per-process-per-client
+//! workaround used during the M1.5 stress gate (commit a6775ab).
 //!
 //! Wire framing for both directions: `[u32_le len][raw bytes]`.
-//! Why: TCP is a byte stream; NATS payloads are discrete; without
-//! explicit boundaries the receiver can't tell where one block ends
-//! and the next begins. Symmetric framing keeps client-side
-//! demux/mux trivial.
+//! The hello frame is a JWT in standard `header.payload.signature`
+//! form (ASCII bytes, no JSON wrapper). Subsequent frames are
+//! opaque payload bytes — gateway never inspects content; framing
+//! is the only contract.
 //!
-//! Subsequent sub-steps:
-//!   4. JWT validation + session lifecycle (auth handshake before
-//!      any forwarding). Once JWT carries player_id, the manual
-//!      --player-id arg goes away.
-//!   5. Multi-client (N concurrent connections, per-conn NATS
-//!      subscription + per-conn input publisher).
-//!   6. Per-tier dynamic subscription set per docs/08 §1.2.
+//! JWT validation:
+//!   - HS256 only (no RS256, no `none` alg). Validated against the
+//!     `NOTATLAS_JWT_SECRET` env var (or a dev-default with a
+//!     loud warning).
+//!   - Claims: `{ "client_id": u64, "player_id": u32, "exp": i64 }`
+//!     (unix seconds). Expired tokens reject.
+//!   - On failure: connection closes immediately, no error frame
+//!     written back. Production might want a structured error
+//!     response but for now the silence-then-close behavior is
+//!     unambiguous and minimal-attack-surface.
 //!
 //! Per docs/08 §8.3 gateway is the lift-with-reshape from
-//! fallen-runes' gateway. Until the reshape is mechanical (TCP
-//! framing + JWT pieces lift mostly intact), keep this binary
-//! thin. The interest filter and per-tier composition live at
-//! cell-mgr (docs/08 §8 decision 3), not here — this service is
-//! just the byte pipe.
+//! fallen-runes' gateway. Keep this binary thin — interest filter
+//! and per-tier composition live at cell-mgr (docs/08 §8 decision
+//! 3), not here.
 
 const std = @import("std");
 const nats = @import("nats");
 const notatlas = @import("notatlas");
 const posix = std.posix;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Per-payload header for slow-lane and fast-lane batches.
 /// Mirrors `cell_mgr/fanout.zig:PayloadHeader`. When a real
@@ -54,27 +55,21 @@ const PayloadHeader = extern struct {
 };
 
 const default_listen_port: u16 = 9000;
-/// Per-connection inbound buffer. Sized comfortably above any
-/// expected single-frame input (player input messages are tiny —
-/// this is more than enough for any plausible burst). Frames over
-/// `max_frame_bytes` close the conn defensively.
 const conn_buf_size: usize = 64 * 1024;
 const max_frame_bytes: u32 = 16 * 1024;
 const frame_header_bytes: usize = 4;
+/// Per docs/08 §1.2 a single gateway process should comfortably
+/// handle a few dozen concurrent client connections. 64 leaves
+/// headroom over the M1.5 spec of 50.
+const max_conns: usize = 64;
+/// Hello frame must arrive within this many seconds of accept,
+/// otherwise the conn is reaped. Stops idle non-talkers from
+/// holding slots indefinitely; production might tune lower (~2 s).
+const hello_timeout_s: i64 = 10;
 
 const Args = struct {
-    /// Hardcoded client_id for the skeleton — the gateway
-    /// subscribes to `gw.client.<this>.cmd`. Multi-client lands
-    /// in sub-step 5.
-    client_id: u64 = 1,
-    /// Player entity id this client is driving. Outbound TCP
-    /// frames are published to `sim.entity.<this>.input`. Once
-    /// JWT lands (sub-step 4) the JWT carries player_id and this
-    /// arg goes away. For sub-step 3 default to client_id.
-    player_id: ?u32 = null,
     /// TCP listen port. Bound to 127.0.0.1 only — gateway is
-    /// loopback-only until JWT lands (sub-step 4) and the service
-    /// is safe to expose externally.
+    /// loopback-only until it's deployment-ready.
     listen_port: u16 = default_listen_port,
     nats_url: []const u8 = "nats://127.0.0.1:4222",
 };
@@ -92,10 +87,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             const v = args.next() orelse return error.MissingArg;
             out.nats_url = try allocator.dupe(u8, v);
             have_nats_url = true;
-        } else if (std.mem.eql(u8, a, "--client-id")) {
-            out.client_id = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArg, 10);
-        } else if (std.mem.eql(u8, a, "--player-id")) {
-            out.player_id = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--listen-port")) {
             out.listen_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingArg, 10);
         } else {
@@ -121,8 +112,6 @@ fn installSignalHandlers() !void {
     };
     posix.sigaction(posix.SIG.INT, &act, null);
     posix.sigaction(posix.SIG.TERM, &act, null);
-    // SIGPIPE on a closed socket would otherwise terminate the
-    // process; we already check write errors and close the conn.
     const ignore_pipe: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -131,23 +120,180 @@ fn installSignalHandlers() !void {
     posix.sigaction(posix.SIG.PIPE, &ignore_pipe, null);
 }
 
-/// Set O_NONBLOCK on a connected socket fd. Conn fds returned by
-/// `accept()` don't inherit O_NONBLOCK from the listener on Linux —
-/// we want non-blocking reads in the main loop, so flip the flag
-/// after accept.
+/// Set O_NONBLOCK on a connected socket fd. Linux conn fds returned
+/// by `accept()` don't inherit O_NONBLOCK from the listener.
 fn setNonblocking(fd: posix.fd_t) !void {
     const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
     const nonblock_bit: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock_bit);
 }
 
-/// Per-connection inbound buffer. Append at `len`, drain frames out
-/// of the front, compact the tail down to position 0 once a frame
-/// is consumed.
+/// Per-connection inbound buffer.
 const ConnBuf = struct {
     bytes: [conn_buf_size]u8 = undefined,
     len: usize = 0,
 };
+
+const ConnState = enum {
+    /// Just accepted; haven't received a JWT hello yet.
+    awaiting_hello,
+    /// JWT validated, NATS sub created, both directions live.
+    active,
+};
+
+const Conn = struct {
+    conn: std.net.Server.Connection,
+    buf: ConnBuf = .{},
+    state: ConnState = .awaiting_hello,
+    accepted_at_unix_s: i64 = 0,
+    client_id: u64 = 0,
+    player_id: u32 = 0,
+    cmd_subj: []const u8 = "",
+    input_subj: []const u8 = "",
+    sub_cmd: ?*nats.Subscription = null,
+
+    fn deinit(self: *Conn, allocator: std.mem.Allocator, client: *nats.Client) void {
+        if (self.sub_cmd) |s| client.unsubscribe(s) catch {};
+        if (self.cmd_subj.len > 0) allocator.free(self.cmd_subj);
+        if (self.input_subj.len > 0) allocator.free(self.input_subj);
+        self.conn.stream.close();
+        self.* = undefined;
+    }
+};
+
+const Conns = struct {
+    slots: [max_conns]?Conn = .{null} ** max_conns,
+    active_count: u32 = 0,
+
+    fn findFree(self: *const Conns) ?usize {
+        for (self.slots, 0..) |s, i| if (s == null) return i;
+        return null;
+    }
+
+    fn close(
+        self: *Conns,
+        i: usize,
+        allocator: std.mem.Allocator,
+        client: *nats.Client,
+    ) void {
+        if (self.slots[i] == null) return;
+        var c = &self.slots[i].?;
+        c.deinit(allocator, client);
+        self.slots[i] = null;
+        if (self.active_count > 0) self.active_count -= 1;
+    }
+};
+
+/// JWT claims — what the gateway extracts and trusts after a
+/// signature-valid token is presented. Matches the standard
+/// `client_id` / `player_id` / `exp` triple a python-side helper
+/// emits.
+const Claims = struct {
+    client_id: u64,
+    player_id: u32,
+    exp: i64,
+};
+
+const Identity = struct {
+    client_id: u64,
+    player_id: u32,
+};
+
+const JwtError = error{
+    BadJwt,
+    BadSignature,
+    BadAlgorithm,
+    Expired,
+    PayloadTooLarge,
+};
+
+/// Validate a JWT bearer token (HS256). Returns the (client_id,
+/// player_id) pair on success; rejects expired tokens, wrong
+/// algorithms, and signature mismatches.
+fn verifyJwt(
+    allocator: std.mem.Allocator,
+    token: []const u8,
+    secret: []const u8,
+    now_unix_s: i64,
+) JwtError!Identity {
+    // Find the two dots that separate header.payload.signature.
+    const dot1 = std.mem.indexOfScalar(u8, token, '.') orelse return error.BadJwt;
+    const rest = token[dot1 + 1 ..];
+    const dot2_in_rest = std.mem.indexOfScalar(u8, rest, '.') orelse return error.BadJwt;
+    const dot2 = dot1 + 1 + dot2_in_rest;
+    if (std.mem.indexOfScalarPos(u8, token, dot2 + 1, '.') != null) return error.BadJwt;
+
+    const header_b64 = token[0..dot1];
+    const payload_b64 = token[dot1 + 1 .. dot2];
+    const sig_b64 = token[dot2 + 1 ..];
+    if (header_b64.len == 0 or payload_b64.len == 0 or sig_b64.len == 0) return error.BadJwt;
+
+    // Verify signature against the signed input "header.payload".
+    const signed = token[0..dot2];
+    var expected_mac: [HmacSha256.mac_length]u8 = undefined;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(signed);
+    hmac.final(&expected_mac);
+
+    var got_mac: [HmacSha256.mac_length]u8 = undefined;
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const sig_size = decoder.calcSizeForSlice(sig_b64) catch return error.BadJwt;
+    if (sig_size != HmacSha256.mac_length) return error.BadSignature;
+    decoder.decode(got_mac[0..sig_size], sig_b64) catch return error.BadJwt;
+    if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, expected_mac, got_mac)) {
+        return error.BadSignature;
+    }
+
+    // Decode header — must have alg=HS256. Reject anything else,
+    // especially `none` (the classic JWT footgun).
+    var header_buf: [256]u8 = undefined;
+    const header_size = decoder.calcSizeForSlice(header_b64) catch return error.BadJwt;
+    if (header_size > header_buf.len) return error.PayloadTooLarge;
+    decoder.decode(header_buf[0..header_size], header_b64) catch return error.BadJwt;
+
+    const Header = struct { alg: []const u8 };
+    const parsed_hdr = std.json.parseFromSlice(
+        Header,
+        allocator,
+        header_buf[0..header_size],
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.BadJwt;
+    defer parsed_hdr.deinit();
+    if (!std.mem.eql(u8, parsed_hdr.value.alg, "HS256")) return error.BadAlgorithm;
+
+    // Decode + parse claims.
+    var payload_buf: [512]u8 = undefined;
+    const payload_size = decoder.calcSizeForSlice(payload_b64) catch return error.BadJwt;
+    if (payload_size > payload_buf.len) return error.PayloadTooLarge;
+    decoder.decode(payload_buf[0..payload_size], payload_b64) catch return error.BadJwt;
+
+    const parsed = std.json.parseFromSlice(
+        Claims,
+        allocator,
+        payload_buf[0..payload_size],
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.BadJwt;
+    defer parsed.deinit();
+
+    if (parsed.value.exp <= now_unix_s) return error.Expired;
+    return .{ .client_id = parsed.value.client_id, .player_id = parsed.value.player_id };
+}
+
+/// Resolve the JWT signing secret. Env `NOTATLAS_JWT_SECRET` if
+/// set; otherwise a dev-default with a loud warning (the warning
+/// is the load-bearing part — production deployments should fail
+/// CI if this default is observed in logs).
+fn resolveSecret(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "NOTATLAS_JWT_SECRET")) |s| {
+        return s;
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {
+            std.debug.print("gateway: WARNING — NOTATLAS_JWT_SECRET unset; using dev-default. DO NOT DEPLOY.\n", .{});
+            return try allocator.dupe(u8, "notatlas-dev-secret-do-not-deploy");
+        },
+        else => return err,
+    }
+}
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -158,37 +304,29 @@ pub fn main() !void {
     defer allocator.free(args.nats_url);
     try installSignalHandlers();
 
-    const player_id = args.player_id orelse @as(u32, @intCast(args.client_id));
+    const secret = try resolveSecret(allocator);
+    defer allocator.free(secret);
 
-    const cmd_subj = try std.fmt.allocPrint(allocator, "gw.client.{d}.cmd", .{args.client_id});
-    defer allocator.free(cmd_subj);
-    const input_subj = try std.fmt.allocPrint(allocator, "sim.entity.{d}.input", .{player_id});
-    defer allocator.free(input_subj);
-
-    // Bind the TCP listener BEFORE the NATS connect so a port-in-use
-    // error fails fast without leaving a dangling NATS subscription.
     const listen_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, args.listen_port);
     var server = try listen_addr.listen(.{
         .reuse_address = true,
         .force_nonblocking = true,
     });
     defer server.deinit();
-    std.debug.print("gateway: listening on 127.0.0.1:{d}\n", .{args.listen_port});
+    std.debug.print("gateway: listening on 127.0.0.1:{d}; max_conns={d}\n", .{ args.listen_port, max_conns });
 
-    std.debug.print("gateway: connecting to {s}; client_id={d} player_id={d}\n", .{ args.nats_url, args.client_id, player_id });
-
+    std.debug.print("gateway: connecting to {s}\n", .{args.nats_url});
     var client = try nats.Client.connect(allocator, .{
         .servers = &.{args.nats_url},
         .name = "gateway",
     });
     defer client.close();
+    std.debug.print("gateway: connected\n", .{});
 
-    const sub_cmd = try client.subscribe(cmd_subj, .{});
-    std.debug.print("gateway: subscribed to {s}; outbound publishes to {s}\n", .{ cmd_subj, input_subj });
-
-    var conn: ?std.net.Server.Connection = null;
-    var conn_buf: ConnBuf = .{};
-    defer if (conn) |c| c.stream.close();
+    var conns: Conns = .{};
+    defer for (&conns.slots, 0..) |*slot, i| {
+        if (slot.* != null) conns.close(i, allocator, client);
+    };
 
     var msgs_total: u64 = 0;
     var ents_total: u64 = 0;
@@ -197,107 +335,168 @@ pub fn main() !void {
     var bytes_tcp_out_total: u64 = 0;
     var bytes_tcp_in_total: u64 = 0;
     var frames_in_total: u64 = 0;
+    var accepts_total: u64 = 0;
+    var rejected_jwt: u64 = 0;
+    var rejected_full: u64 = 0;
     var last_log_ns: u64 = @intCast(std.time.nanoTimestamp());
 
     while (g_running.load(.acquire)) {
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
 
-        // Non-blocking accept. If something's pending, replace the
-        // existing connection — single-client policy for sub-step 2.
-        if (server.accept()) |new_conn| {
-            if (conn) |old| {
-                std.debug.print("gateway: replacing existing TCP conn {f} with {f}\n", .{ old.address, new_conn.address });
-                old.stream.close();
-            } else {
-                std.debug.print("gateway: TCP client connected from {f}\n", .{new_conn.address});
-            }
-            setNonblocking(new_conn.stream.handle) catch |err| {
-                std.debug.print("gateway: setNonblocking failed ({s}); rejecting conn\n", .{@errorName(err)});
-                new_conn.stream.close();
-                conn = null;
-                conn_buf.len = 0;
+        // Accept as many pending conns as we have free slots for.
+        accept_loop: while (true) {
+            const new_conn = server.accept() catch |err| switch (err) {
+                error.WouldBlock => break :accept_loop,
+                else => return err,
             };
-            conn = new_conn;
-            conn_buf.len = 0;
-        } else |err| switch (err) {
-            error.WouldBlock => {},
-            else => return err,
+            const slot_idx = conns.findFree() orelse {
+                std.debug.print(
+                    "gateway: rejecting conn from {f} — all {d} slots full\n",
+                    .{ new_conn.address, max_conns },
+                );
+                rejected_full += 1;
+                new_conn.stream.close();
+                continue;
+            };
+            setNonblocking(new_conn.stream.handle) catch |err| {
+                std.debug.print("gateway: setNonblocking failed ({s}); rejecting\n", .{@errorName(err)});
+                new_conn.stream.close();
+                continue;
+            };
+            conns.slots[slot_idx] = .{
+                .conn = new_conn,
+                .accepted_at_unix_s = std.time.timestamp(),
+            };
+            conns.active_count += 1;
+            accepts_total += 1;
         }
 
-        // TCP → NATS: drain whatever's pending on the conn, parse
-        // length-prefixed frames out of conn_buf, publish each.
-        if (conn) |c| {
-            const drained = drainSocket(&conn_buf, c.stream) catch |err| blk: {
-                std.debug.print("gateway: TCP read failed ({s}); closing conn\n", .{@errorName(err)});
-                c.stream.close();
-                conn = null;
-                conn_buf.len = 0;
-                break :blk DrainResult{};
-            };
-            bytes_tcp_in_total += drained.bytes_read;
-            // Drain frames out of the buffer one at a time. peekFrame
-            // returns a slice into conn_buf; publish copies into NATS
-            // client buffer; consumeFrame compacts the buffer for the
-            // next iteration. Loop until no complete frame remains.
-            if (conn != null) {
-                close_loop: while (true) {
-                    const peek = peekFrame(&conn_buf) catch |err| switch (err) {
-                        error.OversizedFrame => {
-                            std.debug.print("gateway: oversized frame (>{d} B); closing conn\n", .{max_frame_bytes});
-                            c.stream.close();
-                            conn = null;
-                            conn_buf.len = 0;
-                            break :close_loop;
-                        },
-                    };
-                    const frame = peek orelse break :close_loop;
-                    try client.publish(input_subj, frame);
-                    consumeFrame(&conn_buf);
-                    frames_in_total += 1;
+        // Per-conn work.
+        for (&conns.slots, 0..) |*slot, i| {
+            if (slot.* == null) continue;
+            const c = &slot.*.?;
+
+            // Hello-timeout reaper for awaiting_hello conns that
+            // never speak — protects the slot table from idle non-
+            // talkers / port-scanners.
+            if (c.state == .awaiting_hello) {
+                if (std.time.timestamp() - c.accepted_at_unix_s > hello_timeout_s) {
+                    std.debug.print(
+                        "gateway: conn {f} hello timeout; closing\n",
+                        .{c.conn.address},
+                    );
+                    rejected_jwt += 1;
+                    conns.close(i, allocator, client);
+                    continue;
                 }
             }
-            if (conn != null and drained.eof) {
-                std.debug.print("gateway: TCP client closed (EOF); reverting to idle\n", .{});
-                c.stream.close();
-                conn = null;
-                conn_buf.len = 0;
+
+            // TCP → buffer.
+            const drained = drainSocket(&c.buf, c.conn.stream) catch |err| {
+                std.debug.print("gateway: conn {d} read failed ({s}); closing\n", .{ i, @errorName(err) });
+                conns.close(i, allocator, client);
+                continue;
+            };
+            bytes_tcp_in_total += drained.bytes_read;
+
+            // State-driven frame handling.
+            switch (c.state) {
+                .awaiting_hello => {
+                    const peek = peekFrame(&c.buf) catch |err| {
+                        std.debug.print("gateway: conn {d} bad hello frame ({s}); closing\n", .{ i, @errorName(err) });
+                        rejected_jwt += 1;
+                        conns.close(i, allocator, client);
+                        continue;
+                    };
+                    if (peek) |jwt_bytes| {
+                        const id = verifyJwt(allocator, jwt_bytes, secret, std.time.timestamp()) catch |err| {
+                            std.debug.print("gateway: conn {d} JWT rejected ({s}); closing\n", .{ i, @errorName(err) });
+                            rejected_jwt += 1;
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
+                        c.client_id = id.client_id;
+                        c.player_id = id.player_id;
+                        c.cmd_subj = std.fmt.allocPrint(allocator, "gw.client.{d}.cmd", .{id.client_id}) catch |err| {
+                            std.debug.print("gateway: conn {d} alloc cmd_subj failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
+                        c.input_subj = std.fmt.allocPrint(allocator, "sim.entity.{d}.input", .{id.player_id}) catch |err| {
+                            std.debug.print("gateway: conn {d} alloc input_subj failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
+                        c.sub_cmd = client.subscribe(c.cmd_subj, .{}) catch |err| {
+                            std.debug.print("gateway: conn {d} subscribe failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
+                        c.state = .active;
+                        consumeFrame(&c.buf);
+                        std.debug.print(
+                            "gateway: conn {d} from {f} → client_id={d} player_id={d}\n",
+                            .{ i, c.conn.address, c.client_id, c.player_id },
+                        );
+                    }
+                },
+                .active => {
+                    // TCP → NATS publish.
+                    publish_loop: while (true) {
+                        const peek = peekFrame(&c.buf) catch {
+                            std.debug.print("gateway: conn {d} oversized frame; closing\n", .{i});
+                            conns.close(i, allocator, client);
+                            break :publish_loop;
+                        };
+                        const frame = peek orelse break :publish_loop;
+                        client.publish(c.input_subj, frame) catch |err| {
+                            std.debug.print("gateway: conn {d} input publish failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            break :publish_loop;
+                        };
+                        consumeFrame(&c.buf);
+                        frames_in_total += 1;
+                    }
+                },
             }
-        }
 
-        // NATS → TCP: forward each batched fanout payload to the
-        // connected socket as a length-prefixed frame.
-        while (sub_cmd.nextMsg()) |msg| {
-            var owned = msg;
-            defer owned.deinit();
-            const payload = owned.payload orelse continue;
-            msgs_total += 1;
-            bytes_total += payload.len;
-            const header = decodeHeader(payload);
-            ents_total += header.entity_count;
-            clusters_total += header.cluster_count;
+            // NATS → TCP forward (only meaningful for active conns).
+            if (slot.* != null and slot.*.?.state == .active) {
+                const sub = slot.*.?.sub_cmd.?;
+                while (sub.nextMsg()) |msg| {
+                    var owned = msg;
+                    defer owned.deinit();
+                    const payload = owned.payload orelse continue;
+                    msgs_total += 1;
+                    bytes_total += payload.len;
+                    const hdr = decodeHeader(payload);
+                    ents_total += hdr.entity_count;
+                    clusters_total += hdr.cluster_count;
+                    const n = forwardFrame(slot.*.?.conn.stream, payload) catch |err| {
+                        std.debug.print("gateway: conn {d} write failed ({s}); closing\n", .{ i, @errorName(err) });
+                        conns.close(i, allocator, client);
+                        break;
+                    };
+                    bytes_tcp_out_total += n;
+                }
+            }
 
-            if (conn) |c| {
-                const n = forwardFrame(c.stream, payload) catch |err| blk: {
-                    std.debug.print("gateway: TCP write failed ({s}); closing conn\n", .{@errorName(err)});
-                    c.stream.close();
-                    conn = null;
-                    conn_buf.len = 0;
-                    break :blk 0;
-                };
-                bytes_tcp_out_total += n;
+            if (slot.* != null and drained.eof) {
+                std.debug.print("gateway: conn {d} EOF; closing\n", .{i});
+                conns.close(i, allocator, client);
             }
         }
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= std.time.ns_per_s) {
-            const tcp_status: []const u8 = if (conn != null) "TCP up" else "TCP idle";
             std.debug.print(
-                "[gateway client={d}] {d} msgs / {d} ents / {d} clusters / {d} B in / {d} B out / {d} frames-in ({d} B) ({s}) last 1 s\n",
+                "[gateway] {d} active conns / {d} accepts ({d} jwt-reject, {d} full-reject) | NATS in: {d} msgs / {d} ents / {d} clusters / {d} B | TCP in: {d} frames ({d} B) | TCP out: {d} B (last 1 s)\n",
                 .{
-                    args.client_id,      msgs_total,        ents_total, clusters_total,
-                    bytes_total,         bytes_tcp_out_total, frames_in_total,
-                    bytes_tcp_in_total,  tcp_status,
+                    conns.active_count, accepts_total,    rejected_jwt, rejected_full,
+                    msgs_total,         ents_total,       clusters_total,
+                    bytes_total,        frames_in_total, bytes_tcp_in_total,
+                    bytes_tcp_out_total,
                 },
             );
             msgs_total = 0;
@@ -307,6 +506,9 @@ pub fn main() !void {
             bytes_tcp_out_total = 0;
             bytes_tcp_in_total = 0;
             frames_in_total = 0;
+            accepts_total = 0;
+            rejected_jwt = 0;
+            rejected_full = 0;
             last_log_ns = now_ns;
         }
     }
@@ -322,11 +524,10 @@ fn decodeHeader(payload: []const u8) PayloadHeader {
 }
 
 /// Write `[u32_le len][payload]` to the connected client. Returns
-/// total bytes written (frame header included). Writes are blocking
-/// for sub-step 2; if the client's recv buffer fills the loop pauses
-/// until it drains. `nc` and other localhost clients drain instantly,
-/// so this is fine for the skeleton; real backpressure handling is
-/// future work (sub-step 4+ alongside JWT / multi-client).
+/// total bytes written. Blocking writes — the conn socket is non-
+/// blocking so a slow reader returns `error.WouldBlock` (treated
+/// as a write failure → conn close). Real backpressure handling
+/// is future work.
 fn forwardFrame(stream: std.net.Stream, payload: []const u8) !usize {
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @intCast(payload.len), .little);
@@ -341,9 +542,8 @@ const DrainResult = struct {
 };
 
 /// Drain whatever's pending on `stream` into `buf`. Reads until
-/// `WouldBlock` (no more data available), `eof` (peer closed), or
-/// the buffer fills (oversized frame defensive limit triggers in
-/// the caller). Non-blocking — never stalls the main loop.
+/// `WouldBlock`, EOF, or the buffer fills. Non-blocking — never
+/// stalls the main loop.
 fn drainSocket(buf: *ConnBuf, stream: std.net.Stream) !DrainResult {
     var result: DrainResult = .{};
     while (buf.len < buf.bytes.len) {
@@ -363,12 +563,7 @@ fn drainSocket(buf: *ConnBuf, stream: std.net.Stream) !DrainResult {
 
 /// Peek one complete length-prefixed frame at the front of `buf`,
 /// returning the payload bytes as a slice INTO `buf.bytes`. The
-/// slice is valid until the next mutating call; caller must invoke
-/// `consumeFrame` after publish completes. Returns null if no
-/// complete frame is buffered. Returns `error.OversizedFrame` if
-/// the header advertises a frame larger than `max_frame_bytes` —
-/// caller should close the conn (defensive against junk-on-the-
-/// wire / unauthenticated peer).
+/// slice is valid until the next mutating call.
 fn peekFrame(buf: *const ConnBuf) error{OversizedFrame}!?[]const u8 {
     if (buf.len < frame_header_bytes) return null;
     const frame_len = std.mem.readInt(u32, buf.bytes[0..frame_header_bytes], .little);
@@ -378,9 +573,6 @@ fn peekFrame(buf: *const ConnBuf) error{OversizedFrame}!?[]const u8 {
     return buf.bytes[frame_header_bytes..total];
 }
 
-/// Drop the frame previously returned by `peekFrame` from the
-/// front of `buf`. Compacts the tail down to offset 0 so the next
-/// `drainSocket` call has the full buffer to read into.
 fn consumeFrame(buf: *ConnBuf) void {
     const frame_len = std.mem.readInt(u32, buf.bytes[0..frame_header_bytes], .little);
     const total = frame_header_bytes + @as(usize, frame_len);
@@ -390,6 +582,8 @@ fn consumeFrame(buf: *ConnBuf) void {
     }
     buf.len = remaining;
 }
+
+// ---- tests ----
 
 test "peek/consumeFrame: single frame" {
     var buf: ConnBuf = .{};
@@ -429,7 +623,7 @@ test "peek/consumeFrame: incomplete frame returns null" {
     var buf: ConnBuf = .{};
     const len_bytes: [4]u8 = .{ 5, 0, 0, 0 };
     @memcpy(buf.bytes[0..4], &len_bytes);
-    @memcpy(buf.bytes[4..7], "hel"); // only 3 of 5 payload bytes
+    @memcpy(buf.bytes[4..7], "hel");
     buf.len = 7;
     try std.testing.expectEqual(@as(?[]const u8, null), try peekFrame(&buf));
 }
@@ -440,4 +634,111 @@ test "peekFrame: oversized frame errors" {
     std.mem.writeInt(u32, buf.bytes[0..4], huge, .little);
     buf.len = 4;
     try std.testing.expectError(error.OversizedFrame, peekFrame(&buf));
+}
+
+/// Helper: mint a valid HS256 JWT inside the test process so the
+/// verify path doesn't depend on an external token-mint tool.
+fn mintTestJwt(
+    out_buf: []u8,
+    secret: []const u8,
+    claims_json: []const u8,
+) ![]const u8 {
+    const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+
+    const header_b64_len = encoder.calcSize(header_json.len);
+    const payload_b64_len = encoder.calcSize(claims_json.len);
+    const sig_b64_len = encoder.calcSize(HmacSha256.mac_length);
+    const total = header_b64_len + 1 + payload_b64_len + 1 + sig_b64_len;
+    if (total > out_buf.len) return error.NoSpaceLeft;
+
+    var off: usize = 0;
+    _ = encoder.encode(out_buf[off .. off + header_b64_len], header_json);
+    off += header_b64_len;
+    out_buf[off] = '.';
+    off += 1;
+    _ = encoder.encode(out_buf[off .. off + payload_b64_len], claims_json);
+    off += payload_b64_len;
+
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(out_buf[0..off]);
+    hmac.final(&mac);
+
+    out_buf[off] = '.';
+    off += 1;
+    _ = encoder.encode(out_buf[off .. off + sig_b64_len], &mac);
+    off += sig_b64_len;
+    return out_buf[0..off];
+}
+
+test "verifyJwt: valid token" {
+    var buf: [512]u8 = undefined;
+    const claims = "{\"client_id\":256,\"player_id\":7,\"exp\":99999999999}";
+    const tok = try mintTestJwt(&buf, "test-secret", claims);
+    const id = try verifyJwt(std.testing.allocator, tok, "test-secret", 1_000_000);
+    try std.testing.expectEqual(@as(u64, 256), id.client_id);
+    try std.testing.expectEqual(@as(u32, 7), id.player_id);
+}
+
+test "verifyJwt: bad signature" {
+    var buf: [512]u8 = undefined;
+    const claims = "{\"client_id\":256,\"player_id\":7,\"exp\":99999999999}";
+    const tok = try mintTestJwt(&buf, "test-secret", claims);
+    try std.testing.expectError(
+        error.BadSignature,
+        verifyJwt(std.testing.allocator, tok, "wrong-secret", 1_000_000),
+    );
+}
+
+test "verifyJwt: expired" {
+    var buf: [512]u8 = undefined;
+    const claims = "{\"client_id\":256,\"player_id\":7,\"exp\":500}";
+    const tok = try mintTestJwt(&buf, "test-secret", claims);
+    try std.testing.expectError(
+        error.Expired,
+        verifyJwt(std.testing.allocator, tok, "test-secret", 1_000_000),
+    );
+}
+
+test "verifyJwt: malformed (no dots)" {
+    try std.testing.expectError(
+        error.BadJwt,
+        verifyJwt(std.testing.allocator, "not-a-jwt", "secret", 0),
+    );
+}
+
+test "verifyJwt: malformed (only one dot)" {
+    try std.testing.expectError(
+        error.BadJwt,
+        verifyJwt(std.testing.allocator, "abc.def", "secret", 0),
+    );
+}
+
+test "verifyJwt: rejects alg=none" {
+    // Hand-crafted token with `alg":"none"` header. Even with no
+    // signature this should reject — defensive against the classic
+    // JWT-library footgun.
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    var hdr_buf: [128]u8 = undefined;
+    var pl_buf: [128]u8 = undefined;
+    var tok_buf: [512]u8 = undefined;
+    const hdr_json = "{\"alg\":\"none\",\"typ\":\"JWT\"}";
+    const pl_json = "{\"client_id\":1,\"player_id\":1,\"exp\":99999999999}";
+    const hdr_b64_len = encoder.calcSize(hdr_json.len);
+    const pl_b64_len = encoder.calcSize(pl_json.len);
+    _ = encoder.encode(hdr_buf[0..hdr_b64_len], hdr_json);
+    _ = encoder.encode(pl_buf[0..pl_b64_len], pl_json);
+    const sig_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // bogus
+    const tok = try std.fmt.bufPrint(&tok_buf, "{s}.{s}.{s}", .{
+        hdr_buf[0..hdr_b64_len],
+        pl_buf[0..pl_b64_len],
+        sig_b64,
+    });
+    // Signature won't match HS256 of (header+payload), so this fails
+    // at signature step before alg check — that's fine, both are
+    // rejection paths. The point of the test is: alg=none never
+    // succeeds.
+    const r = verifyJwt(std.testing.allocator, tok, "any-secret", 1_000_000);
+    try std.testing.expectError(error.BadSignature, r);
 }

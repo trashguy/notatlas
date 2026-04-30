@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# M1.5 stress gate launcher — 30 ents/cell × 50 simulated clients.
+# M1.5 stress gate launcher — 30 ents/cell × N simulated clients.
 #
-# Architecture: per-process-per-client gateway workaround until
-# JWT + multi-client gateway lands. 50 gateway processes on ports
-# 9000..9049 with client_ids 0x100..0x131 (= 256..305). The harness
-# `bench` scenario spawns matching cell-mgr subscribers in that id
-# range so cell-mgr fans out per-sub on `gw.client.<id>.cmd`.
+# Default: ONE gateway process, JWT-authenticated multi-client. The
+# orchestrator (scripts/m1_5_drive.py) opens N TCP conns to a single
+# port, sends a JWT bearer per conn (claims supply client_id/player_id),
+# then drains state frames.
 #
-# Pass criteria: per-conn TCP outbound rate ≤ 1 Mbps, headline gate
-# per docs/04 §M1.5. Worst case is all 50 subs at origin (spread=0)
-# so every sub sees all 30 ships at visual-tier — no slow-lane
-# cluster-aggregate compaction. If the gate passes here it passes
-# anywhere.
+# Set MODE=multi for the legacy per-process-per-client workaround
+# (50 gateway procs on consecutive ports). Used during the original
+# 2026-05-01 M1.5 gate before JWT landed.
 #
-# Usage: ./scripts/m1_5_run.sh [duration_s] [n_subs]
+# Pass criterion: per-conn TCP outbound rate ≤ 1 Mbps. Worst case is
+# all subs at origin (spread=0) so every sub sees all 30 ships at
+# visual-tier — no slow-lane cluster-aggregate compaction.
+#
+# Usage:
+#   ./scripts/m1_5_run.sh [duration_s] [n_subs] [mode]
+#     mode = 'single' (default) | 'multi'
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DURATION="${1:-30}"
 N_SUBS="${2:-50}"
+MODE="${3:-single}"
 N_SHIPS=30
 PORT_BASE=9000
 CLIENT_BASE=256
@@ -28,7 +32,7 @@ LOG=/tmp/notatlas-m15
 mkdir -p "$LOG"
 rm -f "$LOG"/*.log
 
-echo ">>> M1.5: $N_SHIPS ships × $N_SUBS subs × ${DURATION}s"
+echo ">>> M1.5 ($MODE-gateway): $N_SHIPS ships × $N_SUBS subs × ${DURATION}s"
 
 if ! ss -lnt 2>/dev/null | grep -q :4222; then
   echo ">>> starting NATS"
@@ -54,34 +58,43 @@ zig-out/bin/ship-sim --ships "$N_SHIPS" --grid --spacing 30 > "$LOG/shipsim.log"
 PIDS+=($!)
 sleep 0.5
 
-# 50 gateway processes — each with its own port + client_id +
-# player_id. The harness's bench scenario spawns matching subs.
-echo ">>> spawning $N_SUBS gateway processes"
-for ((i=0; i<N_SUBS; i++)); do
-  port=$((PORT_BASE + i))
-  cid=$((CLIENT_BASE + i))
-  pid_player=$((i + 1))  # ships are ids 1..30; if i>=30 player_id is bogus (no ship)
-  zig-out/bin/gateway --client-id "$cid" --player-id "$pid_player" --listen-port "$port" \
-    > "$LOG/gateway-$i.log" 2>&1 &
+if [[ "$MODE" == "single" ]]; then
+  echo ">>> spawning 1 gateway (JWT multi-client)"
+  zig-out/bin/gateway --listen-port "$PORT_BASE" > "$LOG/gateway.log" 2>&1 &
   PIDS+=($!)
-done
+  ORCHESTRATOR_FLAGS="--single-gateway"
+else
+  echo ">>> spawning $N_SUBS gateway processes (per-process-per-client)"
+  for ((i=0; i<N_SUBS; i++)); do
+    port=$((PORT_BASE + i))
+    cid=$((CLIENT_BASE + i))
+    pid_player=$((i + 1))
+    zig-out/bin/gateway --listen-port "$port" \
+      > "$LOG/gateway-$i.log" 2>&1 &
+    PIDS+=($!)
+  done
+  ORCHESTRATOR_FLAGS=""
+  # NOTE: legacy mode uses the new multi-client gateway too — each
+  # process gets one conn from the orchestrator, with JWT auth still
+  # required. The mode toggle just spreads conns across N ports vs
+  # one. The original ed76523-era single-conn-no-JWT gateway is no
+  # longer the binary on disk.
+fi
 
-# Wait for gateways to bind and subscribe.
 sleep 1.5
-echo ">>> $N_SUBS gateways up; spawning harness bench subs"
+echo ">>> gateways up; spawning harness bench subs"
 
 zig-out/bin/cell-mgr-harness --scenario bench --n-subs "$N_SUBS" --duration "$DURATION" \
   > "$LOG/harness.log" 2>&1 &
 PIDS+=($!)
 HARNESS_PID=${PIDS[-1]}
 
-# Give harness time to publish all subs and cell-mgr to absorb them.
 sleep 2
 
 echo ">>> running orchestrator"
-python3 scripts/m1_5_drive.py --n-subs "$N_SUBS" --port-base "$PORT_BASE" --measure-s "$((DURATION - 6))"
+python3 scripts/m1_5_drive.py --n-subs "$N_SUBS" --port-base "$PORT_BASE" \
+  --measure-s "$((DURATION - 6))" --client-id-base "$CLIENT_BASE" $ORCHESTRATOR_FLAGS
 
-# Wait for the harness duration to complete (it tears down subs on exit).
 wait "$HARNESS_PID" 2>/dev/null || true
 
 echo ">>> done"

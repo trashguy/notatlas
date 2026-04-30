@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Interactive WASD driver for ship-sim — TCP→gateway→NATS.
 
-Connects to the gateway's TCP port and translates keypresses into
-length-prefixed JSON InputMsg frames published to
-`sim.entity.<player_id>.input`. Use after starting NATS, cell-mgr,
-ship-sim, and gateway (see scripts/drive_ship.sh).
+Connects to the gateway's TCP port, sends a JWT hello frame, then
+translates keypresses into length-prefixed JSON InputMsg frames
+published to `sim.entity.<player_id>.input`. Use after starting
+NATS, cell-mgr, ship-sim, and gateway (see scripts/drive_ship.sh).
 
 Keys (no Enter required):
     W / S   — thrust forward / reverse
@@ -15,7 +15,8 @@ Keys (no Enter required):
 Hold a key by tapping it repeatedly — input is latched server-side,
 so each tap sets the persistent thrust/steer until the next tap.
 """
-import argparse, json, socket, struct, sys, termios, tty, threading, time, select
+import argparse, json, os, socket, struct, sys, termios, tty, threading, time, select
+import mint_jwt
 
 
 def send_input(sock, thrust, steer):
@@ -60,10 +61,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
+    ap.add_argument("--client-id", type=int, default=256)
+    ap.add_argument("--player-id", type=int, default=1)
     args = ap.parse_args()
 
+    secret = os.environ.get("NOTATLAS_JWT_SECRET", mint_jwt.DEV_SECRET)
     sock = socket.create_connection((args.host, args.port))
-    print(f"connected to {args.host}:{args.port}")
+    # JWT hello — gateway requires this as the first frame.
+    tok = mint_jwt.mint(args.client_id, args.player_id, 3600, secret).encode()
+    sock.sendall(struct.pack("<I", len(tok)) + tok)
+    print(f"connected to {args.host}:{args.port} as client_id={args.client_id} player_id={args.player_id}")
     print("controls: W/S thrust, A/D steer, space stop, Q quit")
     print("(ship-sim stdout shows ship#1 absolute position once per second)")
 

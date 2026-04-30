@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """M1.5 stress-gate orchestrator.
 
-Opens N TCP connections to the gateway processes (ports `port_base ..
-port_base+N-1`), drains length-prefixed frames as fast as possible
-for `measure_s` seconds, and reports per-connection bandwidth.
+Opens N TCP connections to the gateway and drains length-prefixed
+frames as fast as possible for `measure_s` seconds, reporting per-
+connection bandwidth. Pass criterion (docs/04 §M1.5):
+max(per-conn bytes/sec) ≤ 1 Mbps (= 125000 B/s).
 
-Pass criterion (docs/04 §M1.5): max(per-conn bytes/sec) ≤ 1 Mbps,
-where 1 Mbps = 125000 B/s in this codebase's accounting (network
-sense, lowercase b = bits).
+Two modes:
+  - --multi-gateway (default): N gateway processes on consecutive
+    ports starting at --port-base. Per-process-per-client workaround
+    used during the original M1.5 gate run.
+  - --single-gateway: one gateway process on --port-base, N
+    concurrent JWT-authenticated connections. Validates the
+    multi-client + JWT path that replaces the workaround.
 
 Usage:
   python3 scripts/m1_5_drive.py --n-subs 50 --port-base 9000 --measure-s 20
+  python3 scripts/m1_5_drive.py --n-subs 50 --port-base 9000 --measure-s 20 --single-gateway
 """
 import argparse, socket, struct, threading, time, sys, statistics
+import mint_jwt
 
 ONE_MBPS_BYTES = 125_000  # 1 Mbps = 1_000_000 bits / 8
 
@@ -56,15 +63,32 @@ def main():
     ap.add_argument("--port-base", type=int, default=9000)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--measure-s", type=int, default=20)
+    ap.add_argument("--single-gateway", action="store_true",
+                    help="all conns target one gateway on port-base; sends JWT hello per conn")
+    ap.add_argument("--client-id-base", type=int, default=256)
     args = ap.parse_args()
 
-    print(f">>> opening {args.n_subs} TCP conns to {args.host}:{args.port_base}..{args.port_base+args.n_subs-1}")
+    import os
+    secret = os.environ.get("NOTATLAS_JWT_SECRET", mint_jwt.DEV_SECRET)
+
+    mode = "single-gateway+JWT" if args.single_gateway else "multi-gateway+JWT"
+    if args.single_gateway:
+        print(f">>> opening {args.n_subs} TCP conns to {args.host}:{args.port_base} ({mode})")
+    else:
+        print(f">>> opening {args.n_subs} TCP conns to {args.host}:{args.port_base}..{args.port_base+args.n_subs-1} ({mode})")
     conns = []
     fail_open = 0
     for i in range(args.n_subs):
-        port = args.port_base + i
+        port = args.port_base if args.single_gateway else args.port_base + i
+        client_id = args.client_id_base + i
+        player_id = i + 1
         try:
             s = socket.create_connection((args.host, port), timeout=5)
+            # JWT hello is required by the multi-client gateway in
+            # both modes — gateway speaks one protocol regardless of
+            # how many TCP ports are exposed.
+            tok = mint_jwt.mint(client_id, player_id, exp_secs=3600, secret=secret).encode()
+            s.sendall(struct.pack("<I", len(tok)) + tok)
             conns.append(Conn(i, s))
         except OSError as e:
             print(f"  conn {i} (port {port}) FAILED to open: {e}")

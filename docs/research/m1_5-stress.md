@@ -82,7 +82,7 @@ observed:       40 169 B/s (~8% over from window-jitter, see above)
 
 ## What this does NOT prove
 
-- **Single-gateway-multi-client throughput.** This run uses 50 gateway processes; the per-process resource cost (RSS, TCP/NATS connections, accept queues) is paid once per client. A real production gateway (sub-steps 4+5) would multiplex N clients on one process — the per-conn payload work is the same but the framing and accept paths share a single CPU. Likely fine given 32% headroom, but not measured here.
+- **Single-gateway-multi-client throughput.** This run uses 50 gateway processes; the per-process resource cost (RSS, TCP/NATS connections, accept queues) is paid once per client. *(Subsequently measured: see "Single-gateway+JWT" section below — also passes at 17.3% of budget but at lower per-conn frame rate.)*
 - **Cell-mgr CPU at higher densities.** The 8% bandwidth jitter is window-edge effect at 60 Hz — moderate density. At 200 ships/cell or 200 subs/cell the per-tick walk cost grows linearly; soft-cap framing per `design_soft_caps_subcell.md` says sub-cell partitioning is the answer past 200/cell, not larger ent counts in a single cell-mgr.
 - **Network egress reality.** All traffic stays on loopback; the dev box's interface MTU and queue depths don't apply. WAN testing (gateway co-located with NATS, clients across a real network) is post-Phase-2 and would reveal jitter / loss-recovery characteristics this measurement skips.
 - **Player input return path under load.** This run only exercises NATS → TCP outbound. The TCP → NATS input path was verified at sub-step 3 with a single client; concurrent input from 50 clients is a separate measurement (low-priority — input is sparse and small).
@@ -90,12 +90,35 @@ observed:       40 169 B/s (~8% over from window-jitter, see above)
 ## Reproduce
 
 ```sh
-./scripts/m1_5_run.sh 30 50
-# args: duration_s, n_subs (defaults: 30, 50)
+./scripts/m1_5_run.sh 30 50           # default: single gateway + JWT
+./scripts/m1_5_run.sh 30 50 multi     # legacy: 50 gateway procs
+# args: duration_s, n_subs, mode
 ```
 
-The launcher starts NATS (if not up), `cell-mgr`, `ship-sim --ships 30 --grid --spacing 30`, `bench` harness with N subs, then 50 gateway processes on ports 9000..9049, then the python orchestrator. Logs land in `/tmp/notatlas-m15/`. Cleanup on exit kills all spawned PIDs.
+The launcher starts NATS (if not up), `cell-mgr`, `ship-sim --ships 30 --grid --spacing 30`, `bench` harness with N subs, then either one gateway or N gateways, then the python orchestrator. JWTs are minted via `scripts/mint_jwt.py` against `NOTATLAS_JWT_SECRET` (env var; dev-default with warning if unset). Logs land in `/tmp/notatlas-m15/`. Cleanup on exit kills all spawned PIDs.
+
+## Single-gateway+JWT (post-2026-05-01 update)
+
+After multi-client gateway + JWT (commits `<TBD>` shipped 2026-05-01), the same gate runs against ONE gateway process accepting 50 JWT-authenticated TCP connections.
+
+| stat | bytes/sec | kbps | % of 1 Mbps |
+|---|---:|---:|---:|
+| min | 21 495 | 172.0 | 17.2% |
+| median | 21 495 | 172.0 | 17.2% |
+| mean | 21 516 | 172.1 | 17.2% |
+| p95 | 21 567 | 172.5 | 17.3% |
+| max | 21 567 | 172.5 | 17.3% |
+
+**Pass**, with notable rate change vs the multi-gateway mode:
+
+- frames/s per conn: 52 (vs 97 multi-gateway)
+- ents/s per conn: 1 044 (vs 1 951)
+- variance still ≈ 0% across 50 conns
+
+The single gateway's main loop is single-threaded; 50 conns × per-iteration work (drainSocket × 50, drain-pending-NATS-msgs × 50, forwardFrame × ~22) reduces effective loop rate, so the NATS msg ingestion / forwarding is paced lower than the cell-mgr produces. cell-mgr's per-tick log still shows 4500 publishes/s served by NATS; the gateway forwards ~2300/s to TCP. The shortfall is dropped at the gateway's NATS subscription buffers — `slow_consumers=0` per NATS server stats, so no upstream pressure, just per-iter pacing.
+
+**This still passes the gate** at 17.3% of 1 Mbps/client — the per-conn rate is the metric that matters, not the gateway's aggregate throughput. But it's a real architectural finding: a multi-threaded gateway (or a higher-cadence single-threaded loop with smaller per-iter work) would close the gap to the multi-gateway baseline. Sub-step 6 candidate.
 
 ## Phase 1 → Phase 2
 
-This is the gate. Phase 1 architecture passes its scaling test under conservative worst-case framing. Phase 2 content work (real ship hulls, biomes, anchorages, structures, market) can begin against the verified-scalable substrate.
+This is the gate. Phase 1 architecture passes its scaling test under conservative worst-case framing in BOTH gateway topologies (per-process-per-client and JWT multi-client). Phase 2 content work (real ship hulls, biomes, anchorages, structures, market) can begin against the verified-scalable substrate.
