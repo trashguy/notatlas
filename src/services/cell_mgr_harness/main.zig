@@ -27,7 +27,8 @@ const Args = struct {
     /// then publish per-entity state msgs at the tier-1 `visual_rate_hz`
     /// from data/tier_distances.yaml (override with `--rate`) with
     /// simple orbital trajectories (exercises cell-mgr's fast-lane
-    /// callback relay).
+    /// callback relay). `bench` = parameterized N subscribers + 0
+    /// entities, hold; entity load comes from ship-sim.
     scenario: Scenario = .oneshot,
     duration_s: u32 = 5,
     /// `pose-stream` only: state-msg publish rate per entity (Hz).
@@ -38,12 +39,23 @@ const Args = struct {
     state_rate_hz_override: ?u32 = null,
     /// `pose-stream` only: number of entities to spin around.
     pose_n_entities: u32 = 5,
+    /// `bench` only: number of subscribers to spawn. client_ids are
+    /// 0x100, 0x101, ... 0x100 + n_subs - 1 — cell-mgr will publish
+    /// per-sub batches on `gw.client.<id>.cmd` matching that range.
+    /// For the M1.5 stress gate the matching gateway processes use
+    /// the same id range to subscribe.
+    n_subs: u32 = 50,
+    /// `bench` only: subscriber position spread (m). Subs are placed
+    /// uniformly in a 2*spread × 2*spread square at origin. 0 =
+    /// all subs at exactly origin (worst-case fast-lane density —
+    /// every sub sees every entity at visual-tier).
+    sub_spread_m: f32 = 0,
     /// Path to the tier_distances.yaml file. Lets the harness be run
     /// from anywhere; defaults to the project-root file.
     tier_yaml_path: []const u8 = "data/tier_distances.yaml",
 };
 
-const Scenario = enum { oneshot, static, churn, @"pose-stream", @"fire-once" };
+const Scenario = enum { oneshot, static, churn, @"pose-stream", @"fire-once", bench };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args = try std.process.argsWithAllocator(allocator);
@@ -71,6 +83,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.state_rate_hz_override = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--n")) {
             out.pose_n_entities = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--n-subs")) {
+            out.n_subs = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--sub-spread")) {
+            out.sub_spread_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
         } else if (std.mem.eql(u8, a, "--tier-yaml")) {
             out.tier_yaml_path = args.next() orelse return error.MissingArg;
         } else {
@@ -186,6 +202,7 @@ pub fn main() !void {
         .churn => try runChurn(&pubr, args.duration_s),
         .@"pose-stream" => try runPoseStream(&pubr, args.duration_s, args.pose_n_entities, effective_rate),
         .@"fire-once" => try runFireOnce(&pubr),
+        .bench => try runBench(&pubr, args.duration_s, args.n_subs, args.sub_spread_m),
     }
 
     // Give the connection a moment to flush before close().
@@ -354,6 +371,44 @@ fn runFireOnce(p: *Publisher) !void {
     try p.pubSubscribe(.{ .op = .exit, .client_id = 0x100, .x = 0, .y = 0, .z = 0 });
     try p.pubSubscribe(.{ .op = .exit, .client_id = 0x101, .x = 0, .y = 0, .z = 0 });
     try p.pubSubscribe(.{ .op = .exit, .client_id = 0x102, .x = 0, .y = 0, .z = 0 });
+}
+
+/// M1.5 stress gate driver — spawn N subscribers, hold for the
+/// duration, no entities (ship-sim provides those). Subs land in a
+/// 2*spread × 2*spread square at origin; spread=0 puts them all at
+/// exactly origin for the worst-case fast-lane density (every sub
+/// sees every ship at visual-tier).
+fn runBench(p: *Publisher, duration_s: u32, n_subs: u32, spread_m: f32) !void {
+    std.debug.print("harness: bench — spawn {d} subscribers (spread {d:.1} m), hold for {d}s\n", .{ n_subs, spread_m, duration_s });
+    var rng = std.Random.DefaultPrng.init(0xB00B);
+    const r = rng.random();
+    var s: u32 = 0;
+    while (s < n_subs) : (s += 1) {
+        const x: f32 = if (spread_m > 0) (r.float(f32) - 0.5) * 2 * spread_m else 0;
+        const z: f32 = if (spread_m > 0) (r.float(f32) - 0.5) * 2 * spread_m else 0;
+        try p.pubSubscribe(.{
+            .op = .enter,
+            .client_id = 0x100 + @as(u64, s),
+            .x = x,
+            .y = 0,
+            .z = z,
+        });
+    }
+    std.Thread.sleep(@as(u64, duration_s) * std.time.ns_per_s);
+
+    // Tear down so cell-mgr's table returns to empty on a clean
+    // exit. Useful when the launcher restarts the harness without
+    // restarting cell-mgr.
+    var t: u32 = 0;
+    while (t < n_subs) : (t += 1) {
+        try p.pubSubscribe(.{
+            .op = .exit,
+            .client_id = 0x100 + @as(u64, t),
+            .x = 0,
+            .y = 0,
+            .z = 0,
+        });
+    }
 }
 
 fn runChurn(p: *Publisher, duration_s: u32) !void {

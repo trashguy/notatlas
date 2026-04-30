@@ -52,11 +52,13 @@ const sim_state = @import("state.zig");
 const tick_period_ns: u64 = std.time.ns_per_s / 60; // 60 Hz auth tick
 const phys_dt_fixed: f32 = 1.0 / 60.0;
 
-/// Ships are spawned along +X starting at x=0, spaced `ship_spacing_m`
-/// apart. 60 m clears each hull (4 × 2.5 × 6 m) by ~10× and keeps the
-/// fleet inside the 500 m visual tier from a sub at origin so all
-/// ships register on the gateway's per-second tally.
-const ship_spacing_m: f32 = 60.0;
+/// Ships are spawned along +X starting at x=0, spaced `--spacing M`
+/// apart (default 60 m, override via CLI). 60 m clears each hull
+/// (4 × 2.5 × 6 m) by ~10× and keeps a small fleet (≤8 ships)
+/// inside the 500 m visual tier from a sub at origin. For >8 ships
+/// you typically want tighter spacing — e.g. M1.5 stress puts 30
+/// ships in a 6×5 grid at 30 m.
+const default_ship_spacing_m: f32 = 60.0;
 const ship_spawn_y: f32 = 4.0;
 
 /// Force tuning for `thrust = ±1.0`. 60 kN against a 15 t hull is
@@ -96,6 +98,17 @@ const Args = struct {
     /// we hardcode-spawn so the chain has actual N>1 traffic to
     /// stress.
     ships: u32 = 5,
+    /// Ship-to-ship spacing in m. With `--grid` ships are laid out
+    /// in a square grid centered at origin; otherwise a +X line
+    /// starting at x=0. Defaults to 60 m (line) — tighten for
+    /// stress tests where you want all ships inside one sub's
+    /// visual tier.
+    spacing_m: f32 = default_ship_spacing_m,
+    /// Square grid layout instead of a line. Useful when N is large
+    /// enough that a line would push outer ships outside any
+    /// subscriber's visual tier — a grid keeps everyone clustered
+    /// near origin.
+    grid: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -122,6 +135,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--ships")) {
             out.ships = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
             if (out.ships == 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--spacing")) {
+            out.spacing_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+        } else if (std.mem.eql(u8, a, "--grid")) {
+            out.grid = true;
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -270,18 +287,38 @@ pub fn main() !void {
     var state = sim_state.State.init(allocator);
     defer state.deinit(&phys);
 
-    // Spawn N ships along +X. Ids 1..N, positions (i × spacing, y, 0).
-    var i: u32 = 0;
-    while (i < args.ships) : (i += 1) {
-        const id: u32 = i + 1;
-        const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * ship_spacing_m, ship_spawn_y, 0 };
-        try spawnShip(allocator, &state, &phys, hull, id, pos);
+    // Spawn N ships. Line layout = (i × spacing, y, 0); grid layout
+    // = ceil(sqrt(N))-wide square grid centered at origin.
+    if (args.grid) {
+        const cols: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(args.ships)))));
+        const half_extent: f32 = @as(f32, @floatFromInt(cols - 1)) * 0.5 * args.spacing_m;
+        var i: u32 = 0;
+        while (i < args.ships) : (i += 1) {
+            const id: u32 = i + 1;
+            const col = i % cols;
+            const row = i / cols;
+            const x: f32 = @as(f32, @floatFromInt(col)) * args.spacing_m - half_extent;
+            const z: f32 = @as(f32, @floatFromInt(row)) * args.spacing_m - half_extent;
+            const pos: [3]f32 = .{ x, ship_spawn_y, z };
+            try spawnShip(allocator, &state, &phys, hull, id, pos);
+        }
+        std.debug.print(
+            "ship-sim [{s}]: spawned {d} ships in {d}-col grid, spacing {d:.0} m, half-extent {d:.0} m\n",
+            .{ args.shard, args.ships, cols, args.spacing_m, half_extent },
+        );
+    } else {
+        var i: u32 = 0;
+        while (i < args.ships) : (i += 1) {
+            const id: u32 = i + 1;
+            const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * args.spacing_m, ship_spawn_y, 0 };
+            try spawnShip(allocator, &state, &phys, hull, id, pos);
+        }
+        std.debug.print(
+            "ship-sim [{s}]: spawned {d} ships in line at x=[0..{d:.0}] m, spacing {d:.0} m\n",
+            .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * args.spacing_m, args.spacing_m },
+        );
     }
     phys.optimizeBroadPhase();
-    std.debug.print(
-        "ship-sim [{s}]: spawned {d} ships at x=[0..{d:.0}] m, spacing {d:.0} m\n",
-        .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * ship_spacing_m, ship_spacing_m },
-    );
 
     // M5.1 fixed-step accumulator — catch up if the loop falls
     // behind, spiral-cap at 5 ticks/loop. Same pattern as the

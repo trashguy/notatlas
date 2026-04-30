@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Interactive WASD driver for ship-sim — TCP→gateway→NATS.
+
+Connects to the gateway's TCP port and translates keypresses into
+length-prefixed JSON InputMsg frames published to
+`sim.entity.<player_id>.input`. Use after starting NATS, cell-mgr,
+ship-sim, and gateway (see scripts/drive_ship.sh).
+
+Keys (no Enter required):
+    W / S   — thrust forward / reverse
+    A / D   — steer left / right
+    space   — stop (thrust=0, steer=0)
+    Q       — quit
+
+Hold a key by tapping it repeatedly — input is latched server-side,
+so each tap sets the persistent thrust/steer until the next tap.
+"""
+import argparse, json, socket, struct, sys, termios, tty, threading, time, select
+
+
+def send_input(sock, thrust, steer):
+    msg = json.dumps({"thrust": thrust, "steer": steer}).encode()
+    sock.sendall(struct.pack("<I", len(msg)) + msg)
+
+
+def reader_thread(sock, stop_event):
+    """Drain inbound state frames so the gateway's send buffer doesn't
+    fill up and stall the loop. We don't decode positions — ship-sim's
+    stdout is the authoritative source for that — just count frames so
+    the user can see traffic is flowing."""
+    sock.settimeout(0.2)
+    frames = 0
+    last_print = time.monotonic()
+    while not stop_event.is_set():
+        try:
+            hdr = sock.recv(4)
+            if not hdr or len(hdr) < 4:
+                continue
+            (length,) = struct.unpack("<I", hdr)
+            remaining = length
+            while remaining > 0:
+                chunk = sock.recv(remaining)
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+            frames += 1
+        except socket.timeout:
+            pass
+        except OSError:
+            return
+        now = time.monotonic()
+        if now - last_print >= 1.0:
+            sys.stderr.write(f"  [stream] {frames} state frames/s in last 1s\n")
+            sys.stderr.flush()
+            frames = 0
+            last_print = now
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=9000)
+    args = ap.parse_args()
+
+    sock = socket.create_connection((args.host, args.port))
+    print(f"connected to {args.host}:{args.port}")
+    print("controls: W/S thrust, A/D steer, space stop, Q quit")
+    print("(ship-sim stdout shows ship#1 absolute position once per second)")
+
+    stop_event = threading.Event()
+    rx = threading.Thread(target=reader_thread, args=(sock, stop_event), daemon=True)
+    rx.start()
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    thrust, steer = 0.0, 0.0
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1).lower()
+            if ch == "q":
+                break
+            elif ch == "w":
+                thrust = 1.0
+            elif ch == "s":
+                thrust = -1.0
+            elif ch == "a":
+                steer = -1.0
+            elif ch == "d":
+                steer = 1.0
+            elif ch == " ":
+                thrust, steer = 0.0, 0.0
+            else:
+                continue
+            send_input(sock, thrust, steer)
+            sys.stderr.write(f"  -> thrust={thrust:+.1f} steer={steer:+.1f}\n")
+            sys.stderr.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        stop_event.set()
+        try:
+            send_input(sock, 0.0, 0.0)
+        except Exception:
+            pass
+        sock.close()
+        print("disconnected")
+
+
+if __name__ == "__main__":
+    main()
