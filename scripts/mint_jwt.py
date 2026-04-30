@@ -5,7 +5,11 @@ Reads NOTATLAS_JWT_SECRET from the environment (matching the gateway's
 default-resolution path) or falls back to the dev default.
 
 Usage:
-  python3 scripts/mint_jwt.py --client-id 256 --player-id 1 [--exp-secs 3600]
+  python3 scripts/mint_jwt.py --client-id 256 --player-id 0x02000001 [--exp-secs 3600]
+
+`player-id` accepts hex (0x02000001) or decimal. The top-byte tag is
+the EntityKind discriminator (0x02 = player). See
+src/shared/entity_kind.zig and memory architecture_entity_id_kind_tag.md.
 """
 import argparse, base64, hashlib, hmac, json, os, sys, time
 
@@ -32,8 +36,8 @@ def mint(client_id: int, player_id: int, exp_secs: int, secret: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--client-id", type=int, required=True)
-    ap.add_argument("--player-id", type=int, required=True)
+    ap.add_argument("--client-id", type=lambda s: int(s, 0), required=True)
+    ap.add_argument("--player-id", type=lambda s: int(s, 0), required=True)
     ap.add_argument("--exp-secs", type=int, default=3600)
     args = ap.parse_args()
     secret = os.environ.get("NOTATLAS_JWT_SECRET", DEV_SECRET)

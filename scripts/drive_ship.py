@@ -7,22 +7,39 @@ published to `sim.entity.<player_id>.input`. Use after starting
 NATS, cell-mgr, ship-sim, and gateway (see scripts/drive_ship.sh).
 
 Keys (no Enter required):
-    W / S   — thrust forward / reverse
-    A / D   — steer left / right
-    F       — fire starboard cannon (one shot per tap, ~1.5 s reload)
+    W / S   — thrust forward / reverse (drives capsule when free-agent,
+              the attached ship's helm when aboard)
+    A / D   — steer left / right (same routing as thrust)
+    F       — fire starboard cannon (only effective while aboard a ship;
+              ~1.5 s reload)
+    B       — board nearest ship within ~8 m (free-agent → passenger)
+    G       — disembark (passenger → free-agent)
     space   — stop (thrust=0, steer=0)
     Q       — quit
 
 Hold a key by tapping it repeatedly — thrust/steer are latched
 server-side until the next tap. F is also latched but rate-limited
 by the ship's cannon cooldown, so holding F sustains autoreload.
+B and G are edge-triggered: ship-sim consumes the verb on the next
+input msg and clears it.
+
+Default --player-id is 0x02000001 (top-byte tag = EntityKind.player,
+seq = 1). See docs/08 §2A and memory architecture_entity_id_kind_tag.md.
 """
 import argparse, json, os, socket, struct, sys, termios, tty, threading, time, select
 import mint_jwt
 
+DEFAULT_PLAYER_ID = 0x02000001  # EntityKind.player | seq=1
 
-def send_input(sock, thrust, steer, fire=False):
-    msg = json.dumps({"thrust": thrust, "steer": steer, "fire": fire}).encode()
+
+def send_input(sock, thrust, steer, fire=False, board=False, disembark=False):
+    msg = json.dumps({
+        "thrust": thrust,
+        "steer": steer,
+        "fire": fire,
+        "board": board,
+        "disembark": disembark,
+    }).encode()
     sock.sendall(struct.pack("<I", len(msg)) + msg)
 
 
@@ -80,7 +97,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--client-id", type=int, default=256)
-    ap.add_argument("--player-id", type=int, default=1)
+    ap.add_argument("--player-id", type=lambda s: int(s, 0), default=DEFAULT_PLAYER_ID,
+                    help=f"top-byte-tagged entity id; default 0x{DEFAULT_PLAYER_ID:08X}")
     args = ap.parse_args()
 
     secret = os.environ.get("NOTATLAS_JWT_SECRET", mint_jwt.DEV_SECRET)
@@ -88,8 +106,8 @@ def main():
     # JWT hello — gateway requires this as the first frame.
     tok = mint_jwt.mint(args.client_id, args.player_id, 3600, secret).encode()
     sock.sendall(struct.pack("<I", len(tok)) + tok)
-    print(f"connected to {args.host}:{args.port} as client_id={args.client_id} player_id={args.player_id}")
-    print("controls: W/S thrust, A/D steer, space stop, Q quit")
+    print(f"connected to {args.host}:{args.port} as client_id={args.client_id} player_id=0x{args.player_id:08X}")
+    print("controls: W/S thrust, A/D steer, F fire, B board, G disembark, space stop, Q quit")
     print("(ship-sim stdout shows ship#1 absolute position once per second)")
 
     stop_event = threading.Event()
@@ -106,6 +124,8 @@ def main():
             if ch == "q":
                 break
             fire = False
+            board = False
+            disembark = False
             if ch == "w":
                 thrust = 1.0
             elif ch == "s":
@@ -118,12 +138,26 @@ def main():
                 # One-shot fire intent: send fire=true now; subsequent
                 # WASD presses send fire=false (default arg).
                 fire = True
+            elif ch == "b":
+                # Edge-triggered board verb: ship-sim picks the
+                # nearest ship within ~8 m and transitions the
+                # player to passenger.
+                board = True
+            elif ch == "g":
+                # Edge-triggered disembark verb: passenger → free-
+                # agent capsule at the ship-local pose lifted to
+                # world.
+                disembark = True
             elif ch == " ":
                 thrust, steer = 0.0, 0.0
             else:
                 continue
-            send_input(sock, thrust, steer, fire=fire)
-            sys.stderr.write(f"  -> thrust={thrust:+.1f} steer={steer:+.1f}{' FIRE' if fire else ''}\n")
+            send_input(sock, thrust, steer, fire=fire, board=board, disembark=disembark)
+            verb_tag = ""
+            if fire: verb_tag += " FIRE"
+            if board: verb_tag += " BOARD"
+            if disembark: verb_tag += " DISEMBARK"
+            sys.stderr.write(f"  -> thrust={thrust:+.1f} steer={steer:+.1f}{verb_tag}\n")
             sys.stderr.flush()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)

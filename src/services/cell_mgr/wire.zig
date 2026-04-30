@@ -141,6 +141,17 @@ pub const InputMsg = struct {
     /// (one-shot fire = one InputMsg with `fire:true` followed by
     /// another with `fire:false` or omitted).
     fire: bool = false,
+    /// Board verb. Edge-trigger: ship-sim consumes a single `true`
+    /// per InputMsg and clears it. Routes to ship-sim's transition
+    /// logic — picks the nearest ship within the board radius and
+    /// flips the player from free-agent to passenger
+    /// (docs/08 §2A.2).
+    board: bool = false,
+    /// Disembark verb. Edge-trigger. Inverse of `board`: ship-sim
+    /// recreates the player's free-agent body at
+    /// `ship_pose ⊗ local_pose` with inherited velocity and resumes
+    /// `sim.entity.<player_id>.state` publishing.
+    disembark: bool = false,
 };
 
 pub fn encodeInput(allocator: std.mem.Allocator, msg: InputMsg) ![]u8 {
@@ -212,6 +223,53 @@ pub fn parseWeaponIdFromFireSubject(subject: []const u8) !u32 {
     if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
     if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
     const id_str = subject[prefix.len .. subject.len - suffix.len];
+    if (id_str.len == 0) return error.BadSubject;
+    return std.fmt.parseInt(u32, id_str, 10);
+}
+
+/// `idx.spatial.attach.<player_id>` payload — published by ship-sim
+/// on board / disembark transitions per docs/08 §2A.2 step 5. The
+/// spatial-index subscribes and emits the synthetic enter/exit deltas
+/// (cell-mgr unsubscribes on board, resubscribes on disembark).
+///
+/// `attached_ship_id == 0` means the player just transitioned to
+/// free-agent (disembark side); a non-zero value means the player is
+/// now aboard that ship (board side). u32 is sufficient — the ship
+/// id is the top-byte-tagged entity id from the `ship` kind range.
+///
+/// The control subject is separate from the player's state subject
+/// because spatial-index needs to act *before* the next state
+/// publish — on board the player's state subject stops publishing,
+/// so a heuristic "detect a gap" approach would race the cell-mgr's
+/// tier filter for several ticks.
+pub const AttachMsg = struct {
+    player_id: u32,
+    attached_ship_id: u32 = 0,
+    /// Last-known world pose of the player at the moment of
+    /// transition. On board this is the world pose at the instant the
+    /// capsule body is destroyed; on disembark this is the world
+    /// pose ship-sim hands the new capsule. spatial-index uses this
+    /// to populate the synthetic exit/enter delta with a real
+    /// position rather than a stale one.
+    x: f32,
+    y: f32,
+    z: f32,
+};
+
+pub fn encodeAttach(allocator: std.mem.Allocator, msg: AttachMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeAttach(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(AttachMsg) {
+    return std.json.parseFromSlice(AttachMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the player id from `idx.spatial.attach.<id>`.
+pub fn parsePlayerIdFromAttachSubject(subject: []const u8) !u32 {
+    const prefix = "idx.spatial.attach.";
+    if (subject.len <= prefix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    const id_str = subject[prefix.len..];
     if (id_str.len == 0) return error.BadSubject;
     return std.fmt.parseInt(u32, id_str, 10);
 }
@@ -322,6 +380,37 @@ test "wire: input ignores unknown fields (forward-compat)" {
     const parsed = try decodeInput(testing.allocator, future);
     defer parsed.deinit();
     try testing.expectEqual(@as(f32, 0.5), parsed.value.thrust);
+}
+
+test "wire: input board/disembark verbs round-trip" {
+    const orig: InputMsg = .{ .board = true };
+    const buf = try encodeInput(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeInput(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(true, parsed.value.board);
+    try testing.expectEqual(false, parsed.value.disembark);
+}
+
+test "wire: attach round-trip" {
+    const orig: AttachMsg = .{
+        .player_id = 0x0200_0001,
+        .attached_ship_id = 0x0100_0003,
+        .x = 50,
+        .y = 4,
+        .z = -10,
+    };
+    const buf = try encodeAttach(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeAttach(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: parsePlayerIdFromAttachSubject" {
+    try testing.expectEqual(@as(u32, 33554433), try parsePlayerIdFromAttachSubject("idx.spatial.attach.33554433"));
+    try testing.expectError(error.BadSubject, parsePlayerIdFromAttachSubject("idx.spatial.attach."));
+    try testing.expectError(error.BadSubject, parsePlayerIdFromAttachSubject("sim.entity.1.input"));
 }
 
 test "wire: subscribe roundtrip with boarded ship" {

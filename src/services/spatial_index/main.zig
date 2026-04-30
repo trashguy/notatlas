@@ -20,9 +20,17 @@
 //!     already JetStream-consumer-shaped).
 //!   - cell-only deltas (no `idx.spatial.query` radius queries
 //!     yet — that's a separate sub-step).
-//!   - no aboard-ship gating (the boarded-tier / free-agent split
-//!     per docs/08 §2A.2 lives at ship-sim's spawn / board /
-//!     disembark transitions, not here).
+//!   - aboard-ship gating: ship-sim publishes
+//!     `idx.spatial.attach.<player_id>` on each board / disembark
+//!     transition (docs/08 §2A.2). spatial-index subscribes and
+//!     synthesizes the cell delta:
+//!       board (`attached_ship_id != 0`)  → exit delta on the
+//!           player's last cell + forget from the membership table
+//!           so the player's state subject going silent doesn't
+//!           leave a stale entry.
+//!       disembark (`attached_ship_id == 0`) → enter delta at the
+//!           reported world pose so cell-mgr resubscribes before
+//!           ship-sim's next state msg lands.
 //!   - generation tag passed through verbatim (entity recycling
 //!     handling lives at consumers via stale-gen rejection).
 //!
@@ -111,13 +119,18 @@ pub fn main() !void {
     defer client.close();
 
     const sub_state = try client.subscribe("sim.entity.*.state", .{});
-    std.debug.print("spatial-index: subscribed to sim.entity.*.state\n", .{});
+    const sub_attach = try client.subscribe("idx.spatial.attach.*", .{});
+    std.debug.print(
+        "spatial-index: subscribed to sim.entity.*.state and idx.spatial.attach.*\n",
+        .{},
+    );
 
     var state = idx_state.State.init(allocator, args.cell_side_m);
     defer state.deinit();
 
     var deltas_total: u64 = 0;
     var msgs_total: u64 = 0;
+    var attach_msgs_total: u64 = 0;
     var last_log_ns: u64 = @intCast(std.time.nanoTimestamp());
 
     while (g_running.load(.acquire)) {
@@ -131,13 +144,21 @@ pub fn main() !void {
         msgs_total += observed.msgs;
         deltas_total += observed.deltas;
 
+        const attach_drained = drainAttachSub(allocator, sub_attach, &state, client) catch |err| blk: {
+            std.debug.print("spatial-index: attach drain error ({s})\n", .{@errorName(err)});
+            break :blk DrainStats{};
+        };
+        attach_msgs_total += attach_drained.msgs;
+        deltas_total += attach_drained.deltas;
+
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= log_interval_ns) {
             std.debug.print(
-                "[spatial-index] {d} entities tracked; {d} state msgs / {d} deltas in last 1 s\n",
-                .{ state.entityCount(), msgs_total, deltas_total },
+                "[spatial-index] {d} entities tracked; {d} state msgs, {d} attach msgs, {d} deltas in last 1 s\n",
+                .{ state.entityCount(), msgs_total, attach_msgs_total, deltas_total },
             );
             msgs_total = 0;
+            attach_msgs_total = 0;
             deltas_total = 0;
             last_log_ns = now_ns;
         }
@@ -217,4 +238,60 @@ fn publishDelta(
     const buf = try wire.encodeDelta(allocator, msg);
     defer allocator.free(buf);
     try client.publish(subj, buf);
+}
+
+/// Drain `idx.spatial.attach.*` and synthesize cell deltas for the
+/// board / disembark transitions. Per docs/08 §2A.2:
+///   - board   (`attached_ship_id != 0`): publish exit on the
+///     player's last cell, forget from the table. The player's state
+///     subject going silent will not leave a stale entry.
+///   - disembark (`attached_ship_id == 0`): observe the player at
+///     the reported world pose, publish enter on the resulting cell.
+///     A subsequent `sim.entity.<player_id>.state` msg in the same
+///     cell returns null from `observe` so we don't double-publish.
+fn drainAttachSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    state: *idx_state.State,
+    client: *nats.Client,
+) !DrainStats {
+    var stats: DrainStats = .{};
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const player_id = wire.parsePlayerIdFromAttachSubject(owned.subject) catch continue;
+        const parsed = wire.decodeAttach(allocator, payload) catch continue;
+        defer parsed.deinit();
+        if (parsed.value.player_id != player_id) continue; // subject/body mismatch — drop
+        stats.msgs += 1;
+
+        if (parsed.value.attached_ship_id != 0) {
+            // Board: emit exit on last-known cell, drop from table.
+            const old_cell = state.forget(player_id) orelse continue;
+            try publishDelta(allocator, client, old_cell, .{
+                .op = .exit,
+                .id = player_id,
+                .generation = 0,
+                .x = parsed.value.x,
+                .y = parsed.value.y,
+                .z = parsed.value.z,
+            });
+            stats.deltas += 1;
+        } else {
+            // Disembark: classify the new world pose, emit enter.
+            const t = state.observe(player_id, parsed.value.x, parsed.value.z) catch continue;
+            if (t == null) continue;
+            try publishDelta(allocator, client, t.?.new_cell, .{
+                .op = .enter,
+                .id = player_id,
+                .generation = 0,
+                .x = parsed.value.x,
+                .y = parsed.value.y,
+                .z = parsed.value.z,
+            });
+            stats.deltas += 1;
+        }
+    }
+    return stats;
 }
