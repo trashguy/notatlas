@@ -27,12 +27,13 @@ def send_input(sock, thrust, steer, fire=False):
 
 
 def reader_thread(sock, stop_event):
-    """Drain inbound state frames so the gateway's send buffer doesn't
-    fill up and stall the loop. We don't decode positions — ship-sim's
-    stdout is the authoritative source for that — just count frames so
-    the user can see traffic is flowing."""
+    """Drain inbound frames so the gateway's send buffer doesn't fill
+    up and stall the loop. Frame format: [u32_le len][u8 kind][payload].
+    kind=0 state/cluster (count silently); kind=1 fire (print JSON
+    so the user sees the cannonball flying)."""
     sock.settimeout(0.2)
-    frames = 0
+    state_frames = 0
+    fire_frames = 0
     last_print = time.monotonic()
     while not stop_event.is_set():
         try:
@@ -40,22 +41,37 @@ def reader_thread(sock, stop_event):
             if not hdr or len(hdr) < 4:
                 continue
             (length,) = struct.unpack("<I", hdr)
+            framed = b""
             remaining = length
             while remaining > 0:
                 chunk = sock.recv(remaining)
                 if not chunk:
                     return
+                framed += chunk
                 remaining -= len(chunk)
-            frames += 1
+            if length < 1:
+                continue
+            kind = framed[0]
+            payload = framed[1:]
+            if kind == 0:
+                state_frames += 1
+            elif kind == 1:
+                fire_frames += 1
+                try:
+                    sys.stderr.write(f"  [FIRE] {payload.decode(errors='replace')}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
         except socket.timeout:
             pass
         except OSError:
             return
         now = time.monotonic()
         if now - last_print >= 1.0:
-            sys.stderr.write(f"  [stream] {frames} state frames/s in last 1s\n")
+            sys.stderr.write(f"  [stream] {state_frames} state, {fire_frames} fire frames/s\n")
             sys.stderr.flush()
-            frames = 0
+            state_frames = 0
+            fire_frames = 0
             last_print = now
 
 

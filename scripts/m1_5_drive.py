@@ -35,6 +35,12 @@ class Conn:
         self.fail = None
 
 def reader(c, deadline):
+    """Frame format (gateway → client): [u32_le len][u8 kind][payload].
+    `len` includes the 1-byte kind. kind=0 cmd (binary state/cluster),
+    kind=1 fire (JSON). For M1.5 we count all frames toward the
+    bandwidth gate but only inspect kind=0 payloads for the entity
+    accounting (kind=1 fire frames are sparse).
+    """
     s = c.sock
     s.settimeout(0.5)
     while time.monotonic() < deadline:
@@ -43,12 +49,16 @@ def reader(c, deadline):
             if not hdr or len(hdr) < 4:
                 continue
             (length,) = struct.unpack("<I", hdr)
-            payload = s.recv(length, socket.MSG_WAITALL)
-            if not payload or len(payload) < length:
+            framed = s.recv(length, socket.MSG_WAITALL)
+            if not framed or len(framed) < length:
                 continue
             c.frames += 1
             c.bytes += 4 + length
-            if length >= 8:
+            if length < 1:
+                continue
+            kind = framed[0]
+            payload = framed[1:]
+            if kind == 0 and len(payload) >= 8:
                 ent_ct, _ = struct.unpack("<II", payload[:8])
                 c.ents += ent_ct
         except socket.timeout:

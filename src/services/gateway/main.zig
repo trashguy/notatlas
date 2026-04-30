@@ -17,11 +17,25 @@
 //! and outbound input subject. Replaces the per-process-per-client
 //! workaround used during the M1.5 stress gate (commit a6775ab).
 //!
-//! Wire framing for both directions: `[u32_le len][raw bytes]`.
-//! The hello frame is a JWT in standard `header.payload.signature`
-//! form (ASCII bytes, no JSON wrapper). Subsequent frames are
-//! opaque payload bytes — gateway never inspects content; framing
-//! is the only contract.
+//! Wire framing:
+//!   - Inbound hello (TCP → gateway): `[u32_le len][JWT bytes]`. No
+//!     kind tag — the hello-frame slot is unambiguously the first
+//!     frame on a new conn.
+//!   - Inbound input (TCP → gateway): `[u32_le len][JSON InputMsg]`.
+//!     No kind tag — only one inbound stream type after auth.
+//!   - Outbound (gateway → TCP): `[u32_le len][u8 kind][payload]`.
+//!     `len` includes the kind byte. `kind=0` = state/cluster
+//!     (cell-mgr fanout's `gw.client.<id>.cmd`, binary
+//!     PayloadHeader+records); `kind=1` = fire event
+//!     (`gw.client.<id>.fire`, JSON FireMsg). Receivers demux by
+//!     kind — the two streams have incompatible payload shapes
+//!     so a tag at the frame level is the cheapest disambiguator.
+//!
+//! The asymmetric framing (inbound = no tag, outbound = tag) is
+//! deliberate: inbound from the client is single-stream by definition
+//! (the client is one entity sending one type of input), but outbound
+//! aggregates multiple NATS subjects per client so demux happens
+//! at the gateway-to-client boundary.
 //!
 //! JWT validation:
 //!   - HS256 only (no RS256, no `none` alg). Validated against the
@@ -141,6 +155,16 @@ const ConnState = enum {
     active,
 };
 
+/// Outbound frame kind byte. New kinds added here propagate to
+/// client-side demux scripts (scripts/m1_5_drive.py, tcp_reader.py,
+/// drive_ship.py).
+const FrameKind = enum(u8) {
+    /// `gw.client.<id>.cmd` — cell-mgr fanout (state + cluster).
+    cmd = 0,
+    /// `gw.client.<id>.fire` — fire event broadcast.
+    fire = 1,
+};
+
 const Conn = struct {
     conn: std.net.Server.Connection,
     buf: ConnBuf = .{},
@@ -149,12 +173,16 @@ const Conn = struct {
     client_id: u64 = 0,
     player_id: u32 = 0,
     cmd_subj: []const u8 = "",
+    fire_subj: []const u8 = "",
     input_subj: []const u8 = "",
     sub_cmd: ?*nats.Subscription = null,
+    sub_fire: ?*nats.Subscription = null,
 
     fn deinit(self: *Conn, allocator: std.mem.Allocator, client: *nats.Client) void {
         if (self.sub_cmd) |s| client.unsubscribe(s) catch {};
+        if (self.sub_fire) |s| client.unsubscribe(s) catch {};
         if (self.cmd_subj.len > 0) allocator.free(self.cmd_subj);
+        if (self.fire_subj.len > 0) allocator.free(self.fire_subj);
         if (self.input_subj.len > 0) allocator.free(self.input_subj);
         self.conn.stream.close();
         self.* = undefined;
@@ -335,6 +363,7 @@ pub fn main() !void {
     var bytes_tcp_out_total: u64 = 0;
     var bytes_tcp_in_total: u64 = 0;
     var frames_in_total: u64 = 0;
+    var fires_fwd_total: u64 = 0;
     var accepts_total: u64 = 0;
     var rejected_jwt: u64 = 0;
     var rejected_full: u64 = 0;
@@ -423,13 +452,23 @@ pub fn main() !void {
                             conns.close(i, allocator, client);
                             continue;
                         };
+                        c.fire_subj = std.fmt.allocPrint(allocator, "gw.client.{d}.fire", .{id.client_id}) catch |err| {
+                            std.debug.print("gateway: conn {d} alloc fire_subj failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
                         c.input_subj = std.fmt.allocPrint(allocator, "sim.entity.{d}.input", .{id.player_id}) catch |err| {
                             std.debug.print("gateway: conn {d} alloc input_subj failed ({s})\n", .{ i, @errorName(err) });
                             conns.close(i, allocator, client);
                             continue;
                         };
                         c.sub_cmd = client.subscribe(c.cmd_subj, .{}) catch |err| {
-                            std.debug.print("gateway: conn {d} subscribe failed ({s})\n", .{ i, @errorName(err) });
+                            std.debug.print("gateway: conn {d} subscribe cmd failed ({s})\n", .{ i, @errorName(err) });
+                            conns.close(i, allocator, client);
+                            continue;
+                        };
+                        c.sub_fire = client.subscribe(c.fire_subj, .{}) catch |err| {
+                            std.debug.print("gateway: conn {d} subscribe fire failed ({s})\n", .{ i, @errorName(err) });
                             conns.close(i, allocator, client);
                             continue;
                         };
@@ -462,9 +501,12 @@ pub fn main() !void {
             }
 
             // NATS → TCP forward (only meaningful for active conns).
+            // Drain both `.cmd` and `.fire` subs; tag each frame with
+            // its kind so the client can demux state-binary vs
+            // fire-JSON.
             if (slot.* != null and slot.*.?.state == .active) {
-                const sub = slot.*.?.sub_cmd.?;
-                while (sub.nextMsg()) |msg| {
+                const sub_cmd = slot.*.?.sub_cmd.?;
+                while (sub_cmd.nextMsg()) |msg| {
                     var owned = msg;
                     defer owned.deinit();
                     const payload = owned.payload orelse continue;
@@ -473,8 +515,23 @@ pub fn main() !void {
                     const hdr = decodeHeader(payload);
                     ents_total += hdr.entity_count;
                     clusters_total += hdr.cluster_count;
-                    const n = forwardFrame(slot.*.?.conn.stream, payload) catch |err| {
-                        std.debug.print("gateway: conn {d} write failed ({s}); closing\n", .{ i, @errorName(err) });
+                    const n = forwardFrame(slot.*.?.conn.stream, .cmd, payload) catch |err| {
+                        std.debug.print("gateway: conn {d} write cmd failed ({s}); closing\n", .{ i, @errorName(err) });
+                        conns.close(i, allocator, client);
+                        break;
+                    };
+                    bytes_tcp_out_total += n;
+                }
+                if (slot.* == null) continue;
+                const sub_fire = slot.*.?.sub_fire.?;
+                while (sub_fire.nextMsg()) |msg| {
+                    var owned = msg;
+                    defer owned.deinit();
+                    const payload = owned.payload orelse continue;
+                    fires_fwd_total += 1;
+                    bytes_total += payload.len;
+                    const n = forwardFrame(slot.*.?.conn.stream, .fire, payload) catch |err| {
+                        std.debug.print("gateway: conn {d} write fire failed ({s}); closing\n", .{ i, @errorName(err) });
                         conns.close(i, allocator, client);
                         break;
                     };
@@ -491,10 +548,10 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= std.time.ns_per_s) {
             std.debug.print(
-                "[gateway] {d} active conns / {d} accepts ({d} jwt-reject, {d} full-reject) | NATS in: {d} msgs / {d} ents / {d} clusters / {d} B | TCP in: {d} frames ({d} B) | TCP out: {d} B (last 1 s)\n",
+                "[gateway] {d} active conns / {d} accepts ({d} jwt-reject, {d} full-reject) | NATS in: {d} msgs / {d} ents / {d} clusters / {d} fires / {d} B | TCP in: {d} frames ({d} B) | TCP out: {d} B (last 1 s)\n",
                 .{
                     conns.active_count, accepts_total,    rejected_jwt, rejected_full,
-                    msgs_total,         ents_total,       clusters_total,
+                    msgs_total,         ents_total,       clusters_total, fires_fwd_total,
                     bytes_total,        frames_in_total, bytes_tcp_in_total,
                     bytes_tcp_out_total,
                 },
@@ -506,6 +563,7 @@ pub fn main() !void {
             bytes_tcp_out_total = 0;
             bytes_tcp_in_total = 0;
             frames_in_total = 0;
+            fires_fwd_total = 0;
             accepts_total = 0;
             rejected_jwt = 0;
             rejected_full = 0;
@@ -523,17 +581,20 @@ fn decodeHeader(payload: []const u8) PayloadHeader {
     return std.mem.bytesToValue(PayloadHeader, payload[0..@sizeOf(PayloadHeader)]);
 }
 
-/// Write `[u32_le len][payload]` to the connected client. Returns
-/// total bytes written. Blocking writes — the conn socket is non-
-/// blocking so a slow reader returns `error.WouldBlock` (treated
-/// as a write failure → conn close). Real backpressure handling
-/// is future work.
-fn forwardFrame(stream: std.net.Stream, payload: []const u8) !usize {
+/// Write `[u32_le len][u8 kind][payload]` to the connected client.
+/// `len` includes the 1-byte kind tag. Blocking writes — the conn
+/// socket is non-blocking so a slow reader returns
+/// `error.WouldBlock` (treated as a write failure → conn close).
+/// Real backpressure handling is future work.
+fn forwardFrame(stream: std.net.Stream, kind: FrameKind, payload: []const u8) !usize {
     var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, @intCast(payload.len), .little);
+    const total_payload_len = 1 + payload.len;
+    std.mem.writeInt(u32, &header, @intCast(total_payload_len), .little);
     try stream.writeAll(&header);
+    var kind_byte: [1]u8 = .{@intFromEnum(kind)};
+    try stream.writeAll(&kind_byte);
     try stream.writeAll(payload);
-    return header.len + payload.len;
+    return header.len + total_payload_len;
 }
 
 const DrainResult = struct {
