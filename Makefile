@@ -1,6 +1,6 @@
 .PHONY: all build run test test-release release fmt fmt-check clean help \
         setup-windows build-windows build-windows-debug \
-        nats-up nats-down nats-logs cell-mgr cell-mgr-harness
+        nats-up nats-down nats-logs cell-mgr cell-mgr-harness ship-sim
 
 all: build
 
@@ -83,6 +83,9 @@ cell-mgr:
 cell-mgr-harness:
 	zig build cell-mgr-harness -- $(ARGS)
 
+ship-sim:
+	zig build ship-sim -- $(ARGS)
+
 help:
 	@echo "make build               — debug build"
 	@echo "make run                 — debug build + run sandbox"
@@ -100,3 +103,4 @@ help:
 	@echo "make nats-logs           — tail the dev nats-server logs"
 	@echo "make cell-mgr            — run cell-mgr (pass args via ARGS=...)"
 	@echo "make cell-mgr-harness    — run cell-mgr-harness (pass args via ARGS=...)"
+	@echo "make ship-sim            — run ship-sim (pass args via ARGS=...)"

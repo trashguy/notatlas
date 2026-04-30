@@ -232,6 +232,39 @@ pub fn build(b: *std.Build) void {
     fanout_test_mod.addImport("notatlas", notatlas_mod);
     const fanout_tests = b.addTest(.{ .root_module = fanout_test_mod });
     test_step.dependOn(&b.addRunArtifact(fanout_tests).step);
+
+    // ----- ship-sim service (Phase 1, docs/08 §2A) -----
+    //
+    // Owns 60 Hz rigid-body authority for ships AND free-agent
+    // players. Skeleton in this commit; subsequent sub-steps add
+    // Jolt-driven ship state, multi-ship, board/disembark, and
+    // free-agent player physics.
+    const ship_sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ship_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ship_sim_mod.addImport("notatlas", notatlas_mod);
+    ship_sim_mod.addImport("nats", nats_mod);
+    const ship_sim = b.addExecutable(.{
+        .name = "ship-sim",
+        .root_module = ship_sim_mod,
+    });
+    b.installArtifact(ship_sim);
+
+    const run_ship_sim = b.addRunArtifact(ship_sim);
+    if (b.args) |args| run_ship_sim.addArgs(args);
+    const ship_sim_step = b.step("ship-sim", "Run the ship-sim service");
+    ship_sim_step.dependOn(&run_ship_sim.step);
+
+    const ship_sim_state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ship_sim/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ship_sim_state_test_mod.addImport("notatlas", notatlas_mod);
+    const ship_sim_state_tests = b.addTest(.{ .root_module = ship_sim_state_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ship_sim_state_tests).step);
 }
 
 fn embedShader(
