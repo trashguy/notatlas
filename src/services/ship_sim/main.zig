@@ -1,51 +1,52 @@
 //! ship-sim — 60 Hz rigid-body authority for ships AND free-agent
 //! players per docs/08 §2A.
 //!
-//! Sub-step 1 scope (this commit): one hardcoded ship publishing
-//! its pose on `sim.entity.<id>.state` at 60 Hz with stub orbital
-//! motion. Closes the producer → cell-mgr fast-lane loop end-to-end
-//! — cell-mgr's `relayState` already forwards inbound state msgs to
-//! every visible sub. Stub motion stands in for real Jolt physics
-//! while we get the wiring right.
+//! Sub-step 2 scope: replace stub orbital motion with Jolt rigid body
+//! + buoyancy against the deterministic wave kernel. Same M3 init
+//! pattern the sandbox runs (src/main.zig:130-200) — ship is a Jolt
+//! dynamic box, per-tick `Buoyancy.step` applies Archimedes + drag at
+//! sample points, then `phys.step(1/60, 1)` integrates. Pose is read
+//! back from Jolt and published on `sim.entity.<id>.state`.
 //!
-//! Subsequent sub-steps add (in order):
-//!   2. Replace stub motion with Jolt rigid body + buoyancy via
-//!      `physics` module, sourcing waves from `wave_query`.
+//! This is the first time engine subsystems (physics + buoyancy +
+//! wave_query) run headless outside the sandbox. The same scalar wave
+//! field the GPU raymarches in M2 is the one buoyancy queries here —
+//! load-bearing per `architecture_ships_on_water` memory.
+//!
+//! Subsequent sub-steps:
 //!   3. Multi-ship: ECS-style entity table with per-ship Jolt body.
 //!   4. Player input subscription on `sim.entity.<player_id>.input`.
-//!   5. Board / disembark transitions (M5.3 SoT pattern across the
-//!      net per docs/08 §2A.2).
+//!   5. Board / disembark transitions (M5.3 SoT pattern).
 //!   6. Free-agent player capsule controller + water sampling.
 //!
 //! HA story per docs/08 §7.4: Phase 1 ship-sim is single-process.
 //! Crash loses ~5 s of state. Phase 2+ adds JetStream KV checkpoints.
 //!
-//! The 60 Hz tick is locked per docs/02 §9 / docs/08 §5.2 (the auth
-//! tick for the player + ship-sim layer). The tight-loop floor uses
-//! a 5 ms `processIncomingTimeout` budget — same pattern as cell-mgr
-//! per memory `feedback_nats_zig_poll_budget.md`.
+//! The 60 Hz tick is locked per docs/02 §9 / docs/08 §5.2. The tight-
+//! loop floor uses a 5 ms `processIncomingTimeout` budget — same
+//! pattern as cell-mgr per memory `feedback_nats_zig_poll_budget.md`.
 
 const std = @import("std");
 const nats = @import("nats");
 const notatlas = @import("notatlas");
+const physics = @import("physics");
 const wire = @import("wire");
 
 const sim_state = @import("state.zig");
 
 const tick_period_ns: u64 = std.time.ns_per_s / 60; // 60 Hz auth tick
+const phys_dt_fixed: f32 = 1.0 / 60.0;
 
-/// Hardcoded test ship parameters (sub-step 1). Will move into
-/// `data/ships/*.yaml` + entity spawn protocol once spatial-index +
-/// gateway are in.
+/// Hardcoded test ship parameters (sub-step 2). Will move into
+/// per-entity spawn protocol once spatial-index + gateway are in.
 const test_ship_id: u32 = 1;
 const test_ship_generation: u16 = 0;
-/// Orbital radius and angular velocity for the stub motion. Slow
-/// enough that codec velocity range (±50 m/s) isn't exceeded —
-/// 1 rad/s × 100 m = 100 m/s tangential which IS over the codec
-/// limit, so we use a slower angular rate. 0.3 rad/s × 100 m = 30
-/// m/s, comfortably inside.
-const test_orbit_radius_m: f32 = 100.0;
-const test_orbit_omega: f32 = 0.3; // rad/s
+
+/// YAML inputs — ship-sim must agree with the sandbox on hull + wave
+/// kernel until the spawn protocol carries them on the wire. Ran from
+/// project root (the build/cwd convention shared with cell-mgr).
+const hull_config_path = "data/ships/box.yaml";
+const wave_config_path = "data/waves/storm.yaml";
 
 const Args = struct {
     /// Shard identifier — for now just a tag in log lines so multiple
@@ -102,6 +103,40 @@ fn installSignalHandlers() !void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+fn loadHull(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.hull_params.HullParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadHullFromFile(gpa, abs);
+}
+
+fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.WaveParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadFromFile(gpa, abs);
+}
+
+fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.BuoyancyConfig {
+    return .{
+        .sample_points = hull.sample_points,
+        .cell_half_height = hull.cell_half_height,
+        .cell_cross_section = hull.cell_cross_section,
+        .drag_per_point = hull.drag_per_point,
+    };
+}
+
+/// yaw extracted from a unit quaternion (x,y,z,w). Y-up convention,
+/// rotation around +y. Same formula the cluster builder will want
+/// once heading is meaningful (mean-heading aggregation per
+/// replication.zig). For pure pitch/roll the result is undefined
+/// in principle but stable in practice (~0).
+fn yawFromQuat(q: [4]f32) f32 {
+    const x = q[0];
+    const y = q[1];
+    const z = q[2];
+    const w = q[3];
+    return std.math.atan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + x * x));
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -111,6 +146,46 @@ pub fn main() !void {
     defer allocator.free(args.nats_url);
     defer allocator.free(args.shard);
     try installSignalHandlers();
+
+    // Load hull + wave kernel before the NATS connect so a missing /
+    // malformed YAML fails fast without leaving a dangling client.
+    var hull = try loadHull(allocator, hull_config_path);
+    defer hull.deinit(allocator);
+    const wave_params = try loadWaves(allocator, wave_config_path);
+    std.debug.print(
+        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m\n",
+        .{
+            args.shard,
+            hull.half_extents[0],
+            hull.half_extents[1],
+            hull.half_extents[2],
+            hull.mass_kg,
+            hull.sample_points.len,
+            wave_params.seed,
+            wave_params.amplitude_m,
+        },
+    );
+
+    // Jolt — same M3 init pattern as the sandbox. Single dynamic body
+    // at the test ship's id; future multi-ship is a per-entity body
+    // map driven by spawn deltas.
+    physics.init();
+    defer physics.shutdown();
+    var phys = try physics.System.init(.{});
+    defer phys.deinit();
+
+    // Drop from above SL so buoyancy is visible in the first second
+    // of logs — same comfort the sandbox uses.
+    const spawn_pos: [3]f32 = .{ 0, 4, 0 };
+    const body_id = try phys.createBox(.{
+        .half_extents = hull.half_extents,
+        .position = spawn_pos,
+        .motion = .dynamic,
+        .mass_override_kg = hull.mass_kg,
+    });
+    phys.optimizeBroadPhase();
+
+    var buoy = physics.Buoyancy.init(buoyancyConfigFromHull(hull));
 
     std.debug.print("ship-sim [{s}]: connecting to {s}\n", .{ args.shard, args.nats_url });
 
@@ -125,65 +200,63 @@ pub fn main() !void {
     var state = sim_state.State.init(allocator);
     defer state.deinit();
 
-    // Spawn the test ship. Sub-step 1 hardcodes one ship; multi-
-    // ship + spatial-index spawn protocol lands in sub-step 3.
+    // Spawn the test ship in the local entity table (mirrors Jolt's
+    // body for stats / log purposes; the body is the source of truth).
     try state.entities.put(test_ship_id, .{
         .id = .{ .id = test_ship_id, .generation = test_ship_generation },
         .kind = .ship,
         .pose = .{
-            .pos = .{ test_orbit_radius_m, 0, 0 },
+            .pos = spawn_pos,
             .rot = .{ 0, 0, 0, 1 },
             .vel = .{ 0, 0, 0 },
         },
     });
-    std.debug.print("ship-sim [{s}]: spawned test ship id={d} gen={d}\n", .{
+    std.debug.print("ship-sim [{s}]: spawned test ship id={d} gen={d} at ({d:.1},{d:.1},{d:.1})\n", .{
         args.shard, test_ship_id, test_ship_generation,
+        spawn_pos[0], spawn_pos[1], spawn_pos[2],
     });
 
-    // Pre-format the publish subject once — `sim.entity.1.state`
-    // for sub-step 1's single-ship case. With multi-ship the
-    // subject formats per-ship per-tick.
     var subj_buf: [64]u8 = undefined;
     const state_subj = try std.fmt.bufPrint(&subj_buf, "sim.entity.{d}.state", .{test_ship_id});
 
-    // M5.1 fixed-step accumulator pattern: catch up rather than reset
-    // so a long pause (log flush, GC) doesn't compress multiple
-    // ticks into one — we get exactly one tick per period over the
-    // long run. Spiral cap at 5 ticks/loop prevents the death-
-    // spiral case where the loop falls so far behind it can't catch
-    // up.
+    // M5.1 fixed-step accumulator — catch up if the loop falls
+    // behind, spiral-cap at 5 ticks/loop. Same pattern as the
+    // sandbox; identical to sub-step 1.
     const max_ticks_per_loop: u32 = 5;
     const start_ns: u64 = @intCast(std.time.nanoTimestamp());
     var last_tick_ns: u64 = start_ns;
     var tick_n: u64 = 0;
+    var phys_t: f32 = 0;
     var last_log_tick: u64 = 0;
     var last_log_ns: u64 = start_ns;
 
     while (g_running.load(.acquire)) {
-        // 5 ms poll budget keeps the tight-loop floor at ~200 Hz,
-        // well above the 60 Hz tick. Same pattern as cell-mgr.
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
 
-        // Drive the tick if at least one period has elapsed; catch
-        // up to N ticks if we fell behind.
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, state_subj, tick_n);
+            try tick(allocator, client, &state, state_subj, &phys, &buoy, body_id, wave_params, phys_t);
             tick_n += 1;
+            phys_t += phys_dt_fixed;
             last_tick_ns +%= tick_period_ns;
         }
 
-        // Log once per second of wall clock. Tying this to wall
-        // clock (not tick count) keeps the log readable when the
-        // loop falls behind temporarily.
         if (now_ns -% last_log_ns >= std.time.ns_per_s) {
             const ticks_in_window = tick_n - last_log_tick;
-            std.debug.print("[ship-sim {s}] {d} entities, {d} ticks last 1 s (target 60), {d} state-pubs\n", .{
-                args.shard,      state.entityCount(),
-                ticks_in_window, ticks_in_window * state.entityCount(),
-            });
+            const pos = phys.getPosition(body_id) orelse spawn_pos;
+            const lin_v = phys.getLinearVelocity(body_id) orelse .{ 0, 0, 0 };
+            std.debug.print(
+                "[ship-sim {s}] {d} entities, {d} ticks last 1 s (target 60); ship pos=({d:.2},{d:.2},{d:.2}) v=({d:.2},{d:.2},{d:.2})\n",
+                .{
+                    args.shard,            state.entityCount(),
+                    ticks_in_window,       pos[0],
+                    pos[1],                pos[2],
+                    lin_v[0],              lin_v[1],
+                    lin_v[2],
+                },
+            );
             last_log_tick = tick_n;
             last_log_ns = now_ns;
         }
@@ -192,44 +265,46 @@ pub fn main() !void {
     std.debug.print("ship-sim [{s}]: shutting down at tick {d}\n", .{ args.shard, tick_n });
 }
 
-/// Per-tick work — sub-step 1: stub orbital motion + state publish.
-/// Subsequent sub-steps replace the motion update with a Jolt
-/// `system.step(dt)` + `Buoyancy.step` over wave_query.
+/// Per-tick work — sub-step 2: buoyancy + Jolt step + state publish.
+/// `phys_t` is the simulation clock at tick start (advances by exactly
+/// `phys_dt_fixed` each tick); buoyancy reads the wave kernel at this
+/// time so successive ticks integrate against a coherent surface.
 fn tick(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     state: *sim_state.State,
     state_subj: []const u8,
-    tick_n: u64,
+    phys: *physics.System,
+    buoy: *const physics.Buoyancy,
+    body_id: physics.BodyId,
+    wave_params: notatlas.wave_query.WaveParams,
+    phys_t: f32,
 ) !void {
-    // Stub orbital motion: ship circles the origin at radius 100 m,
-    // 0.3 rad/s. Tangential velocity 30 m/s — well inside the
-    // codec ±50 m/s velocity range. tick_n × dt = elapsed sim time.
-    const t: f32 = @as(f32, @floatFromInt(tick_n)) / 60.0;
-    const angle = test_orbit_omega * t;
-    const x = test_orbit_radius_m * @cos(angle);
-    const z = test_orbit_radius_m * @sin(angle);
-    const vx = -test_orbit_radius_m * test_orbit_omega * @sin(angle);
-    const vz = test_orbit_radius_m * test_orbit_omega * @cos(angle);
-    // Heading along the orbit tangent (90° ahead of the radial).
-    const heading = angle + std.math.pi / 2.0;
+    buoy.step(phys, body_id, wave_params, phys_t);
+    phys.step(phys_dt_fixed, 1);
 
+    const pos = phys.getPosition(body_id) orelse return error.JoltMissingPosition;
+    const rot = phys.getRotation(body_id) orelse return error.JoltMissingRotation;
+    const lin_v = phys.getLinearVelocity(body_id) orelse return error.JoltMissingLinearVelocity;
+
+    // Mirror the just-stepped pose into the local entity table so the
+    // log + future cluster work see a coherent view.
     if (state.entities.getPtr(test_ship_id)) |e| {
-        e.pose.pos = .{ x, 0, z };
-        e.pose.vel = .{ vx, 0, vz };
+        e.pose.pos = pos;
+        e.pose.rot = rot;
+        e.pose.vel = lin_v;
     }
 
     const msg: wire.StateMsg = .{
         .generation = test_ship_generation,
-        .x = x,
-        .y = 0,
-        .z = z,
-        // Yaw quaternion around +y to match heading.
-        .rot = .{ 0, @sin(angle / 2.0), 0, @cos(angle / 2.0) },
-        .vx = vx,
-        .vy = 0,
-        .vz = vz,
-        .heading_rad = heading,
+        .x = pos[0],
+        .y = pos[1],
+        .z = pos[2],
+        .rot = rot,
+        .vx = lin_v[0],
+        .vy = lin_v[1],
+        .vz = lin_v[2],
+        .heading_rad = yawFromQuat(rot),
     };
     const buf = try wire.encodeState(allocator, msg);
     defer allocator.free(buf);
