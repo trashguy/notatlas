@@ -42,7 +42,7 @@ plus integration with fallen-runes' gateway / ship-sim service decomp.
 | ✓ `97e8049` + `ca57b02` | M8: deterministic-projectile | 1000 fires gate green (~3× O(dt) drift). ship-sim drives cannon FireMsg publishes via InputMsg.fire (1.5 s cooldown, starboard mount); cell-mgr fanout's fire-lane forwards to subs; gateway forwards to TCP with kind=1 frames. End-to-end: press F → cannonball flies. |
 | ✓ `e7d4419` | M9: lag-comp-rollback | 60 Hz rewind buffer; 50 ms / 200 ms ping rewind matches target view to one-tick precision (~8 cm @ 5 m/s); 250 ms cap rejects "shot around corners." Hit-test routine lives at the caller; module is the rewind primitive |
 | ✓ multi-commit 2026-05-01 | Integration | ship-sim service running 60 Hz Jolt+buoyancy multi-ship (`6c3f229`/`d8b884a`); JWT-validated multi-client gateway TCP↔NATS bidirectional (`51af4ee`/`ed76523`/`7b446bf`/`ff3141d`); ship-sim input subscription closes the player-control loop (`16c3701`). One cell; 30 ships verified at M1.5. |
-| ◐ partial | Combat slice | One sloop with cannons (✓ ship-sim cannon fire end-to-end via TCP). Sails (▢ rigging system not yet implemented; thrust force model is a placeholder). Planks / hull damage (▢). AI sloop opponent (▢ — needs `ai-sim` service). Closes when a sloop can sail wind-driven, take damage, and an AI opponent fights back. |
+| ◐ partial | Combat slice | One sloop with cannons (✓ ship-sim cannon fire end-to-end via TCP). Free-agent player capsule + board/disembark with lever-arm velocity inheritance (✓ `3798f72`). Sails (▢ rigging system not yet implemented; thrust force model is a placeholder). Planks / hull damage (▢). AI sloop opponent (▢ — needs `ai-sim` service; arch locked per memory `architecture_ai_sim_decisions_only.md`). Closes when a sloop can sail wind-driven, take damage, and an AI opponent fights back. |
 
 **Milestone 1.5 stress test (gate before Phase 2):** ✓ shipped 2026-05-01
 - 30 boxes in one cell × 50 simulated clients × actual gateway / NATS
@@ -67,7 +67,7 @@ spatial-index, env, persistence-writer services.
 | Status | Milestone | Deliverable |
 |---|---|---|
 | ✓ multi-commit | Cell-mgr service | Skeleton (`30a3806`) → cluster pathway (`47f3e74`) → fast-lane callback relay (`21c0283`) → slow-lane cleanup (`54a2300`) → cross-cell visibility (`60d0241`) → fast-lane batching (`d769f65`) → fire-lane (`2e2bb17`). Subscribes to spatial-index deltas; runs 30 Hz fanout tick + 60 Hz fast-lane batched relay. |
-| ✓ `b08f339` | Spatial-index service | v1 single-process: sim.entity.*.state firehose → idx.spatial.cell.<x>_<z>.delta on cell transitions. Open: idx.spatial.query req/reply, active/standby N=3 HA, aboard-ship gating. |
+| ✓ multi-commit | Spatial-index service | v1 complete (2026-04-30). Skeleton (`b08f339`) → aboard-ship gating via `idx.spatial.attach.*` (`3798f72`) → `idx.spatial.query.radius` req/reply (`85d6ae4`) → N=3 active/standby HA via NATS KV leader election (`af4f29f`). All round-out items shipped. Open: `idx.spatial.cell.*.delta` migration to JetStream-backed for clean failover catch-up — deferred until cell-mgr's JetStream consumer-group story lands. |
 | ▢ | Env service | Wind, weather, wave seed, time of day at 5 Hz |
 | ▢ | Persistence-writer service | Sole PG writer, batches change streams |
 | ▢ | Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter (depends on spatial-index aboard-ship gating + ship-sim board/disembark) |
