@@ -1,32 +1,47 @@
-//! Per-subscriber fanout pass for cell-mgr — the slow lane.
+//! Per-subscriber fanout for cell-mgr — slow-lane + fast-lane.
 //!
-//! Per docs/08 §2.3 the cell-mgr fanout tick owns "tier ≤ 0.5
-//! cadence" content: tier 0 (always, hull pose at 30 Hz) and tier
-//! 0.5 (fleet aggregate at 5 Hz). Tier 1+ flows separately via the
-//! fast-lane callback path (`Fanout.relayState`).
+//! Two lanes per docs/08 §2.3, both publishing to `gw.client.<id>.cmd`:
 //!
-//! In practice tier 0 individual records are subsumed by the tier
-//! 0.5 cluster path (docs/08 §3.2a: distant entities flow as cluster
-//! summaries instead of individual records — the 160× BW reduction
-//! lever). So the slow-lane payload is **cluster records only**:
-//!   - 8 B PayloadHeader { entity_count = 0, cluster_count }
-//!   - cluster_count × 16 B ClusterRecord
+//! - **Slow-lane** (`runTick`, 30 Hz). Owns tier ≤ 0.5 content. In
+//!   practice tier-0 individual records are subsumed by tier-0.5
+//!   cluster summaries (docs/08 §3.2a: distant entities flow as
+//!   clusters — the 160× BW reduction lever). So the slow-lane payload
+//!   is **cluster records only**:
+//!     - 8 B PayloadHeader { entity_count = 0, cluster_count }
+//!     - cluster_count × 16 B ClusterRecord
+//!   `entity_count` stays in the wire shape so receivers don't need a
+//!   version flip when individual records are reintroduced for some
+//!   field type that doesn't naturally fit a cluster summary.
 //!
-//! `entity_count` stays in the wire shape so receivers don't need a
-//! version flip when individual records are reintroduced for some
-//! field type that doesn't naturally fit into a cluster summary.
+//! - **Fast-lane** (`relayState` + `flushBatches`, 60 Hz). Owns tier ≥
+//!   visual content. Inbound `sim.entity.*.state` msgs land via NATS
+//!   callback; `relayState` appends a 20 B EntityRecord to each
+//!   visible subscriber's `pending` buffer. `flushBatches` is called
+//!   once per 60 Hz window (16.67 ms) — for each sub with non-empty
+//!   pending it emits **one batched payload**:
+//!     - 8 B PayloadHeader { entity_count, cluster_count = 0 }
+//!     - entity_count × 20 B EntityRecord
+//!   This amortizes the NATS PUB framing (~50 B per msg: subject +
+//!   protocol overhead) across N records per window. Concretely: at
+//!   60 entities visible × 60 Hz incoming, per-msg publish would be
+//!   60 × 60 = 3600 publishes/sec/sub; batched is 60 publishes/sec/sub
+//!   carrying ~1208 B each. Same payload bytes; ~30× fewer NATS msgs;
+//!   the 60× framing overhead drops to ~1×.
 //!
-//! Cluster pathway runs at 5 Hz (configurable). spatial-index will
+//! Wire shape is identical between the two lanes — receivers parse
+//! one payload type, regardless of which lane produced it.
+//!
+//! Cluster rebuild runs at 5 Hz (configurable). spatial-index will
 //! eventually own the cluster build per docs/08 §3.2a; cell-mgr plays
 //! both roles for now (until the spatial-index service spins up).
 //!
-//! Hot-path discipline: per-subscriber output buffers are pre-grown
-//! at subscribe time and reused with `clearRetainingCapacity` per
-//! tick. The cluster pass uses a dedicated arena that
-//! `reset(.retain_capacity)`s each cycle — first build sizes it, all
-//! subsequent builds reuse without growing. Net steady-state allocs
-//! per tick: 0 (verified by the M6.4 gate test under a counting
-//! allocator).
+//! Hot-path discipline: per-subscriber `output` and `pending` buffers
+//! are pre-grown at subscribe time and reused with
+//! `clearRetainingCapacity` between flushes/ticks. Cluster pass uses a
+//! dedicated arena that `reset(.retain_capacity)`s each cycle — first
+//! build sizes it, subsequent builds reuse without growing. Net
+//! steady-state allocs per tick: 0 (verified by the M6.4 gate test
+//! under a counting allocator).
 //!
 //! Sink is a thin vtable so the same Fanout drives both real NATS
 //! publishes (NatsSink) and the in-process gate test (CaptureSink in
@@ -148,13 +163,23 @@ pub const ClusterConfig = struct {
 };
 
 const SubscriberBuffers = struct {
-    /// Outbound payload — header + cluster records (+ entity records,
-    /// reserved for future tier-0 content that doesn't fit a cluster
-    /// summary).
+    /// Outbound payload assembly buffer. Used by both the slow-lane
+    /// `runTick` (header + cluster records) and the fast-lane
+    /// `flushBatches` (header + accumulated entity records). The two
+    /// lanes never overlap in time — cell-mgr is single-threaded — so
+    /// they can clobber each other freely; each lane clears the buffer
+    /// before writing.
     output: std.ArrayListUnmanaged(u8) = .empty,
+
+    /// Fast-lane staging — entity records appended by `relayState`,
+    /// drained by `flushBatches` once per fast-lane window. Records
+    /// only; no header (header is prepended at flush). Cleared on
+    /// flush.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
 
     fn deinit(self: *SubscriberBuffers, allocator: std.mem.Allocator) void {
         self.output.deinit(allocator);
+        self.pending.deinit(allocator);
     }
 };
 
@@ -188,12 +213,6 @@ pub const Fanout = struct {
     /// the next cluster pass (when the arena resets).
     clusters: []replication.Cluster,
 
-    /// Fixed-size scratch buffer for the fast-lane relay path
-    /// (`relayState`). One single-record payload fits in
-    /// payload_header_size + entity_record_size = 28 B; 64 B leaves
-    /// room without forcing a per-call allocation.
-    relay_buf: [64]u8 = undefined,
-
     pub fn init(allocator: std.mem.Allocator, thresholds: TierThresholds) Fanout {
         return .{
             .allocator = allocator,
@@ -224,6 +243,7 @@ pub const Fanout = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
             try gop.value_ptr.output.ensureTotalCapacity(self.allocator, self.output_capacity);
+            try gop.value_ptr.pending.ensureTotalCapacity(self.allocator, self.output_capacity);
         }
     }
 
@@ -297,11 +317,13 @@ pub const Fanout = struct {
         return publishes;
     }
 
-    /// Fast-lane callback path per docs/08 §2.3. Forward a single
-    /// entity's state to every subscriber whose effective tier is
-    /// ≥ visual — without waiting for the slow-lane fanout tick. The
-    /// caller (cell-mgr's `sim.entity.*.state` subscription) invokes
-    /// this on every inbound state msg.
+    /// Fast-lane callback path per docs/08 §2.3. **Append** a single
+    /// entity's state record into each visible subscriber's pending
+    /// batch — does not publish. `flushBatches` drains pending and
+    /// emits one batched payload per sub at the fast-lane window
+    /// cadence (60 Hz). The caller (cell-mgr's
+    /// `sim.entity.*.state` subscription) invokes this on every
+    /// inbound state msg.
     ///
     /// Pose + aboard_ship come from the inbound msg, not from the
     /// cell's entity table — so subscribers near a cell boundary
@@ -319,42 +341,84 @@ pub const Fanout = struct {
     /// this cell) bypass the guard since we have no reference to
     /// compare against.
     ///
-    /// Allocation-free: builds a single-record payload in `relay_buf`
-    /// (28 B used out of 64 B), publishes via `sink`. nats-zig's
-    /// publish path itself is alloc-free (fixed PUB header buffer).
-    /// Returns the number of forwards made.
+    /// Returns the number of subscribers we appended a record for
+    /// (= number of records that will end up across the next set of
+    /// flushed batches). Hot-path discipline: appends into a per-sub
+    /// `pending` buffer that was pre-grown at subscribe time, so
+    /// steady-state allocs are 0.
     pub fn relayState(
         self: *Fanout,
         state: *const State,
         ent_id: replication.EntityId,
         pose: pose_codec.Pose,
         aboard_ship: ?replication.EntityId,
-        sink: Sink,
     ) !usize {
         if (state.entities.get(ent_id.id)) |existing| {
             if (existing.id.generation != ent_id.generation) return 0;
         }
 
         // Build the per-record bytes once — same value goes to every
-        // subscriber.
-        const slot = self.relay_buf[0 .. payload_header_size + entity_record_size];
-        const header: PayloadHeader = .{ .entity_count = 1, .cluster_count = 0 };
-        @memcpy(slot[0..payload_header_size], std.mem.asBytes(&header));
-        const rec_slot = slot[payload_header_size..];
-        writeEntityHeader(rec_slot[0..record_header_size], ent_id.id, ent_id.generation);
-        const n = pose_codec.encodePose(pose, pose, null, rec_slot[record_header_size..][0..pose_codec.delta_size]);
+        // subscriber's pending buffer.
+        var rec_buf: [entity_record_size]u8 = undefined;
+        writeEntityHeader(rec_buf[0..record_header_size], ent_id.id, ent_id.generation);
+        const n = pose_codec.encodePose(
+            pose,
+            pose,
+            null,
+            rec_buf[record_header_size..][0..pose_codec.delta_size],
+        );
         std.debug.assert(n == pose_codec.delta_size);
 
-        var forwards: usize = 0;
+        var pushes: usize = 0;
         var sub_it = state.subscribers.iterator();
         while (sub_it.next()) |sub_entry| {
             const sub = sub_entry.value_ptr.*;
             const tier = replication.effectiveTier(sub, pose.pos, aboard_ship, self.thresholds);
             if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
-            try sink.publish(sub.client_id, slot);
-            forwards += 1;
+            const sb = self.subs.getPtr(sub.client_id) orelse return error.UnknownSubscriber;
+            try sb.pending.appendSlice(self.allocator, &rec_buf);
+            pushes += 1;
         }
-        return forwards;
+        return pushes;
+    }
+
+    /// Flush the fast-lane batches accumulated by `relayState` since
+    /// the last flush. For each subscriber with non-empty pending,
+    /// emits **one** batched payload (header + concatenated records)
+    /// via `sink`. Subs with empty pending are skipped — no empty
+    /// publishes.
+    ///
+    /// Reuses the per-sub `output` buffer as a scratch assembly area:
+    /// pending records are concatenated after the header, then sink is
+    /// invoked, then pending is cleared. The slow-lane (`runTick`)
+    /// also writes into `output`; cell-mgr is single-threaded so the
+    /// two lanes never overlap, and each lane clears `output` before
+    /// writing.
+    ///
+    /// Caller drives this from a 60 Hz tick (the fast-lane window
+    /// cadence — locked to tier-1 visual rate per
+    /// data/tier_distances.yaml). Returns the number of batched
+    /// publishes emitted.
+    pub fn flushBatches(self: *Fanout, sink: Sink) !usize {
+        var publishes: usize = 0;
+        var it = self.subs.iterator();
+        while (it.next()) |entry| {
+            const client_id = entry.key_ptr.*;
+            const sb = entry.value_ptr;
+            if (sb.pending.items.len == 0) continue;
+            std.debug.assert(sb.pending.items.len % entity_record_size == 0);
+            const ec: u32 = @intCast(sb.pending.items.len / entity_record_size);
+
+            sb.output.clearRetainingCapacity();
+            const header: PayloadHeader = .{ .entity_count = ec, .cluster_count = 0 };
+            try sb.output.appendSlice(self.allocator, std.mem.asBytes(&header));
+            try sb.output.appendSlice(self.allocator, sb.pending.items);
+
+            try sink.publish(client_id, sb.output.items);
+            sb.pending.clearRetainingCapacity();
+            publishes += 1;
+        }
+        return publishes;
     }
 
     /// Cluster-pass body: snapshot entities into the cluster-builder
@@ -654,7 +718,7 @@ fn poseAt(x: f32, z: f32) pose_codec.Pose {
     return .{ .pos = .{ x, 0, z }, .rot = .{ 0, 0, 0, 1 }, .vel = .{ 0, 0, 0 } };
 }
 
-test "fanout: relayState forwards only to visual+ subscribers" {
+test "fanout: relayState appends only to visual+ subscribers' pending" {
     var state = State.init(testing.allocator);
     defer state.deinit();
     var fanout = Fanout.init(testing.allocator, TierThresholds.default);
@@ -671,23 +735,36 @@ test "fanout: relayState forwards only to visual+ subscribers" {
     try applySubscribe(&state, &fanout, 0xCC, 1000, 0);
 
     const ent_id: EntityId = .{ .id = 1, .generation = 0 };
-    const forwards = try fanout.relayState(&state, ent_id, poseAt(0, 0), null, capture.sink());
-    try testing.expectEqual(@as(usize, 2), forwards);
+    const pushes = try fanout.relayState(&state, ent_id, poseAt(0, 0), null);
+    try testing.expectEqual(@as(usize, 2), pushes);
 
+    // Pending lengths reflect the per-sub appends; nothing has been
+    // sent to the sink yet.
+    try testing.expectEqual(@as(usize, entity_record_size), fanout.subs.getPtr(0xAA).?.pending.items.len);
+    try testing.expectEqual(@as(usize, entity_record_size), fanout.subs.getPtr(0xBB).?.pending.items.len);
+    try testing.expectEqual(@as(usize, 0), fanout.subs.getPtr(0xCC).?.pending.items.len);
+    try testing.expect(capture.payloadFor(0xAA) == null);
+
+    // Now flush — one publish per non-empty pending sub.
+    const publishes = try fanout.flushBatches(capture.sink());
+    try testing.expectEqual(@as(usize, 2), publishes);
     try testing.expect(capture.payloadFor(0xAA) != null);
     try testing.expect(capture.payloadFor(0xBB) != null);
     try testing.expect(capture.payloadFor(0xCC) == null);
 
-    // Payload shape: 8B header + 1 × 20B record = 28 B.
+    // Payload shape: 8 B header + 1 × 20 B record = 28 B.
     const payload = capture.payloadFor(0xAA).?;
     try testing.expectEqual(@as(usize, payload_header_size + entity_record_size), payload.len);
     const header = payloadHeader(payload);
     try testing.expectEqual(@as(u32, 1), header.entity_count);
     try testing.expectEqual(@as(u32, 0), header.cluster_count);
     try testing.expectEqual(@as(u32, 1), readRecordId(payload[payload_header_size..]));
+
+    // Pending cleared by flush.
+    try testing.expectEqual(@as(usize, 0), fanout.subs.getPtr(0xAA).?.pending.items.len);
 }
 
-test "fanout: relayState forwards cross-cell entities (not in local entity table)" {
+test "fanout: relayState appends cross-cell entities (not in local entity table)" {
     // Entity NOT registered in this cell's table (simulates a state
     // msg arriving for a ship in a neighbour cell). Sub at the
     // origin is in close_combat from the entity's pose. The relay
@@ -705,8 +782,9 @@ test "fanout: relayState forwards cross-cell entities (not in local entity table
     try testing.expectEqual(@as(usize, 0), state.entityCount());
 
     const ent_id: EntityId = .{ .id = 99, .generation = 0 };
-    const forwards = try fanout.relayState(&state, ent_id, poseAt(50, 0), null, capture.sink());
-    try testing.expectEqual(@as(usize, 1), forwards);
+    const pushes = try fanout.relayState(&state, ent_id, poseAt(50, 0), null);
+    try testing.expectEqual(@as(usize, 1), pushes);
+    _ = try fanout.flushBatches(capture.sink());
     try testing.expect(capture.payloadFor(0xAA) != null);
 }
 
@@ -724,8 +802,62 @@ test "fanout: relayState rejects stale-generation msg for known entity" {
     // Inbound msg from generation 4 of an entity we know at
     // generation 5 — stale, drop it.
     const stale: EntityId = .{ .id = 1, .generation = 4 };
-    const forwards = try fanout.relayState(&state, stale, poseAt(0, 0), null, capture.sink());
-    try testing.expectEqual(@as(usize, 0), forwards);
+    const pushes = try fanout.relayState(&state, stale, poseAt(0, 0), null);
+    try testing.expectEqual(@as(usize, 0), pushes);
+
+    // Pending stays empty; flush is a no-op.
+    const publishes = try fanout.flushBatches(capture.sink());
+    try testing.expectEqual(@as(usize, 0), publishes);
+    try testing.expect(capture.payloadFor(0xAA) == null);
+}
+
+test "fanout: flushBatches batches multiple records into one publish per sub" {
+    // 5 entities each generate one state msg; the sub at origin sees
+    // all of them as visual+. With batching, the sub gets a single
+    // 5-record payload (1 publish), not 5 single-record payloads.
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    try applySubscribe(&state, &fanout, 0xAA, 0, 0);
+    var i: u32 = 1;
+    while (i <= 5) : (i += 1) {
+        try applyEnter(&state, i, 0, @as(f32, @floatFromInt(i)) * 10, 0);
+        const ent_id: EntityId = .{ .id = i, .generation = 0 };
+        _ = try fanout.relayState(&state, ent_id, poseAt(@as(f32, @floatFromInt(i)) * 10, 0), null);
+    }
+
+    const publishes = try fanout.flushBatches(capture.sink());
+    try testing.expectEqual(@as(usize, 1), publishes);
+
+    const payload = capture.payloadFor(0xAA).?;
+    const header = payloadHeader(payload);
+    try testing.expectEqual(@as(u32, 5), header.entity_count);
+    try testing.expectEqual(@as(u32, 0), header.cluster_count);
+    try testing.expectEqual(@as(usize, payload_header_size + 5 * entity_record_size), payload.len);
+
+    // Records carry entity ids 1..5 in the order they were appended.
+    var rec_i: u32 = 0;
+    while (rec_i < 5) : (rec_i += 1) {
+        const off = payload_header_size + rec_i * entity_record_size;
+        try testing.expectEqual(rec_i + 1, readRecordId(payload[off..]));
+    }
+}
+
+test "fanout: flushBatches is a no-op when pending is empty" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    try applySubscribe(&state, &fanout, 0xAA, 0, 0);
+    const publishes = try fanout.flushBatches(capture.sink());
+    try testing.expectEqual(@as(usize, 0), publishes);
     try testing.expect(capture.payloadFor(0xAA) == null);
 }
 
@@ -1093,4 +1225,134 @@ test "M6.5 BW: idle / mid / hot scenarios + distance sweep" {
     // At 0 m all entities are inside visual range; cluster centroid
     // is too, so cluster_count must drop to 0.
     try testing.expectEqual(@as(u32, 0), sweep_results[sweep_results.len - 1].cluster_n);
+
+    // ---- Fast-lane batched measurement ----
+    //
+    // The hot scenario for the fast-lane is the close-combat fight
+    // current_work.md flagged as 134 % of budget per sub (50 subs ×
+    // 100 ents × 60 Hz × 28 B per-msg payload = 168 KB/s/sub of
+    // payload PLUS NATS PUB framing). The win from batching:
+    //
+    //   - PRE-batch: every state msg triggers a separate publish per
+    //     visible sub. 100 ents × 60 Hz × 50 subs = 300 000 publishes/s
+    //     aggregate, each carrying its own ~50 B NATS PUB framing
+    //     (subject + len + CRLF). Per sub: 6 000 publishes/s.
+    //
+    //   - POST-batch: per fast-lane window (60 Hz = 16.67 ms), each
+    //     sub gets a single batched payload with one record per
+    //     visible entity. Per sub: 60 publishes/s carrying header (8) +
+    //     N_visible × 20 B records.
+    //
+    // The payload-byte count is identical (still N records of 20 B
+    // each, plus headers). What batching saves is the **NATS PUB
+    // framing** that lives one-per-publish.
+    //
+    // We measure here:
+    //   - per-sub batched payload bytes / sec (the new wire bytes)
+    //   - per-sub publishes / sec (what NATS framing scales with)
+    //   - implied framing-overhead saved at a 50 B/msg estimate
+    const fast_window_hz: f64 = 60.0;
+    const nats_framing_b: f64 = 50.0; // PUB <subj> <len>\r\n<payload>\r\n + subject
+
+    // Same hot density as the slow-lane scenario: 100 ents, 50 subs,
+    // all clustered in 200 m. Drive one fast-lane window: every entity
+    // emits one state msg, then flushBatches.
+    var hot_state = State.init(a);
+    defer hot_state.deinit();
+    var hot_fanout = Fanout.init(a, TierThresholds.default);
+    defer hot_fanout.deinit();
+    var hot_capture: CaptureSink = .{ .allocator = a };
+    defer hot_capture.deinit();
+
+    const n_ent_fast: usize = 100;
+    const n_sub_fast: usize = 50;
+    const fast_ents = try sa.alloc([3]f32, n_ent_fast);
+    for (fast_ents) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
+    const fast_subs = try sa.alloc([3]f32, n_sub_fast);
+    for (fast_subs) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
+
+    for (fast_ents, 0..) |p, i| {
+        _ = try hot_state.applyDelta(.{
+            .op = .enter,
+            .id = @intCast(i + 1),
+            .generation = 0,
+            .x = p[0],
+            .y = p[1],
+            .z = p[2],
+        });
+    }
+    for (fast_subs, 0..) |p, i| {
+        const cid: u64 = 0x2000 + @as(u64, i);
+        _ = try hot_state.applySubscribe(.{
+            .op = .enter,
+            .client_id = cid,
+            .x = p[0],
+            .y = p[1],
+            .z = p[2],
+        });
+        try hot_fanout.ensureSubscriber(cid);
+    }
+
+    // One fast-lane window = every entity publishes one state msg.
+    var pushes_total: usize = 0;
+    for (fast_ents, 0..) |p, i| {
+        const ent_id: EntityId = .{ .id = @intCast(i + 1), .generation = 0 };
+        pushes_total += try hot_fanout.relayState(
+            &hot_state,
+            ent_id,
+            .{ .pos = p, .rot = .{ 0, 0, 0, 1 }, .vel = .{ 0, 0, 0 } },
+            null,
+        );
+    }
+    const publishes = try hot_fanout.flushBatches(hot_capture.sink());
+
+    // Tally: aggregate batched payload bytes, max per sub.
+    var fast_max_payload: usize = 0;
+    var fast_sum_payload: usize = 0;
+    var subs_with_payload: usize = 0;
+    for (fast_subs, 0..) |_, i| {
+        const cid: u64 = 0x2000 + @as(u64, i);
+        if (hot_capture.payloadFor(cid)) |payload| {
+            if (payload.len > fast_max_payload) fast_max_payload = payload.len;
+            fast_sum_payload += payload.len;
+            subs_with_payload += 1;
+        }
+    }
+    const max_payload_per_sec: f64 = @as(f64, @floatFromInt(fast_max_payload)) * fast_window_hz;
+    const max_pct_of_budget: f64 = max_payload_per_sec / budget_bytes_per_sec * 100.0;
+
+    // Pre-batch publishes/sec/sub = N_visible × 60 Hz (one publish per
+    // entity-msg per visible sub). Post-batch = 60 Hz / sub. Use
+    // pushes_total / n_sub_fast as the pre-batch upper bound.
+    const pre_batch_pubs_per_window: f64 = @as(f64, @floatFromInt(pushes_total)) / @as(f64, @floatFromInt(n_sub_fast));
+    const pre_batch_pubs_per_sec: f64 = pre_batch_pubs_per_window * fast_window_hz;
+    const post_batch_pubs_per_sec: f64 = fast_window_hz; // 1 publish per window
+    const framing_pre_kbps: f64 = pre_batch_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
+    const framing_post_kbps: f64 = post_batch_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
+
+    std.debug.print("\n=== [M6.5] fast-lane batched (hot scenario) ===\n", .{});
+    std.debug.print("100 ents × 50 subs in 200 m, one fast-lane window (60 Hz).\n", .{});
+    std.debug.print("Pushes (sub appends) per window: {d}; subs with batched payload: {d}/{d}; batched publishes: {d}.\n", .{
+        pushes_total, subs_with_payload, n_sub_fast, publishes,
+    });
+    std.debug.print("Per-sub batched payload max: {d} B; per-sec @60Hz: {d:.1} B = {d:.2}% of {d:.0} B/s budget.\n", .{
+        fast_max_payload, max_payload_per_sec, max_pct_of_budget, budget_bytes_per_sec,
+    });
+    std.debug.print("Per-sub publishes/sec: PRE-batch {d:.0}, POST-batch {d:.0} ({d:.1}× fewer NATS msgs).\n", .{
+        pre_batch_pubs_per_sec, post_batch_pubs_per_sec, pre_batch_pubs_per_sec / post_batch_pubs_per_sec,
+    });
+    std.debug.print("NATS PUB framing @ 50 B/msg: PRE-batch {d:.1} kbps/sub, POST-batch {d:.1} kbps/sub ({d:.1}× saving).\n", .{
+        framing_pre_kbps, framing_post_kbps, framing_pre_kbps / framing_post_kbps,
+    });
+
+    // Gate: post-batch payload bytes per sub stay within budget. With
+    // 100 entities × 20 B + 8 B header = 2008 B per window × 60 Hz =
+    // 120.5 KB/s = 96.4 % — tight but inside, and this is the
+    // soft-cap-1.5× extreme. Ports / fights at 200 entities visible
+    // need sub-cell partitioning per docs/08 §2.4a (memory
+    // design_soft_caps_subcell.md).
+    try testing.expect(max_pct_of_budget <= 100.0);
+    // Each sub gets exactly one batched publish per window — no
+    // empty publishes, no per-msg publishes.
+    try testing.expectEqual(@as(usize, 1), publishes / subs_with_payload);
 }

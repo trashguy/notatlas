@@ -61,12 +61,29 @@ centroid filter):
 - spatial-index will eventually own the cluster build per docs/08
   §3.2a; cell-mgr plays both roles for now.
 
-**Fast-lane** (new): subscribers receive a single-EntityRecord
-payload per inbound `sim.entity.<id>.state` msg, only if the
-subscriber is at tier ≥ visual from the entity. EntityRecord is the
-20 B `{ u32 id, u16 generation, pose_codec.encodePose delta-mode (14
-B) }` shape. Encoded into a fixed `relay_buf: [64]u8` on Fanout —
-no per-callback allocation.
+**Fast-lane** (batched): inbound `sim.entity.<id>.state` msgs are
+appended into per-subscriber pending buffers via `Fanout.relayState`;
+once per 60 Hz window `Fanout.flushBatches` emits **one** batched
+payload per sub with `cluster_count = 0` and one EntityRecord per
+visible-entity update collected during the window. Wire shape is
+identical to the slow-lane (same `PayloadHeader + records` layout) so
+receivers parse one type regardless of which lane produced it.
+
+EntityRecord is 20 B: `{ u32 id, u16 generation, pose_codec.encodePose
+delta-mode (14 B) }`. Per-sub `pending` buffer is pre-grown at
+`ensureSubscriber` time and reused with `clearRetainingCapacity` per
+flush — no per-callback allocation.
+
+**Why batch.** Pre-batch each state msg triggered one publish per
+visible sub. At hot density (50 subs × 100 ents × 60 Hz fast-lane
+cadence) that's **6 000 publishes/sec/sub**, each carrying its own
+NATS PUB framing (`PUB <subj> <len>\r\n<payload>\r\n` ≈ 50 B for the
+gw.client subject). Post-batch each sub gets **60 publishes/sec** —
+exactly one per fast-lane window — carrying the concatenated records
+for everything visible in that window. Payload bytes are the same
+(same N records, same 20 B each); the **NATS framing collapses from
+2 400 kbps/sub down to 24 kbps/sub** — 100× saving on the per-msg
+overhead. See "Fast-lane batched (hot scenario)" measurement below.
 
 **Original M6.4 placeholder** (pre-codec, kept for the diff):
 
@@ -109,16 +126,43 @@ Now the sweep shows the slow-lane's natural binary cutover:
 
 For comparison, the **previous milestone** (cluster pathway emitting *and* slow-lane individual records for visual+ entities) saw the hot scenario at 48 % of budget and a sharp spike inside 500 m as 100 individual records replaced the cluster summary. Post-cleanup that spike moves to the fast-lane, which sees it as N × M × (sub's tier-1 rate) — independent of the slow-lane budget.
 
+## Fast-lane batched (hot scenario)
+
+100 entities × 50 subs in 200 m, one 60 Hz fast-lane window. Drives
+`relayState` once per (entity × visible sub), then `flushBatches`.
+
+| Metric | Value |
+|---|---:|
+| Pushes (record appends) per window | 5 000 (= 100 × 50, every entity visible to every sub) |
+| Subs with non-empty pending | 50 / 50 |
+| Batched publishes per window | 50 (one per sub) |
+| Per-sub batched payload max | 2 008 B (= 8 B header + 100 × 20 B records) |
+| Per-sub payload @ 60 Hz | 120 480 B/s = **96.38 % of budget** |
+| Per-sub publishes/sec — PRE-batch | 6 000 |
+| Per-sub publishes/sec — POST-batch | 60 |
+| Reduction in NATS messages | **100 ×** |
+| NATS PUB framing (50 B/msg estimate) — PRE | 2 400 kbps/sub |
+| NATS PUB framing (50 B/msg estimate) — POST | 24 kbps/sub |
+| Framing reduction | **100 ×** |
+
+**Read this carefully.** Payload bytes alone are 96 % of budget at this
+density — that's the soft 1.5× / hardcore-tolerable point per memory
+`design_soft_caps_subcell.md`. Going *above* this density needs sub-
+cell partitioning (docs/08 §2.4a, ports / harbor anchorages) to halve
+the per-sub fanout work. Batching doesn't change the payload-bytes
+ceiling; it changes how much of the budget the **NATS framing**
+overhead consumes, which pre-batch was the dominant per-msg cost.
+
 ## Conclusions
 
-1. **Slow-lane is now properly slow.** Hot scenario uses 0.19 % of budget; mid uses 1.34 %; idle 20.5 %. Slow-lane is firmly a low-bandwidth lane; fast-lane carries the per-entity heavy lifting.
-2. **Architectural alignment with docs/08 §2.3.** The slow-lane is "tier ≤ 0.5 cadence" content (cluster summaries, eventual tier-0 fields). The fast-lane is "tier 1+ via callback-to-publish" — already shipped (`Fanout.relayState` + `sim.entity.*.state` subscription).
-3. **Cluster centroid filter inverted in the cleanup.** Pre-cleanup it skipped distant clusters at "always" tier (sub couldn't see them) and included clusters whose centroid was in visual range (sub was close enough that fast-lane individuals would be cleaner). Post-cleanup is the right way around: include any cluster at fleet_aggregate or further from the sub.
-4. **Idle BW slightly up** (17.4 % → 20.5 %) — the cleanup added clusters at "always" tier (the very-distant 5 km case in the sweep) that the old filter wrongly skipped. Better awareness, ~3 pp BW cost, well within budget.
-5. **Hot scenario fast-lane projection.** With 100 entities at 60 Hz tier-1 cadence and 50 subs all in close_combat range, the fast-lane is 100 × 60 × 50 × 28 B = 8.4 MB/s aggregate, or 168 KB/s per subscriber — **134 % of budget per sub**. Two paths to bring this in: (a) sub-cell partition the 50 subs across multiple cell-mgr workers (docs/08 §2.4a), (b) actually rate-limit per-tier on the fast-lane producer (current model assumes producer chose to publish at 60 Hz). Both are post-M6 work.
+1. **Slow-lane is properly slow.** Hot scenario uses 0.19 % of budget; mid uses 1.34 %; idle 20.5 %. Slow-lane is firmly a low-bandwidth lane; fast-lane carries the per-entity heavy lifting.
+2. **Fast-lane is now batched.** Per-sub publishes/sec dropped from up to 6 000 (one per inbound state msg per visible sub) to 60 (one per 60 Hz window). NATS PUB framing overhead drops 100×. Payload bytes are unchanged.
+3. **Wire shape is identical between lanes.** Both use `PayloadHeader + records`. Receivers parse one type. Slow-lane uses `cluster_count`; fast-lane uses `entity_count`; the other field is 0.
+4. **Architectural alignment with docs/08 §2.3.** Slow-lane = "tier ≤ 0.5 cadence" content (cluster summaries, eventual tier-0 fields). Fast-lane = "tier 1+ via callback-to-publish" — buffered then flushed at the tier-1 rate.
+5. **200 ents × 50 subs is over the soft target by design.** Per memory `design_soft_caps_subcell.md` — 200/cell is the design point not a hard cap. Beyond 100 entities in close-quarters, sub-cell partitioning is the architectural lever, not a tighter producer-side rate gate.
 
 ## Known limitations to revisit
 
-- **Fast-lane carries no per-tier rate gating** — the producer's publish cadence sets the wire rate. ship-sim will need to honour tier rates from `data/tier_distances.yaml`; for the M-stack harness the cadence is set via `--rate`.
-- **NATS protocol overhead** (~20-30 B per message for the wire-level `PUB` header) is below the measurement. At 30 publishes/sec/sub on the slow-lane that's another ~900 B/s per subscriber regardless of payload; on the fast-lane it scales with state-msg rate.
+- **Producer-side per-tier rate gating still missing.** Fast-lane window is 60 Hz on the consumer, but the *producer* (ship-sim, harness) sets the inbound msg rate. ship-sim should honour tier rates from `data/tier_distances.yaml`; tier-2/3 fields should be on-change, not 60 Hz. Without that, hot-scenario inbound rate is the source of pressure, batching only fixes the per-sub fanout cost.
 - **Cluster centroid distance is the filter, not per-cluster bounding box.** A cluster whose centroid sits on the wrong side of the visual boundary from a subscriber gets dropped or included wholesale, even if some of its entities are "off the centroid" enough to land in a different band. Acceptable for the M-stack scale; revisit if it becomes visible during the milestone-1.5 stress test.
+- **Window jitter under load.** The 60 Hz fast-lane tick fires from cell-mgr's main loop; if state-msg drain takes longer than the window we'll batch >16.67 ms of records into one publish. Bounded by the tight-loop floor (currently ~5 ms processIncoming budget), not load-bearing for M-stack but the milestone-1.5 stress gate should eyeball flush cadence under live load.

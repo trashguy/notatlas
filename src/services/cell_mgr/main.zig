@@ -24,7 +24,8 @@ const notatlas = @import("notatlas");
 const replication = notatlas.replication;
 const pose_codec = notatlas.pose_codec;
 
-const tick_period_ns: u64 = std.time.ns_per_s / 30; // 30 Hz fanout
+const slow_tick_period_ns: u64 = std.time.ns_per_s / 30; // 30 Hz slow-lane (clusters)
+const fast_tick_period_ns: u64 = std.time.ns_per_s / 60; // 60 Hz fast-lane (batched state msgs)
 
 const Args = struct {
     cell_x: i32 = 0,
@@ -131,44 +132,54 @@ pub fn main() !void {
     var nats_sink_ctx: NatsSinkCtx = .{ .client = client };
     const sink: fanout_mod.Sink = .{ .ctx = &nats_sink_ctx, .publishFn = NatsSinkCtx.publish };
 
-    var last_tick_ns: u64 = @intCast(std.time.nanoTimestamp());
-    var tick_n: u64 = 0;
-    var state_msgs_since_tick: u64 = 0;
-    var fast_forwards_since_tick: u64 = 0;
+    const start_ns: u64 = @intCast(std.time.nanoTimestamp());
+    var last_slow_ns: u64 = start_ns;
+    var last_fast_ns: u64 = start_ns;
+    var slow_tick_n: u64 = 0;
+    var state_msgs_since_log: u64 = 0;
+    var fast_pushes_since_log: u64 = 0;
+    var fast_publishes_since_log: u64 = 0;
 
     while (g_running.load(.acquire)) {
-        // 5 ms poll budget keeps the tight-loop floor at ~200 Hz, well
-        // above the 30 Hz fanout tick and any callback-driven relay
-        // path we'll layer on later. nats-zig v0.2.2 introduced
-        // processIncomingTimeout — pre-v0.2.2 only had the 100 ms
-        // hardcoded path which capped this loop at ~10 Hz.
+        // 5 ms poll budget keeps the tight-loop floor at ~200 Hz — well
+        // above both ticks (60 Hz fast / 30 Hz slow) so the deadline
+        // checks below see ~3 polls per fast window. nats-zig v0.2.2
+        // introduced processIncomingTimeout; pre-v0.2.2 only had the
+        // 100 ms hardcoded path which capped the loop at ~10 Hz.
         try client.processIncomingTimeout(5);
 
         try drainDeltaSub(allocator, sub_delta, &state);
         try drainSubscribeSub(allocator, sub_sub, &state, &fanout, .enter);
         try drainSubscribeSub(allocator, sub_unsub, &state, &fanout, .exit);
-        const fast_forwards = try drainStateSub(allocator, sub_state, &state, &fanout, sink);
-        state_msgs_since_tick += fast_forwards.msgs;
-        fast_forwards_since_tick += fast_forwards.forwards;
+        const drained = try drainStateSub(allocator, sub_state, &state, &fanout);
+        state_msgs_since_log += drained.msgs;
+        fast_pushes_since_log += drained.pushes;
 
         try client.maybeSendPing();
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
-        if (now_ns -% last_tick_ns >= tick_period_ns) {
-            tick_n += 1;
-            const publishes = try fanout.runTick(&state, sink);
-            std.debug.print("[cell {d}_{d}] tick {d}: {d} ents, {d} subs, {d} slow-pubs, {d} state-msgs/{d} fast-fwds (since prev tick)\n", .{
-                args.cell_x,           args.cell_y,              tick_n,
-                state.entityCount(),   state.subscriberCount(),  publishes,
-                state_msgs_since_tick, fast_forwards_since_tick,
+
+        // Fast lane: 60 Hz batched flush of accumulated state msgs.
+        if (now_ns -% last_fast_ns >= fast_tick_period_ns) {
+            fast_publishes_since_log += try fanout.flushBatches(sink);
+            last_fast_ns +%= fast_tick_period_ns;
+        }
+
+        // Slow lane: 30 Hz cluster pass. Catch-up rather than reset —
+        // if we missed several tick boundaries (long log flush, GC
+        // pause) we still publish exactly one tick per period.
+        if (now_ns -% last_slow_ns >= slow_tick_period_ns) {
+            slow_tick_n += 1;
+            const slow_publishes = try fanout.runTick(&state, sink);
+            std.debug.print("[cell {d}_{d}] tick {d}: {d} ents, {d} subs, {d} slow-pubs, {d} state-msgs in / {d} pushed / {d} batched-pubs (since prev log)\n", .{
+                args.cell_x,          args.cell_y,             slow_tick_n,
+                state.entityCount(),  state.subscriberCount(), slow_publishes,
+                state_msgs_since_log, fast_pushes_since_log,   fast_publishes_since_log,
             });
-            state_msgs_since_tick = 0;
-            fast_forwards_since_tick = 0;
-            // Catch-up rather than reset: if we missed several tick
-            // boundaries (long log flush, GC pause) we still publish
-            // exactly one tick per period — same model as the M5.1
-            // physics accumulator.
-            last_tick_ns +%= tick_period_ns;
+            state_msgs_since_log = 0;
+            fast_pushes_since_log = 0;
+            fast_publishes_since_log = 0;
+            last_slow_ns +%= slow_tick_period_ns;
         }
     }
 
@@ -206,20 +217,20 @@ fn drainDeltaSub(allocator: std.mem.Allocator, sub: *nats.Subscription, state: *
 /// Drain `sim.entity.*.state` msgs: parse the entity id from each
 /// subject, decode the JSON payload, update the entity's pose in
 /// `state` if known (no-op otherwise — cross-cell entities aren't in
-/// our table), then unconditionally call `relayState` to fan out to
-/// every visual+ subscriber based on the msg's pose. Returns
-/// counters so the per-tick log can show the fast-lane volume.
-const StateDrainCounts = struct { msgs: u64, forwards: u64 };
+/// our table), then call `relayState` to **append** the record into
+/// every visual+ subscriber's pending batch. Actual NATS publishes
+/// happen in the 60 Hz fast-lane flush tick. Returns counters so the
+/// per-tick log can show fast-lane volume.
+const StateDrainCounts = struct { msgs: u64, pushes: u64 };
 
 fn drainStateSub(
     allocator: std.mem.Allocator,
     sub: *nats.Subscription,
     state: *cm_state.State,
     fanout: *fanout_mod.Fanout,
-    sink: fanout_mod.Sink,
 ) !StateDrainCounts {
     var msgs: u64 = 0;
-    var forwards: u64 = 0;
+    var pushes: u64 = 0;
     while (sub.nextMsg()) |msg| {
         var owned = msg;
         defer owned.deinit();
@@ -247,9 +258,9 @@ fn drainStateSub(
             .rot = parsed.value.rot,
             .vel = .{ parsed.value.vx, parsed.value.vy, parsed.value.vz },
         };
-        forwards += try fanout.relayState(state, ent_id, pose, null, sink);
+        pushes += try fanout.relayState(state, ent_id, pose, null);
     }
-    return .{ .msgs = msgs, .forwards = forwards };
+    return .{ .msgs = msgs, .pushes = pushes };
 }
 
 /// `expected_op` is the op these messages should carry — the subject
