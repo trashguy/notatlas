@@ -272,6 +272,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ship_sim_state_test_mod.addImport("notatlas", notatlas_mod);
+    ship_sim_state_test_mod.addImport("physics", physics_mod);
+    ship_sim_state_test_mod.linkLibrary(jolt);
+    ship_sim_state_test_mod.link_libc = true;
     const ship_sim_state_tests = b.addTest(.{ .root_module = ship_sim_state_test_mod });
     test_step.dependOn(&b.addRunArtifact(ship_sim_state_tests).step);
 

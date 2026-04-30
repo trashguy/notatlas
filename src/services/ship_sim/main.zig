@@ -1,20 +1,19 @@
 //! ship-sim — 60 Hz rigid-body authority for ships AND free-agent
 //! players per docs/08 §2A.
 //!
-//! Sub-step 2 scope: replace stub orbital motion with Jolt rigid body
-//! + buoyancy against the deterministic wave kernel. Same M3 init
-//! pattern the sandbox runs (src/main.zig:130-200) — ship is a Jolt
-//! dynamic box, per-tick `Buoyancy.step` applies Archimedes + drag at
-//! sample points, then `phys.step(1/60, 1)` integrates. Pose is read
-//! back from Jolt and published on `sim.entity.<id>.state`.
+//! Sub-step 3 scope: multi-ship via ECS-style entity table. State.zig
+//! now owns per-entity Jolt body + cached publish subject; main.zig
+//! spawns N ships at startup (default 5, override with `--ships N`)
+//! spread along +X so they're all in one cell and visible from any
+//! subscriber. Per tick: walk entities, apply buoyancy forces;
+//! `phys.step(1/60, 1)` once advances ALL bodies; walk entities again
+//! to read pose and publish per-entity state msgs.
 //!
-//! This is the first time engine subsystems (physics + buoyancy +
-//! wave_query) run headless outside the sandbox. The same scalar wave
-//! field the GPU raymarches in M2 is the one buoyancy queries here —
-//! load-bearing per `architecture_ships_on_water` memory.
+//! This is the lever that lets us actually exercise the soft-cap
+//! (200/cell) — every gateway/cell-mgr metric was stuck at "1 entity
+//! per fast-lane msg" before.
 //!
 //! Subsequent sub-steps:
-//!   3. Multi-ship: ECS-style entity table with per-ship Jolt body.
 //!   4. Player input subscription on `sim.entity.<player_id>.input`.
 //!   5. Board / disembark transitions (M5.3 SoT pattern).
 //!   6. Free-agent player capsule controller + water sampling.
@@ -37,10 +36,12 @@ const sim_state = @import("state.zig");
 const tick_period_ns: u64 = std.time.ns_per_s / 60; // 60 Hz auth tick
 const phys_dt_fixed: f32 = 1.0 / 60.0;
 
-/// Hardcoded test ship parameters (sub-step 2). Will move into
-/// per-entity spawn protocol once spatial-index + gateway are in.
-const test_ship_id: u32 = 1;
-const test_ship_generation: u16 = 0;
+/// Ships are spawned along +X starting at x=0, spaced `ship_spacing_m`
+/// apart. 60 m clears each hull (4 × 2.5 × 6 m) by ~10× and keeps the
+/// fleet inside the 500 m visual tier from a sub at origin so all
+/// ships register on the gateway's per-second tally.
+const ship_spacing_m: f32 = 60.0;
+const ship_spawn_y: f32 = 4.0;
 
 /// YAML inputs — ship-sim must agree with the sandbox on hull + wave
 /// kernel until the spawn protocol carries them on the wire. Ran from
@@ -54,6 +55,12 @@ const Args = struct {
     /// entity-id range is Phase 2+ scaling work.
     shard: []const u8 = "0",
     nats_url: []const u8 = "nats://127.0.0.1:4222",
+    /// Number of ships to spawn. Each gets its own Jolt body, its
+    /// own state subject, and contributes to the per-tick fanout.
+    /// Stays small until the spawn protocol arrives — at sub-step 3
+    /// we hardcode-spawn so the chain has actual N>1 traffic to
+    /// stress.
+    ships: u32 = 5,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -77,6 +84,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             const v = args.next() orelse return error.MissingArg;
             out.shard = try allocator.dupe(u8, v);
             have_shard = true;
+        } else if (std.mem.eql(u8, a, "--ships")) {
+            out.ships = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+            if (out.ships == 0) return error.BadArg;
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -125,16 +135,48 @@ fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.Buoyanc
 }
 
 /// yaw extracted from a unit quaternion (x,y,z,w). Y-up convention,
-/// rotation around +y. Same formula the cluster builder will want
-/// once heading is meaningful (mean-heading aggregation per
-/// replication.zig). For pure pitch/roll the result is undefined
-/// in principle but stable in practice (~0).
+/// rotation around +y.
 fn yawFromQuat(q: [4]f32) f32 {
     const x = q[0];
     const y = q[1];
     const z = q[2];
     const w = q[3];
     return std.math.atan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + x * x));
+}
+
+/// Spawn a single ship: create Jolt body, allocate cached state
+/// subject, insert into the entity table. Caller owns `phys`; on
+/// failure the partial body is destroyed before returning.
+fn spawnShip(
+    allocator: std.mem.Allocator,
+    state: *sim_state.State,
+    phys: *physics.System,
+    hull: notatlas.hull_params.HullParams,
+    id: u32,
+    spawn_pos: [3]f32,
+) !void {
+    const body = try phys.createBox(.{
+        .half_extents = hull.half_extents,
+        .position = spawn_pos,
+        .motion = .dynamic,
+        .mass_override_kg = hull.mass_kg,
+    });
+    errdefer phys.destroyBody(body);
+
+    const subj = try std.fmt.allocPrint(allocator, "sim.entity.{d}.state", .{id});
+    errdefer allocator.free(subj);
+
+    try state.entities.put(id, .{
+        .id = .{ .id = id, .generation = 0 },
+        .kind = .ship,
+        .pose = .{
+            .pos = spawn_pos,
+            .rot = .{ 0, 0, 0, 1 },
+            .vel = .{ 0, 0, 0 },
+        },
+        .body_id = body,
+        .state_subj = subj,
+    });
 }
 
 pub fn main() !void {
@@ -147,8 +189,6 @@ pub fn main() !void {
     defer allocator.free(args.shard);
     try installSignalHandlers();
 
-    // Load hull + wave kernel before the NATS connect so a missing /
-    // malformed YAML fails fast without leaving a dangling client.
     var hull = try loadHull(allocator, hull_config_path);
     defer hull.deinit(allocator);
     const wave_params = try loadWaves(allocator, wave_config_path);
@@ -166,24 +206,10 @@ pub fn main() !void {
         },
     );
 
-    // Jolt — same M3 init pattern as the sandbox. Single dynamic body
-    // at the test ship's id; future multi-ship is a per-entity body
-    // map driven by spawn deltas.
     physics.init();
     defer physics.shutdown();
     var phys = try physics.System.init(.{});
     defer phys.deinit();
-
-    // Drop from above SL so buoyancy is visible in the first second
-    // of logs — same comfort the sandbox uses.
-    const spawn_pos: [3]f32 = .{ 0, 4, 0 };
-    const body_id = try phys.createBox(.{
-        .half_extents = hull.half_extents,
-        .position = spawn_pos,
-        .motion = .dynamic,
-        .mass_override_kg = hull.mass_kg,
-    });
-    phys.optimizeBroadPhase();
 
     var buoy = physics.Buoyancy.init(buoyancyConfigFromHull(hull));
 
@@ -198,30 +224,24 @@ pub fn main() !void {
     std.debug.print("ship-sim [{s}]: connected; tick rate 60 Hz\n", .{args.shard});
 
     var state = sim_state.State.init(allocator);
-    defer state.deinit();
+    defer state.deinit(&phys);
 
-    // Spawn the test ship in the local entity table (mirrors Jolt's
-    // body for stats / log purposes; the body is the source of truth).
-    try state.entities.put(test_ship_id, .{
-        .id = .{ .id = test_ship_id, .generation = test_ship_generation },
-        .kind = .ship,
-        .pose = .{
-            .pos = spawn_pos,
-            .rot = .{ 0, 0, 0, 1 },
-            .vel = .{ 0, 0, 0 },
-        },
-    });
-    std.debug.print("ship-sim [{s}]: spawned test ship id={d} gen={d} at ({d:.1},{d:.1},{d:.1})\n", .{
-        args.shard, test_ship_id, test_ship_generation,
-        spawn_pos[0], spawn_pos[1], spawn_pos[2],
-    });
-
-    var subj_buf: [64]u8 = undefined;
-    const state_subj = try std.fmt.bufPrint(&subj_buf, "sim.entity.{d}.state", .{test_ship_id});
+    // Spawn N ships along +X. Ids 1..N, positions (i × spacing, y, 0).
+    var i: u32 = 0;
+    while (i < args.ships) : (i += 1) {
+        const id: u32 = i + 1;
+        const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * ship_spacing_m, ship_spawn_y, 0 };
+        try spawnShip(allocator, &state, &phys, hull, id, pos);
+    }
+    phys.optimizeBroadPhase();
+    std.debug.print(
+        "ship-sim [{s}]: spawned {d} ships at x=[0..{d:.0}] m, spacing {d:.0} m\n",
+        .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * ship_spacing_m, ship_spacing_m },
+    );
 
     // M5.1 fixed-step accumulator — catch up if the loop falls
     // behind, spiral-cap at 5 ticks/loop. Same pattern as the
-    // sandbox; identical to sub-step 1.
+    // sandbox.
     const max_ticks_per_loop: u32 = 5;
     const start_ns: u64 = @intCast(std.time.nanoTimestamp());
     var last_tick_ns: u64 = start_ns;
@@ -237,7 +257,7 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, state_subj, &phys, &buoy, body_id, wave_params, phys_t);
+            try tick(allocator, client, &state, &phys, &buoy, wave_params, phys_t);
             tick_n += 1;
             phys_t += phys_dt_fixed;
             last_tick_ns +%= tick_period_ns;
@@ -245,16 +265,18 @@ pub fn main() !void {
 
         if (now_ns -% last_log_ns >= std.time.ns_per_s) {
             const ticks_in_window = tick_n - last_log_tick;
-            const pos = phys.getPosition(body_id) orelse spawn_pos;
-            const lin_v = phys.getLinearVelocity(body_id) orelse .{ 0, 0, 0 };
+            // Pose readout for ship #1 — single-line proof-of-life
+            // that physics is alive without flooding the log when
+            // N is large.
+            const lead = state.entities.get(1) orelse unreachable;
+            const lead_pos = phys.getPosition(lead.body_id) orelse lead.pose.pos;
             std.debug.print(
-                "[ship-sim {s}] {d} entities, {d} ticks last 1 s (target 60); ship pos=({d:.2},{d:.2},{d:.2}) v=({d:.2},{d:.2},{d:.2})\n",
+                "[ship-sim {s}] {d} ships, {d} ticks last 1 s (target 60); ship#1 pos=({d:.2},{d:.2},{d:.2}) ; ~{d} state-pubs/s\n",
                 .{
-                    args.shard,            state.entityCount(),
-                    ticks_in_window,       pos[0],
-                    pos[1],                pos[2],
-                    lin_v[0],              lin_v[1],
-                    lin_v[2],
+                    args.shard,                                args.ships,
+                    ticks_in_window,                           lead_pos[0],
+                    lead_pos[1],                               lead_pos[2],
+                    ticks_in_window * @as(u64, args.ships),
                 },
             );
             last_log_tick = tick_n;
@@ -265,48 +287,60 @@ pub fn main() !void {
     std.debug.print("ship-sim [{s}]: shutting down at tick {d}\n", .{ args.shard, tick_n });
 }
 
-/// Per-tick work — sub-step 2: buoyancy + Jolt step + state publish.
-/// `phys_t` is the simulation clock at tick start (advances by exactly
-/// `phys_dt_fixed` each tick); buoyancy reads the wave kernel at this
-/// time so successive ticks integrate against a coherent surface.
+/// Per-tick work — sub-step 3: buoyancy forces accumulated per
+/// entity, single system-wide `phys.step` integrates all bodies,
+/// then per-entity pose readback + state publish.
+///
+/// `phys_t` is the simulation clock at tick start (advances by
+/// exactly `phys_dt_fixed` each tick); buoyancy reads the wave kernel
+/// at this time so successive ticks integrate against a coherent
+/// surface.
 fn tick(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     state: *sim_state.State,
-    state_subj: []const u8,
     phys: *physics.System,
     buoy: *const physics.Buoyancy,
-    body_id: physics.BodyId,
     wave_params: notatlas.wave_query.WaveParams,
     phys_t: f32,
 ) !void {
-    buoy.step(phys, body_id, wave_params, phys_t);
+    // Apply buoyancy + drag to every entity before stepping. Forces
+    // accumulate inside Jolt and integrate in the single step call
+    // that follows.
+    var it = state.entities.valueIterator();
+    while (it.next()) |e| buoy.step(phys, e.body_id, wave_params, phys_t);
+
+    // Single system-wide integration step. One collision step per
+    // tick — Jolt sub-stepping is not yet load-bearing here; if it
+    // becomes one (high-velocity tunneling at 60 Hz), bump.
     phys.step(phys_dt_fixed, 1);
 
-    const pos = phys.getPosition(body_id) orelse return error.JoltMissingPosition;
-    const rot = phys.getRotation(body_id) orelse return error.JoltMissingRotation;
-    const lin_v = phys.getLinearVelocity(body_id) orelse return error.JoltMissingLinearVelocity;
+    // Read back + publish per entity. Allocates / frees a JSON
+    // buffer per ship — known hot-path inefficiency that goes away
+    // when wire/StateMsg moves to the M7 binary codec.
+    var pub_it = state.entities.valueIterator();
+    while (pub_it.next()) |e| {
+        const pos = phys.getPosition(e.body_id) orelse continue;
+        const rot = phys.getRotation(e.body_id) orelse continue;
+        const lin_v = phys.getLinearVelocity(e.body_id) orelse continue;
 
-    // Mirror the just-stepped pose into the local entity table so the
-    // log + future cluster work see a coherent view.
-    if (state.entities.getPtr(test_ship_id)) |e| {
         e.pose.pos = pos;
         e.pose.rot = rot;
         e.pose.vel = lin_v;
-    }
 
-    const msg: wire.StateMsg = .{
-        .generation = test_ship_generation,
-        .x = pos[0],
-        .y = pos[1],
-        .z = pos[2],
-        .rot = rot,
-        .vx = lin_v[0],
-        .vy = lin_v[1],
-        .vz = lin_v[2],
-        .heading_rad = yawFromQuat(rot),
-    };
-    const buf = try wire.encodeState(allocator, msg);
-    defer allocator.free(buf);
-    try client.publish(state_subj, buf);
+        const msg: wire.StateMsg = .{
+            .generation = e.id.generation,
+            .x = pos[0],
+            .y = pos[1],
+            .z = pos[2],
+            .rot = rot,
+            .vx = lin_v[0],
+            .vy = lin_v[1],
+            .vz = lin_v[2],
+            .heading_rad = yawFromQuat(rot),
+        };
+        const buf = try wire.encodeState(allocator, msg);
+        defer allocator.free(buf);
+        try client.publish(e.state_subj, buf);
+    }
 }
