@@ -135,6 +135,12 @@ pub const InputMsg = struct {
     /// above), negative = left. Maps to a lateral force applied at
     /// the bow → torque around +y.
     steer: f32 = 0,
+    /// Cannon trigger. Latched server-side: while true, the ship
+    /// fires its starboard cannon every cooldown period. Client sets
+    /// it to true on a fire input event and to false when releasing
+    /// (one-shot fire = one InputMsg with `fire:true` followed by
+    /// another with `fire:false` or omitted).
+    fire: bool = false,
 };
 
 pub fn encodeInput(allocator: std.mem.Allocator, msg: InputMsg) ![]u8 {

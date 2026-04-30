@@ -9,18 +9,20 @@ NATS, cell-mgr, ship-sim, and gateway (see scripts/drive_ship.sh).
 Keys (no Enter required):
     W / S   — thrust forward / reverse
     A / D   — steer left / right
+    F       — fire starboard cannon (one shot per tap, ~1.5 s reload)
     space   — stop (thrust=0, steer=0)
     Q       — quit
 
-Hold a key by tapping it repeatedly — input is latched server-side,
-so each tap sets the persistent thrust/steer until the next tap.
+Hold a key by tapping it repeatedly — thrust/steer are latched
+server-side until the next tap. F is also latched but rate-limited
+by the ship's cannon cooldown, so holding F sustains autoreload.
 """
 import argparse, json, os, socket, struct, sys, termios, tty, threading, time, select
 import mint_jwt
 
 
-def send_input(sock, thrust, steer):
-    msg = json.dumps({"thrust": thrust, "steer": steer}).encode()
+def send_input(sock, thrust, steer, fire=False):
+    msg = json.dumps({"thrust": thrust, "steer": steer, "fire": fire}).encode()
     sock.sendall(struct.pack("<I", len(msg)) + msg)
 
 
@@ -87,7 +89,8 @@ def main():
             ch = sys.stdin.read(1).lower()
             if ch == "q":
                 break
-            elif ch == "w":
+            fire = False
+            if ch == "w":
                 thrust = 1.0
             elif ch == "s":
                 thrust = -1.0
@@ -95,12 +98,16 @@ def main():
                 steer = -1.0
             elif ch == "d":
                 steer = 1.0
+            elif ch == "f":
+                # One-shot fire intent: send fire=true now; subsequent
+                # WASD presses send fire=false (default arg).
+                fire = True
             elif ch == " ":
                 thrust, steer = 0.0, 0.0
             else:
                 continue
-            send_input(sock, thrust, steer)
-            sys.stderr.write(f"  -> thrust={thrust:+.1f} steer={steer:+.1f}\n")
+            send_input(sock, thrust, steer, fire=fire)
+            sys.stderr.write(f"  -> thrust={thrust:+.1f} steer={steer:+.1f}{' FIRE' if fire else ''}\n")
             sys.stderr.flush()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)

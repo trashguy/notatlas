@@ -80,6 +80,17 @@ const steer_max_n: f32 = 30_000.0;
 /// toward −Z when yaw=0).
 const ship_forward_local: notatlas.math.Vec3 = .{ .x = 0, .y = 0, .z = -1 };
 
+/// Cannon parameters — sub-step 5 v1 has a single starboard cannon
+/// per ship at half_extent.x off centerline, 1 m above deck. Fires
+/// in ship-local +x direction (= starboard), which is the standard
+/// naval broadside orientation. Cooldown 1.5 s for fast iteration;
+/// production cannon reloads land in a per-cannon-component config
+/// later. The fire-event's `rot` is the ship's world quaternion
+/// directly (FireEvent convention: muzzle direction = rotateX(rot)).
+const cannon_cooldown_s: f64 = 1.5;
+const cannon_offset_y: f32 = 1.0;
+const ammo_config_path = "data/ammo/cannonball.yaml";
+
 /// YAML inputs — ship-sim must agree with the sandbox on hull + wave
 /// kernel until the spawn protocol carries them on the wire. Ran from
 /// project root (the build/cwd convention shared with cell-mgr).
@@ -177,6 +188,12 @@ fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.
     return notatlas.yaml_loader.loadFromFile(gpa, abs);
 }
 
+fn loadAmmo(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.projectile.AmmoParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadAmmoFromFile(gpa, abs);
+}
+
 fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.BuoyancyConfig {
     return .{
         .sample_points = hull.sample_points,
@@ -244,8 +261,9 @@ pub fn main() !void {
     var hull = try loadHull(allocator, hull_config_path);
     defer hull.deinit(allocator);
     const wave_params = try loadWaves(allocator, wave_config_path);
+    const ammo = try loadAmmo(allocator, ammo_config_path);
     std.debug.print(
-        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m\n",
+        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m\n",
         .{
             args.shard,
             hull.half_extents[0],
@@ -255,6 +273,8 @@ pub fn main() !void {
             hull.sample_points.len,
             wave_params.seed,
             wave_params.amplitude_m,
+            ammo.muzzle_velocity_mps,
+            ammo.splash_radius_m,
         },
     );
 
@@ -328,6 +348,10 @@ pub fn main() !void {
     var last_tick_ns: u64 = start_ns;
     var tick_n: u64 = 0;
     var phys_t: f32 = 0;
+    // Absolute world clock — f64 because the wipe cycle is ~10 weeks.
+    // FireEvent.fire_time_s is f64 by design (the lag-comp rewind
+    // buffer indexes against it). Advances by phys_dt_fixed per tick.
+    var world_time_s: f64 = 0;
     var last_log_tick: u64 = 0;
     var last_log_ns: u64 = start_ns;
 
@@ -344,9 +368,10 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, &phys, &buoy, wave_params, phys_t, hull.half_extents);
+            try tick(allocator, client, &state, &phys, &buoy, wave_params, phys_t, hull.half_extents, world_time_s, ammo);
             tick_n += 1;
             phys_t += phys_dt_fixed;
+            world_time_s += @as(f64, phys_dt_fixed);
             last_tick_ns +%= tick_period_ns;
         }
 
@@ -374,6 +399,54 @@ pub fn main() !void {
     std.debug.print("ship-sim [{s}]: shutting down at tick {d}\n", .{ args.shard, tick_n });
 }
 
+/// Publish a FireMsg on `sim.entity.<id>.fire` for `e`'s starboard
+/// cannon. Muzzle pose: ship pose offset by (half_extent.x, 1.0, 0)
+/// in ship-local frame (= 1 m above deck, on the starboard side at
+/// midships). Fire direction: ship-local +x rotated by ship rot
+/// (FireEvent convention — `rotateX(rot)` is the muzzle forward).
+fn fireCannon(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    phys: *physics.System,
+    e: *const sim_state.Entity,
+    hull_half_extents: [3]f32,
+    world_time_s: f64,
+    ammo: notatlas.projectile.AmmoParams,
+) !void {
+    const pos = phys.getPosition(e.body_id) orelse return;
+    const rot = phys.getRotation(e.body_id) orelse return;
+
+    const local_offset: notatlas.math.Vec3 = .{
+        .x = hull_half_extents[0],
+        .y = cannon_offset_y,
+        .z = 0,
+    };
+    const world_offset = notatlas.math.Vec3.rotateByQuat(local_offset, rot);
+
+    const msg: wire.FireMsg = .{
+        .generation = e.id.generation,
+        .fire_time_s = world_time_s,
+        .mx = pos[0] + world_offset.x,
+        .my = pos[1] + world_offset.y,
+        .mz = pos[2] + world_offset.z,
+        .rx = rot[0],
+        .ry = rot[1],
+        .rz = rot[2],
+        .rw = rot[3],
+        .charge = 1.0,
+        .ammo_muzzle_velocity_mps = ammo.muzzle_velocity_mps,
+        .ammo_mass_kg = ammo.mass_kg,
+        .ammo_splash_radius_m = ammo.splash_radius_m,
+        .ammo_splash_damage_hp = ammo.splash_damage_hp,
+    };
+
+    var subj_buf: [64]u8 = undefined;
+    const subj = try std.fmt.bufPrint(&subj_buf, "sim.entity.{d}.fire", .{e.id.id});
+    const buf = try wire.encodeFire(allocator, msg);
+    defer allocator.free(buf);
+    try client.publish(subj, buf);
+}
+
 /// Drain pending `sim.entity.*.input` msgs and update latched input
 /// on the matching entities. Unknown / missing entity ids are
 /// silently dropped — gateway hasn't been informed of the spawn set
@@ -394,6 +467,7 @@ fn drainInputSub(
         e.input = .{
             .thrust = std.math.clamp(parsed.value.thrust, -1.0, 1.0),
             .steer = std.math.clamp(parsed.value.steer, -1.0, 1.0),
+            .fire = parsed.value.fire,
         };
     }
 }
@@ -446,14 +520,15 @@ fn applyInputForces(
     }
 }
 
-/// Per-tick work — sub-step 4: input forces → buoyancy → single
-/// system-wide `phys.step` → per-entity pose readback + state
-/// publish.
+/// Per-tick work — sub-step 5: input forces + cannon fire (rate-
+/// limited) → buoyancy → single system-wide `phys.step` →
+/// per-entity pose readback + state publish.
 ///
 /// `phys_t` is the simulation clock at tick start (advances by
 /// exactly `phys_dt_fixed` each tick); buoyancy reads the wave kernel
 /// at this time so successive ticks integrate against a coherent
-/// surface.
+/// surface. `world_time_s` is the absolute world clock used for
+/// fire-event timestamps (f64 to span wipe cycle).
 fn tick(
     allocator: std.mem.Allocator,
     client: *nats.Client,
@@ -463,12 +538,27 @@ fn tick(
     wave_params: notatlas.wave_query.WaveParams,
     phys_t: f32,
     hull_half_extents: [3]f32,
+    world_time_s: f64,
+    ammo: notatlas.projectile.AmmoParams,
 ) !void {
     // Input forces first, then buoyancy. Order doesn't physically
     // matter — Jolt sums all forces between steps — but reads as
     // "what the player wants → what the water does → integrate."
     var input_it = state.entities.valueIterator();
     while (input_it.next()) |e| applyInputForces(phys, e, hull_half_extents);
+
+    // Cannon fire — rate-limited per entity. Done before buoyancy
+    // for no particular reason; FireEvent's muzzle pose is read
+    // from Jolt at this point so it reflects the just-applied input
+    // forces (cannon is on a moving deck — pose is good enough at
+    // 60 Hz).
+    var fire_it = state.entities.valueIterator();
+    while (fire_it.next()) |e| {
+        if (e.input.fire and world_time_s >= e.next_fire_allowed_s) {
+            try fireCannon(allocator, client, phys, e, hull_half_extents, world_time_s, ammo);
+            e.next_fire_allowed_s = world_time_s + cannon_cooldown_s;
+        }
+    }
 
     // Apply buoyancy + drag to every entity before stepping. Forces
     // accumulate inside Jolt and integrate in the single step call

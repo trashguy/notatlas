@@ -35,6 +35,7 @@ pub const Kind = enum { ship, free_agent };
 pub const LatchedInput = struct {
     thrust: f32 = 0,
     steer: f32 = 0,
+    fire: bool = false,
 };
 
 /// One authoritative entity owned by this ship-sim. Sub-step 3:
@@ -51,6 +52,10 @@ pub const Entity = struct {
     body_id: physics.BodyId,
     state_subj: []const u8,
     input: LatchedInput = .{},
+    /// Earliest world-time the entity may fire its cannon again.
+    /// 0 = ready to fire on the first input. Updated to
+    /// `world_time_s + cannon_cooldown_s` after each shot.
+    next_fire_allowed_s: f64 = 0,
 
     pub fn deinit(
         self: *Entity,
