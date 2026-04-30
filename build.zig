@@ -246,6 +246,12 @@ pub fn build(b: *std.Build) void {
     });
     ship_sim_mod.addImport("notatlas", notatlas_mod);
     ship_sim_mod.addImport("nats", nats_mod);
+    // Share the cell-mgr wire types — `sim.entity.<id>.state` is a
+    // contract between ship-sim (producer) and cell-mgr (consumer);
+    // both must agree on the JSON shape. cell_mgr/wire.zig is the
+    // canonical home until a `src/shared/wire.zig` refactor lifts
+    // these out of the consumer-side tree.
+    ship_sim_mod.addImport("wire", wire_mod);
     const ship_sim = b.addExecutable(.{
         .name = "ship-sim",
         .root_module = ship_sim_mod,
