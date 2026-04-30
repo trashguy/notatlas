@@ -301,6 +301,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_gateway.addArgs(args);
     const gateway_step = b.step("gateway", "Run the gateway service");
     gateway_step.dependOn(&run_gateway.step);
+
+    const gateway_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/gateway/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gateway_test_mod.addImport("notatlas", notatlas_mod);
+    gateway_test_mod.addImport("nats", nats_mod);
+    const gateway_tests = b.addTest(.{ .root_module = gateway_test_mod });
+    test_step.dependOn(&b.addRunArtifact(gateway_tests).step);
 }
 
 fn embedShader(
