@@ -274,6 +274,69 @@ pub fn parsePlayerIdFromAttachSubject(subject: []const u8) !u32 {
     return std.fmt.parseInt(u32, id_str, 10);
 }
 
+/// `idx.spatial.query.radius` request payload — a NATS request/reply
+/// roundtrip that returns every entity within `radius_m` of the
+/// world-frame point `(x, y, z)`. spatial-index publishes the
+/// reply on the request's `reply_to` inbox.
+///
+/// `max_results` caps the response payload; if more entities qualify,
+/// the result's `truncated` flag is set and the caller can decide
+/// whether to retry with a tighter filter or just live with the
+/// partial answer. Default 256 is comfortable for the
+/// 200-entity-per-cell soft target.
+///
+/// Kind filtering is intentionally absent in v1 — the entity id's
+/// top byte names the kind already (memory
+/// `architecture_entity_id_kind_tag.md`), so callers can filter
+/// client-side off the returned `id` field with one shift. Adding
+/// server-side filtering is a payload-shrink optimization for
+/// future hot paths.
+///
+/// Distance compares 3D (Euclidean) so vertical separation matters —
+/// a player on a 30 m mast is not "within 5 m" of someone at sea
+/// level. Pure horizontal use cases can pass a generous radius and
+/// post-filter on `y`.
+pub const RadiusQueryMsg = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    radius_m: f32,
+    max_results: u32 = 256,
+};
+
+/// One entry in the radius-query reply. `id` carries the top-byte
+/// kind tag verbatim — callers route by `id >> 24`.
+pub const QueryEntry = struct {
+    id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+};
+
+/// Reply payload for `idx.spatial.query.radius`. `truncated == true`
+/// means the result was capped at the request's `max_results`;
+/// `entries.len` reports the actual count returned.
+pub const RadiusResultMsg = struct {
+    truncated: bool,
+    entries: []const QueryEntry,
+};
+
+pub fn encodeRadiusQuery(allocator: std.mem.Allocator, msg: RadiusQueryMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeRadiusQuery(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(RadiusQueryMsg) {
+    return std.json.parseFromSlice(RadiusQueryMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+pub fn encodeRadiusResult(allocator: std.mem.Allocator, msg: RadiusResultMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeRadiusResult(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(RadiusResultMsg) {
+    return std.json.parseFromSlice(RadiusResultMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 const testing = std.testing;
 
 test "wire: delta roundtrip" {
@@ -411,6 +474,31 @@ test "wire: parsePlayerIdFromAttachSubject" {
     try testing.expectEqual(@as(u32, 33554433), try parsePlayerIdFromAttachSubject("idx.spatial.attach.33554433"));
     try testing.expectError(error.BadSubject, parsePlayerIdFromAttachSubject("idx.spatial.attach."));
     try testing.expectError(error.BadSubject, parsePlayerIdFromAttachSubject("sim.entity.1.input"));
+}
+
+test "wire: radius query roundtrip" {
+    const orig: RadiusQueryMsg = .{ .x = 100, .y = 5, .z = -50, .radius_m = 250, .max_results = 64 };
+    const buf = try encodeRadiusQuery(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeRadiusQuery(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: radius result roundtrip" {
+    const entries = [_]QueryEntry{
+        .{ .id = 0x0100_0001, .x = 10, .y = 0, .z = 0 },
+        .{ .id = 0x0200_0001, .x = 0, .y = 0, .z = 5 },
+    };
+    const orig: RadiusResultMsg = .{ .truncated = false, .entries = &entries };
+    const buf = try encodeRadiusResult(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeRadiusResult(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(false, parsed.value.truncated);
+    try testing.expectEqual(@as(usize, 2), parsed.value.entries.len);
+    try testing.expectEqual(@as(u32, 0x0100_0001), parsed.value.entries[0].id);
+    try testing.expectEqual(@as(u32, 0x0200_0001), parsed.value.entries[1].id);
 }
 
 test "wire: subscribe roundtrip with boarded ship" {

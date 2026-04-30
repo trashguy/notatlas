@@ -18,8 +18,11 @@
 //!     a sub-step — the "standbys subscribe to the same firehose
 //!     and stay state-current" pattern works because cell-mgr is
 //!     already JetStream-consumer-shaped).
-//!   - cell-only deltas (no `idx.spatial.query` radius queries
-//!     yet — that's a separate sub-step).
+//!   - radius queries: `idx.spatial.query.radius` (NATS
+//!     request/reply). Brute-force O(N) over the per-entity pose
+//!     table; primary consumer will be M9 lag-comp's hit detection
+//!     once it lands. v1 caps result count at the request's
+//!     `max_results` (default 256) to bound payload size.
 //!   - aboard-ship gating: ship-sim publishes
 //!     `idx.spatial.attach.<player_id>` on each board / disembark
 //!     transition (docs/08 §2A.2). spatial-index subscribes and
@@ -120,8 +123,9 @@ pub fn main() !void {
 
     const sub_state = try client.subscribe("sim.entity.*.state", .{});
     const sub_attach = try client.subscribe("idx.spatial.attach.*", .{});
+    const sub_query = try client.subscribe("idx.spatial.query.radius", .{});
     std.debug.print(
-        "spatial-index: subscribed to sim.entity.*.state and idx.spatial.attach.*\n",
+        "spatial-index: subscribed to sim.entity.*.state, idx.spatial.attach.*, idx.spatial.query.radius\n",
         .{},
     );
 
@@ -131,6 +135,7 @@ pub fn main() !void {
     var deltas_total: u64 = 0;
     var msgs_total: u64 = 0;
     var attach_msgs_total: u64 = 0;
+    var queries_total: u64 = 0;
     var last_log_ns: u64 = @intCast(std.time.nanoTimestamp());
 
     while (g_running.load(.acquire)) {
@@ -151,14 +156,21 @@ pub fn main() !void {
         attach_msgs_total += attach_drained.msgs;
         deltas_total += attach_drained.deltas;
 
+        const queries_drained = drainQuerySub(allocator, sub_query, &state, client) catch |err| blk: {
+            std.debug.print("spatial-index: query drain error ({s})\n", .{@errorName(err)});
+            break :blk @as(u32, 0);
+        };
+        queries_total += queries_drained;
+
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= log_interval_ns) {
             std.debug.print(
-                "[spatial-index] {d} entities tracked; {d} state msgs, {d} attach msgs, {d} deltas in last 1 s\n",
-                .{ state.entityCount(), msgs_total, attach_msgs_total, deltas_total },
+                "[spatial-index] {d} entities tracked; {d} state, {d} attach, {d} queries, {d} deltas / 1 s\n",
+                .{ state.entityCount(), msgs_total, attach_msgs_total, queries_total, deltas_total },
             );
             msgs_total = 0;
             attach_msgs_total = 0;
+            queries_total = 0;
             deltas_total = 0;
             last_log_ns = now_ns;
         }
@@ -188,7 +200,7 @@ fn drainStateSub(
         defer parsed.deinit();
         stats.msgs += 1;
 
-        const t = state.observe(ent_id, parsed.value.x, parsed.value.z) catch continue;
+        const t = state.observe(ent_id, .{ parsed.value.x, parsed.value.y, parsed.value.z }) catch continue;
         if (t == null) continue;
         const transition = t.?;
 
@@ -280,7 +292,7 @@ fn drainAttachSub(
             stats.deltas += 1;
         } else {
             // Disembark: classify the new world pose, emit enter.
-            const t = state.observe(player_id, parsed.value.x, parsed.value.z) catch continue;
+            const t = state.observe(player_id, .{ parsed.value.x, parsed.value.y, parsed.value.z }) catch continue;
             if (t == null) continue;
             try publishDelta(allocator, client, t.?.new_cell, .{
                 .op = .enter,
@@ -294,4 +306,63 @@ fn drainAttachSub(
         }
     }
     return stats;
+}
+
+/// Maximum entities returned in a single radius-query reply. Caps
+/// payload size at ~256 × 16 B-ish JSON ≈ 4 KB per reply, well below
+/// NATS's 1 MB default. Requests with a higher `max_results` are
+/// silently capped at this constant.
+const max_query_results: u32 = 256;
+
+/// Drain `idx.spatial.query.radius` requests and reply on each
+/// caller's `reply_to` inbox. Brute-force O(N) — see
+/// `state.queryRadius` for the query primitive. Requests with no
+/// `reply_to` (a fire-and-forget mistake) are dropped silently;
+/// malformed payloads are dropped silently. Returns the number of
+/// queries handled this drain.
+fn drainQuerySub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    state: *idx_state.State,
+    client: *nats.Client,
+) !u32 {
+    var handled: u32 = 0;
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const reply_to = owned.reply_to orelse continue;
+        const parsed = wire.decodeRadiusQuery(allocator, payload) catch continue;
+        defer parsed.deinit();
+
+        const cap_u32 = @min(parsed.value.max_results, max_query_results);
+        const cap: usize = @intCast(cap_u32);
+
+        var entries_buf: [max_query_results]idx_state.QueryEntry = undefined;
+        const result = idx_state.queryRadius(
+            state,
+            .{ parsed.value.x, parsed.value.y, parsed.value.z },
+            parsed.value.radius_m,
+            entries_buf[0..cap],
+        );
+
+        // Translate idx_state.QueryEntry → wire.QueryEntry on the
+        // way out so the spatial-index module stays
+        // dependency-free.
+        var wire_entries = try allocator.alloc(wire.QueryEntry, result.written);
+        defer allocator.free(wire_entries);
+        for (entries_buf[0..result.written], 0..) |e, i| {
+            wire_entries[i] = .{ .id = e.id, .x = e.pos[0], .y = e.pos[1], .z = e.pos[2] };
+        }
+
+        const reply: wire.RadiusResultMsg = .{
+            .truncated = result.truncated,
+            .entries = wire_entries,
+        };
+        const buf = try wire.encodeRadiusResult(allocator, reply);
+        defer allocator.free(buf);
+        try client.publish(reply_to, buf);
+        handled += 1;
+    }
+    return handled;
 }
