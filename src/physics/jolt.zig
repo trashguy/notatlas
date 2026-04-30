@@ -59,6 +59,9 @@ pub const c = struct {
     pub extern fn jolt_body_get_linear_velocity(sys: *SystemHandle, id: BodyId, out: *[3]f32) bool;
     pub extern fn jolt_body_get_angular_velocity(sys: *SystemHandle, id: BodyId, out: *[3]f32) bool;
 
+    pub extern fn jolt_body_set_linear_velocity(sys: *SystemHandle, id: BodyId, vel: *const [3]f32) void;
+    pub extern fn jolt_body_set_angular_velocity(sys: *SystemHandle, id: BodyId, vel: *const [3]f32) void;
+
     pub extern fn jolt_body_add_force_at_point(
         sys: *SystemHandle,
         id: BodyId,
@@ -159,6 +162,14 @@ pub const System = struct {
         var out: [3]f32 = undefined;
         if (!c.jolt_body_get_angular_velocity(self.handle, id, &out)) return null;
         return out;
+    }
+
+    pub fn setLinearVelocity(self: *System, id: BodyId, vel: [3]f32) void {
+        c.jolt_body_set_linear_velocity(self.handle, id, &vel);
+    }
+
+    pub fn setAngularVelocity(self: *System, id: BodyId, vel: [3]f32) void {
+        c.jolt_body_set_angular_velocity(self.handle, id, &vel);
     }
 
     pub fn addForceAtPoint(self: *System, id: BodyId, force: [3]f32, point: [3]f32) void {

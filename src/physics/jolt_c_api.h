@@ -80,6 +80,13 @@ bool jolt_body_get_rotation(JoltSystem* sys, JoltBodyId id, float out_quat[4]);
 bool jolt_body_get_linear_velocity(JoltSystem* sys, JoltBodyId id, float out_vel[3]);
 bool jolt_body_get_angular_velocity(JoltSystem* sys, JoltBodyId id, float out_vel[3]);
 
+// Velocity setters. Counterparts to the getters above. Used at body
+// (re)spawn — e.g. disembarking player inheriting the ship's velocity at
+// the lever arm so they don't drop straight down off a moving deck.
+// Calling these on a sleeping body is safe (Jolt activates as needed).
+void jolt_body_set_linear_velocity(JoltSystem* sys, JoltBodyId id, const float vel[3]);
+void jolt_body_set_angular_velocity(JoltSystem* sys, JoltBodyId id, const float vel[3]);
+
 // Force application (Newtons). For buoyancy at M3.3: sample wave height at
 // each hull point, compute Archimedes force, call this with `point` =
 // world-space hull-point position.

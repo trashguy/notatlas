@@ -246,6 +246,18 @@ bool jolt_body_get_angular_velocity(JoltSystem* sys, JoltBodyId id, float out[3]
     return true;
 }
 
+void jolt_body_set_linear_velocity(JoltSystem* sys, JoltBodyId id, const float vel[3]) {
+    BodyID bid(id);
+    if (bid.IsInvalid()) return;
+    sys->physics->GetBodyInterface().SetLinearVelocity(bid, Vec3(vel[0], vel[1], vel[2]));
+}
+
+void jolt_body_set_angular_velocity(JoltSystem* sys, JoltBodyId id, const float vel[3]) {
+    BodyID bid(id);
+    if (bid.IsInvalid()) return;
+    sys->physics->GetBodyInterface().SetAngularVelocity(bid, Vec3(vel[0], vel[1], vel[2]));
+}
+
 void jolt_body_add_force_at_point(
     JoltSystem* sys,
     JoltBodyId id,
