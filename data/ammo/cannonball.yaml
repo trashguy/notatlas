@@ -1,0 +1,4 @@
+muzzle_velocity_mps: 250.0
+mass_kg: 6.0
+splash_radius_m: 3.0
+splash_damage_hp: 50.0
