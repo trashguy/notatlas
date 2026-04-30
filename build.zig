@@ -271,6 +271,30 @@ pub fn build(b: *std.Build) void {
     ship_sim_state_test_mod.addImport("notatlas", notatlas_mod);
     const ship_sim_state_tests = b.addTest(.{ .root_module = ship_sim_state_test_mod });
     test_step.dependOn(&b.addRunArtifact(ship_sim_state_tests).step);
+
+    // ----- gateway service (Phase 1, docs/08 §1.2) -----
+    //
+    // Stateless TCP↔NATS relay. Skeleton subscribes to one
+    // hardcoded client's `gw.client.<id>.cmd` and decodes the
+    // batched payload header — TCP listener + framing comes in
+    // subsequent sub-steps.
+    const gateway_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/gateway/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gateway_mod.addImport("notatlas", notatlas_mod);
+    gateway_mod.addImport("nats", nats_mod);
+    const gateway = b.addExecutable(.{
+        .name = "gateway",
+        .root_module = gateway_mod,
+    });
+    b.installArtifact(gateway);
+
+    const run_gateway = b.addRunArtifact(gateway);
+    if (b.args) |args| run_gateway.addArgs(args);
+    const gateway_step = b.step("gateway", "Run the gateway service");
+    gateway_step.dependOn(&run_gateway.step);
 }
 
 fn embedShader(
