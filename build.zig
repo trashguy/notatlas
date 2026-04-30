@@ -343,6 +343,15 @@ pub fn build(b: *std.Build) void {
     });
     const spatial_index_state_tests = b.addTest(.{ .root_module = spatial_index_state_test_mod });
     test_step.dependOn(&b.addRunArtifact(spatial_index_state_tests).step);
+
+    const spatial_index_leader_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/spatial_index/leader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spatial_index_leader_test_mod.addImport("nats", nats_mod);
+    const spatial_index_leader_tests = b.addTest(.{ .root_module = spatial_index_leader_test_mod });
+    test_step.dependOn(&b.addRunArtifact(spatial_index_leader_tests).step);
 }
 
 fn embedShader(

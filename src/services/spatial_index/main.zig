@@ -46,6 +46,7 @@ const notatlas = @import("notatlas");
 const wire = @import("wire");
 
 const idx_state = @import("state.zig");
+const election_mod = @import("leader.zig");
 
 /// 200 m default cell side: small enough that ship-sim's M1.5 grid
 /// (6 × 5 ships at 30 m, half-extent ~75 m) sits in cell 0_0 but a
@@ -58,9 +59,19 @@ const default_cell_side_m: f32 = 200.0;
 /// service mesh logs scan as one tape.
 const log_interval_ns: u64 = std.time.ns_per_s;
 
+/// Election tick interval. Per docs/08 §7.1 heartbeat=1s, lease=3s.
+/// We run the election state machine every 1s — leader path renews,
+/// standby path checks for expiry.
+const election_interval_ns: u64 = std.time.ns_per_s;
+
 const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
     cell_side_m: f32 = default_cell_side_m,
+    /// Stable per-process node id for leader election. Empty means
+    /// "generate a random one at boot". Useful for testing scenarios
+    /// where deterministic ids let you assert "node 'a' wins
+    /// failover".
+    node_id: []const u8 = "",
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -79,12 +90,18 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--cell-side")) {
             out.cell_side_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
             if (out.cell_side_m <= 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--node-id")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.node_id = try allocator.dupe(u8, v);
         } else {
             std.debug.print("spatial-index: unknown arg '{s}'\n", .{a});
             return error.BadArg;
         }
     }
     if (!have_nats_url) out.nats_url = try allocator.dupe(u8, out.nats_url);
+    if (out.node_id.len == 0) {
+        out.node_id = try election_mod.generateNodeId(allocator);
+    }
     return out;
 }
 
@@ -111,15 +128,23 @@ pub fn main() !void {
 
     const args = try parseArgs(allocator);
     defer allocator.free(args.nats_url);
+    defer allocator.free(args.node_id);
     try installSignalHandlers();
 
-    std.debug.print("spatial-index: connecting to {s}; cell_side={d:.0} m\n", .{ args.nats_url, args.cell_side_m });
+    std.debug.print(
+        "spatial-index: connecting to {s}; cell_side={d:.0} m; node_id={s}\n",
+        .{ args.nats_url, args.cell_side_m, args.node_id },
+    );
 
     var client = try nats.Client.connect(allocator, .{
         .servers = &.{args.nats_url},
         .name = "spatial-index",
     });
     defer client.close();
+
+    var election = try election_mod.Election.init(allocator, client, args.node_id);
+    defer election.deinit();
+    std.debug.print("spatial-index: leader-election bucket ready (idx_spatial_leader)\n", .{});
 
     const sub_state = try client.subscribe("sim.entity.*.state", .{});
     const sub_attach = try client.subscribe("idx.spatial.attach.*", .{});
@@ -137,36 +162,63 @@ pub fn main() !void {
     var attach_msgs_total: u64 = 0;
     var queries_total: u64 = 0;
     var last_log_ns: u64 = @intCast(std.time.nanoTimestamp());
+    var last_election_ns: u64 = 0; // 0 forces an immediate first tick
 
     while (g_running.load(.acquire)) {
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
 
-        const observed = drainStateSub(allocator, sub_state, &state, client) catch |err| blk: {
+        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        if (now_ns -% last_election_ns >= election_interval_ns) {
+            const role_changed = election.tick(now_ns) catch |err| blk: {
+                std.debug.print("spatial-index: election tick error ({s})\n", .{@errorName(err)});
+                break :blk false;
+            };
+            last_election_ns = now_ns;
+            if (role_changed) {
+                if (election.isLeader()) {
+                    std.debug.print(
+                        "spatial-index [{s}]: PROMOTED to leader\n",
+                        .{args.node_id},
+                    );
+                } else {
+                    const seen = election.last_seen_leader orelse "?";
+                    std.debug.print(
+                        "spatial-index [{s}]: DEMOTED to standby (leader={s})\n",
+                        .{ args.node_id, seen },
+                    );
+                }
+            }
+        }
+
+        // Always drain state — standbys stay state-current so they can
+        // serve traffic immediately on promotion. Leader-only side
+        // effects (publishing deltas) are gated inside drainStateSub.
+        const observed = drainStateSub(allocator, sub_state, &state, client, election.isLeader()) catch |err| blk: {
             std.debug.print("spatial-index: drain error ({s})\n", .{@errorName(err)});
             break :blk DrainStats{};
         };
         msgs_total += observed.msgs;
         deltas_total += observed.deltas;
 
-        const attach_drained = drainAttachSub(allocator, sub_attach, &state, client) catch |err| blk: {
+        const attach_drained = drainAttachSub(allocator, sub_attach, &state, client, election.isLeader()) catch |err| blk: {
             std.debug.print("spatial-index: attach drain error ({s})\n", .{@errorName(err)});
             break :blk DrainStats{};
         };
         attach_msgs_total += attach_drained.msgs;
         deltas_total += attach_drained.deltas;
 
-        const queries_drained = drainQuerySub(allocator, sub_query, &state, client) catch |err| blk: {
+        const queries_drained = drainQuerySub(allocator, sub_query, &state, client, election.isLeader()) catch |err| blk: {
             std.debug.print("spatial-index: query drain error ({s})\n", .{@errorName(err)});
             break :blk @as(u32, 0);
         };
         queries_total += queries_drained;
 
-        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= log_interval_ns) {
+            const role_tag: []const u8 = if (election.isLeader()) "LEADER" else "standby";
             std.debug.print(
-                "[spatial-index] {d} entities tracked; {d} state, {d} attach, {d} queries, {d} deltas / 1 s\n",
-                .{ state.entityCount(), msgs_total, attach_msgs_total, queries_total, deltas_total },
+                "[spatial-index {s} {s}] {d} entities; {d} state, {d} attach, {d} queries, {d} deltas / 1 s\n",
+                .{ args.node_id, role_tag, state.entityCount(), msgs_total, attach_msgs_total, queries_total, deltas_total },
             );
             msgs_total = 0;
             attach_msgs_total = 0;
@@ -189,6 +241,7 @@ fn drainStateSub(
     sub: anytype,
     state: *idx_state.State,
     client: *nats.Client,
+    is_leader: bool,
 ) !DrainStats {
     var stats: DrainStats = .{};
     while (sub.nextMsg()) |msg| {
@@ -203,6 +256,11 @@ fn drainStateSub(
         const t = state.observe(ent_id, .{ parsed.value.x, parsed.value.y, parsed.value.z }) catch continue;
         if (t == null) continue;
         const transition = t.?;
+
+        // Standbys keep their state table current but don't emit
+        // deltas — that's the leader's job. On a failover the new
+        // leader is already state-current (no replication lag).
+        if (!is_leader) continue;
 
         const pos_y = parsed.value.y;
         if (transition.old_cell) |old| {
@@ -266,6 +324,7 @@ fn drainAttachSub(
     sub: anytype,
     state: *idx_state.State,
     client: *nats.Client,
+    is_leader: bool,
 ) !DrainStats {
     var stats: DrainStats = .{};
     while (sub.nextMsg()) |msg| {
@@ -279,8 +338,11 @@ fn drainAttachSub(
         stats.msgs += 1;
 
         if (parsed.value.attached_ship_id != 0) {
-            // Board: emit exit on last-known cell, drop from table.
+            // Board: drop from table on every node so standbys stay
+            // current; only the leader emits the synthetic exit
+            // delta.
             const old_cell = state.forget(player_id) orelse continue;
+            if (!is_leader) continue;
             try publishDelta(allocator, client, old_cell, .{
                 .op = .exit,
                 .id = player_id,
@@ -291,9 +353,11 @@ fn drainAttachSub(
             });
             stats.deltas += 1;
         } else {
-            // Disembark: classify the new world pose, emit enter.
+            // Disembark: classify the new world pose on every node,
+            // but only the leader emits the synthetic enter delta.
             const t = state.observe(player_id, .{ parsed.value.x, parsed.value.y, parsed.value.z }) catch continue;
             if (t == null) continue;
+            if (!is_leader) continue;
             try publishDelta(allocator, client, t.?.new_cell, .{
                 .op = .enter,
                 .id = player_id,
@@ -325,11 +389,16 @@ fn drainQuerySub(
     sub: anytype,
     state: *idx_state.State,
     client: *nats.Client,
+    is_leader: bool,
 ) !u32 {
     var handled: u32 = 0;
     while (sub.nextMsg()) |msg| {
         var owned = msg;
         defer owned.deinit();
+        // Standbys still need to drain so messages don't pile up,
+        // but they don't reply — the leader is the single responder
+        // per docs/08 §7.2.
+        if (!is_leader) continue;
         const payload = owned.payload orelse continue;
         const reply_to = owned.reply_to orelse continue;
         const parsed = wire.decodeRadiusQuery(allocator, payload) catch continue;
