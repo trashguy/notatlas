@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const nats = @import("nats");
+const notatlas = @import("notatlas");
 
 const wire = @import("wire");
 
@@ -23,15 +24,23 @@ const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
     /// `oneshot` = enter, sleep, exit. `static` = enter and hold.
     /// `churn` = random enter/exit. `pose-stream` = enter N entities,
-    /// then publish per-entity state msgs at `--rate` Hz with simple
-    /// orbital trajectories (exercises cell-mgr's fast-lane callback
-    /// relay).
+    /// then publish per-entity state msgs at the tier-1 `visual_rate_hz`
+    /// from data/tier_distances.yaml (override with `--rate`) with
+    /// simple orbital trajectories (exercises cell-mgr's fast-lane
+    /// callback relay).
     scenario: Scenario = .oneshot,
     duration_s: u32 = 5,
     /// `pose-stream` only: state-msg publish rate per entity (Hz).
-    state_rate_hz: u32 = 60,
+    /// `null` means "use the tier-1 rate from data/tier_distances.yaml"
+    /// — the architecturally honest default per docs/02 §9. Override
+    /// only for stress scenarios (e.g. demonstrating sub-cell
+    /// partitioning need at >spec rates).
+    state_rate_hz_override: ?u32 = null,
     /// `pose-stream` only: number of entities to spin around.
     pose_n_entities: u32 = 5,
+    /// Path to the tier_distances.yaml file. Lets the harness be run
+    /// from anywhere; defaults to the project-root file.
+    tier_yaml_path: []const u8 = "data/tier_distances.yaml",
 };
 
 const Scenario = enum { oneshot, static, churn, @"pose-stream" };
@@ -59,9 +68,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--duration")) {
             out.duration_s = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--rate")) {
-            out.state_rate_hz = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+            out.state_rate_hz_override = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--n")) {
             out.pose_n_entities = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--tier-yaml")) {
+            out.tier_yaml_path = args.next() orelse return error.MissingArg;
         } else {
             std.debug.print("harness: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -110,6 +121,35 @@ pub fn main() !void {
     const args = try parseArgs(allocator);
     defer allocator.free(args.nats_url);
 
+    // Load tier rates from data — replaces the previously-hardcoded
+    // 60 Hz default. Falls back to TierThresholds.default if the
+    // YAML can't be opened (e.g. running from outside the project
+    // tree); log a warning so the user knows.
+    const tier_thresholds = blk: {
+        const abs = std.fs.cwd().realpathAlloc(allocator, args.tier_yaml_path) catch {
+            std.debug.print("harness: warning — couldn't resolve {s}; using TierThresholds.default rates\n", .{args.tier_yaml_path});
+            break :blk notatlas.replication.TierThresholds.default;
+        };
+        defer allocator.free(abs);
+        break :blk notatlas.yaml_loader.loadTierThresholdsFromFile(allocator, abs) catch |err| {
+            std.debug.print("harness: warning — failed to load tier YAML ({s}); using defaults\n", .{@errorName(err)});
+            break :blk notatlas.replication.TierThresholds.default;
+        };
+    };
+
+    // Resolve effective state rate. Per docs/02 §9 the tier-1 visual
+    // rate is the producer-side default; --rate is an explicit
+    // override (stress-test or sub-spec) that warns when it deviates.
+    const tier1_rate = tier_thresholds.visual_rate_hz;
+    const effective_rate = args.state_rate_hz_override orelse tier1_rate;
+    if (args.state_rate_hz_override) |r| {
+        if (r > tier1_rate) {
+            std.debug.print("harness: warning — --rate {d} exceeds tier-1 visual_rate_hz {d} (above-spec stress mode)\n", .{ r, tier1_rate });
+        } else if (r < tier1_rate) {
+            std.debug.print("harness: --rate {d} is below tier-1 visual_rate_hz {d}\n", .{ r, tier1_rate });
+        }
+    }
+
     const delta_subj = try std.fmt.allocPrint(allocator, "idx.spatial.cell.{d}_{d}.delta", .{ args.cell_x, args.cell_y });
     defer allocator.free(delta_subj);
     const sub_subj = try std.fmt.allocPrint(allocator, "cm.cell.{d}_{d}.subscribe", .{ args.cell_x, args.cell_y });
@@ -117,7 +157,7 @@ pub fn main() !void {
     const unsub_subj = try std.fmt.allocPrint(allocator, "cm.cell.{d}_{d}.unsubscribe", .{ args.cell_x, args.cell_y });
     defer allocator.free(unsub_subj);
 
-    std.debug.print("harness: connecting to {s}\n", .{args.nats_url});
+    std.debug.print("harness: connecting to {s}; tier-1 rate {d} Hz\n", .{ args.nats_url, effective_rate });
     var client = try nats.Client.connect(allocator, .{
         .servers = &.{args.nats_url},
         .name = "cell-mgr-harness",
@@ -136,7 +176,7 @@ pub fn main() !void {
         .oneshot => try runOneshot(&pubr),
         .static => try runStatic(&pubr, args.duration_s),
         .churn => try runChurn(&pubr, args.duration_s),
-        .@"pose-stream" => try runPoseStream(&pubr, args.duration_s, args.pose_n_entities, args.state_rate_hz),
+        .@"pose-stream" => try runPoseStream(&pubr, args.duration_s, args.pose_n_entities, effective_rate),
     }
 
     // Give the connection a moment to flush before close().

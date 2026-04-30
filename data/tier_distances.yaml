@@ -1,12 +1,19 @@
-# Tier replication thresholds. First-pass values from
-# docs/08-phase1-architecture.md §3.2; tune from the Milestone 1.5 stress
-# gate (200 players × 30 ships × ~1000 projectiles), not from synthetic
-# M6 numbers.
+# Tier replication thresholds + producer-side publish rates per
+# docs/08 §3.2. Distances are xz-plane horizontal range in meters
+# from the subscriber. The "always" tier has no distance gate and
+# the "boarded" tier is gated by ship attachment, not range —
+# neither appears in the range section.
 #
-# Distances are xz-plane horizontal range in meters from the subscriber.
-# The "always" tier has no distance gate and the "boarded" tier is gated
-# by ship attachment, not range — neither appears here. rate_hz fields
-# from §3.2 will land alongside cell-mgr at M6.3.
+# Rate fields are the cadence at which ship-sim / harness publishes
+# state at each tier (consumer-side fast-lane window is fixed at
+# 60 Hz to align with the highest producer rate). Tier 2/3 are on-
+# change (no clocked rate); they're not represented here.
+#
+# First-pass values; tune from the Milestone 1.5 stress gate (200
+# players × 30 ships × ~1000 projectiles), not from synthetic M6.
 fleet_aggregate_range_m: 2000.0
 visual_range_m: 500.0
 close_combat_range_m: 150.0
+always_rate_hz: 30
+fleet_aggregate_rate_hz: 5
+visual_rate_hz: 60

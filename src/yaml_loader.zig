@@ -12,6 +12,7 @@ const wind = @import("wind_query.zig");
 const ocean_params_mod = @import("ocean_params.zig");
 const hull_mod = @import("hull_params.zig");
 const replication = @import("shared/replication.zig");
+const projectile = @import("shared/projectile.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -204,6 +205,9 @@ const RawTierThresholds = struct {
     fleet_aggregate_range_m: f32,
     visual_range_m: f32,
     close_combat_range_m: f32,
+    always_rate_hz: u32,
+    fleet_aggregate_rate_hz: u32,
+    visual_rate_hz: u32,
 };
 
 pub fn loadTierThresholdsFromFile(
@@ -217,6 +221,35 @@ pub fn loadTierThresholdsFromFile(
         .fleet_aggregate_range_m = raw.fleet_aggregate_range_m,
         .visual_range_m = raw.visual_range_m,
         .close_combat_range_m = raw.close_combat_range_m,
+        .always_rate_hz = raw.always_rate_hz,
+        .fleet_aggregate_rate_hz = raw.fleet_aggregate_rate_hz,
+        .visual_rate_hz = raw.visual_rate_hz,
+    };
+}
+
+// ------------------------------------------------------------
+// data/ammo/<type>.yaml
+// ------------------------------------------------------------
+
+const RawAmmoParams = struct {
+    muzzle_velocity_mps: f32,
+    mass_kg: f32,
+    splash_radius_m: f32,
+    splash_damage_hp: f32,
+};
+
+pub fn loadAmmoFromFile(
+    allocator: Allocator,
+    abs_path: []const u8,
+) !projectile.AmmoParams {
+    var parser = try ymlz.Ymlz(RawAmmoParams).init(allocator);
+    const raw = try parser.loadFile(abs_path);
+    defer parser.deinit(raw);
+    return .{
+        .muzzle_velocity_mps = raw.muzzle_velocity_mps,
+        .mass_kg = raw.mass_kg,
+        .splash_radius_m = raw.splash_radius_m,
+        .splash_damage_hp = raw.splash_damage_hp,
     };
 }
 
@@ -348,6 +381,23 @@ test "load tier_distances.yaml matches TierThresholds.default" {
     try testing.expectEqual(want.fleet_aggregate_range_m, loaded.fleet_aggregate_range_m);
     try testing.expectEqual(want.visual_range_m, loaded.visual_range_m);
     try testing.expectEqual(want.close_combat_range_m, loaded.close_combat_range_m);
+    try testing.expectEqual(want.always_rate_hz, loaded.always_rate_hz);
+    try testing.expectEqual(want.fleet_aggregate_rate_hz, loaded.fleet_aggregate_rate_hz);
+    try testing.expectEqual(want.visual_rate_hz, loaded.visual_rate_hz);
+}
+
+test "load ammo/cannonball.yaml matches projectile.AmmoParams.default" {
+    const abs = try std.fs.cwd().realpathAlloc(testing.allocator, "data/ammo/cannonball.yaml");
+    defer testing.allocator.free(abs);
+    const loaded = try loadAmmoFromFile(testing.allocator, abs);
+    // The YAML file is the canonical default; module defaults must
+    // match it so code paths that omit a load call still get
+    // sensible numbers.
+    const want: projectile.AmmoParams = .{};
+    try testing.expectEqual(want.muzzle_velocity_mps, loaded.muzzle_velocity_mps);
+    try testing.expectEqual(want.mass_kg, loaded.mass_kg);
+    try testing.expectEqual(want.splash_radius_m, loaded.splash_radius_m);
+    try testing.expectEqual(want.splash_damage_hp, loaded.splash_damage_hp);
 }
 
 test "load ocean.yaml matches OceanParams.default" {

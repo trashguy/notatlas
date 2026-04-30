@@ -64,8 +64,33 @@ pub const TierThresholds = struct {
     fleet_aggregate_range_m: f32 = 2000.0,
     visual_range_m: f32 = 500.0,
     close_combat_range_m: f32 = 150.0,
+    /// Per-tier publish rates (Hz) per docs/02 §9 / docs/08 §3.2.
+    /// `null` rate = on-change cadence (tier 2/3): producer emits
+    /// only when the underlying state actually changes; consumers
+    /// don't time-poll for these. The fields below are the
+    /// **producer-side** cadences that ship-sim / harness must
+    /// honour — they are NOT the consumer-side fast-lane window
+    /// (which is 60 Hz to align with the highest producer rate).
+    always_rate_hz: u32 = 30,
+    fleet_aggregate_rate_hz: u32 = 5,
+    visual_rate_hz: u32 = 60,
+    // close_combat: on_change (no clocked rate)
+    // boarded:      on_change (no clocked rate)
 
     pub const default: TierThresholds = .{};
+
+    /// Producer-side publish rate for clocked tiers, or null for
+    /// on-change tiers. Producers should not call this in a hot
+    /// loop — bind it once at scenario start and reuse.
+    pub fn rateHz(self: TierThresholds, tier: Tier) ?u32 {
+        return switch (tier) {
+            .always => self.always_rate_hz,
+            .fleet_aggregate => self.fleet_aggregate_rate_hz,
+            .visual => self.visual_rate_hz,
+            .close_combat => null,
+            .boarded => null,
+        };
+    }
 };
 
 // ---- filter ----
