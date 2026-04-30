@@ -311,6 +311,38 @@ pub fn build(b: *std.Build) void {
     gateway_test_mod.addImport("nats", nats_mod);
     const gateway_tests = b.addTest(.{ .root_module = gateway_test_mod });
     test_step.dependOn(&b.addRunArtifact(gateway_tests).step);
+
+    // ----- spatial-index service (Phase 2, docs/02 §1.4 / docs/08 §7.1) -----
+    //
+    // Global entity → cell membership oracle. Subscribes to the
+    // sim.entity.*.state firehose, emits idx.spatial.cell.<x>_<z>.delta
+    // events on cell transitions. cell-mgr is the consumer.
+    const spatial_index_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/spatial_index/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spatial_index_mod.addImport("notatlas", notatlas_mod);
+    spatial_index_mod.addImport("nats", nats_mod);
+    spatial_index_mod.addImport("wire", wire_mod);
+    const spatial_index = b.addExecutable(.{
+        .name = "spatial-index",
+        .root_module = spatial_index_mod,
+    });
+    b.installArtifact(spatial_index);
+
+    const run_spatial_index = b.addRunArtifact(spatial_index);
+    if (b.args) |args| run_spatial_index.addArgs(args);
+    const spatial_index_step = b.step("spatial-index", "Run the spatial-index service");
+    spatial_index_step.dependOn(&run_spatial_index.step);
+
+    const spatial_index_state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/spatial_index/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spatial_index_state_tests = b.addTest(.{ .root_module = spatial_index_state_test_mod });
+    test_step.dependOn(&b.addRunArtifact(spatial_index_state_tests).step);
 }
 
 fn embedShader(
