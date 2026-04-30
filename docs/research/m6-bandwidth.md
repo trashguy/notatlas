@@ -126,32 +126,46 @@ Now the sweep shows the slow-lane's natural binary cutover:
 
 For comparison, the **previous milestone** (cluster pathway emitting *and* slow-lane individual records for visual+ entities) saw the hot scenario at 48 % of budget and a sharp spike inside 500 m as 100 individual records replaced the cluster summary. Post-cleanup that spike moves to the fast-lane, which sees it as N × M × (sub's tier-1 rate) — independent of the slow-lane budget.
 
-## Fast-lane batched (hot scenario)
+## Fast-lane batched: 200-soft-target vs 1.5×-stress
 
-100 entities × 50 subs in 200 m, one 60 Hz fast-lane window. Drives
-`relayState` once per (entity × visible sub), then `flushBatches`.
+Both scenarios run one 60 Hz fast-lane window. Every entity emits a
+state msg → `relayState` appends to per-sub pending → `flushBatches`
+emits one batched payload per sub.
 
-| Metric | Value |
-|---|---:|
-| Pushes (record appends) per window | 5 000 (= 100 × 50, every entity visible to every sub) |
-| Subs with non-empty pending | 50 / 50 |
-| Batched publishes per window | 50 (one per sub) |
-| Per-sub batched payload max | 2 008 B (= 8 B header + 100 × 20 B records) |
-| Per-sub payload @ 60 Hz | 120 480 B/s = **96.38 % of budget** |
-| Per-sub publishes/sec — PRE-batch | 6 000 |
-| Per-sub publishes/sec — POST-batch | 60 |
-| Reduction in NATS messages | **100 ×** |
-| NATS PUB framing (50 B/msg estimate) — PRE | 2 400 kbps/sub |
-| NATS PUB framing (50 B/msg estimate) — POST | 24 kbps/sub |
-| Framing reduction | **100 ×** |
+| Metric | target (200-soft) | stress (1.5×) | ratio |
+|---|---:|---:|---:|
+| Entities | 100 | 300 | 3.00× |
+| Subscribers | 50 | 50 | — |
+| Pushes (record appends) per window | 5 000 | 15 000 | 3.00× |
+| Batched publishes per window | 50 (one per sub) | 50 (one per sub) | **flat** |
+| Per-sub batched payload max | 2 008 B | 6 008 B | **2.99×** |
+| Per-sub payload @ 60 Hz | 120 480 B/s = **96.38 % of budget** | 360 480 B/s = **288.38 % of budget** | linear |
+| Per-sub publishes/sec — PRE-batch | 6 000 | 18 000 | 3.00× |
+| Per-sub publishes/sec — POST-batch | 60 | 60 | **flat** |
+| Reduction in NATS messages | 100× | 300× | — |
 
-**Read this carefully.** Payload bytes alone are 96 % of budget at this
-density — that's the soft 1.5× / hardcore-tolerable point per memory
-`design_soft_caps_subcell.md`. Going *above* this density needs sub-
-cell partitioning (docs/08 §2.4a, ports / harbor anchorages) to halve
-the per-sub fanout work. Batching doesn't change the payload-bytes
-ceiling; it changes how much of the budget the **NATS framing**
-overhead consumes, which pre-batch was the dominant per-msg cost.
+**The headline soft-cap-degrades-gracefully property** is the **flat**
+post-batch publishes/sec line. Per-sub NATS message rate does NOT
+scale with entity count. Adding entities adds payload bytes (linearly,
+~3× for 3× ents — header amortization makes it slightly less than 3×),
+but does not multiply the per-sub publish overhead. That's the
+no-cliff property the soft-cap framing requires.
+
+**The 288 % of budget at 1.5× stress is intentional and documented,
+not a failure.** Per memory `design_soft_caps_subcell.md` the system
+should degrade gracefully above the soft target — and "graceful" here
+means "linear in entity count," not "stays inside budget." Above the
+soft cap the architectural lever is **sub-cell partitioning** per
+docs/08 §2.4a (ports / harbor anchorages route subscribers across
+multiple cell-mgr workers, halving per-sub fanout work), not a
+tighter producer-side rate.
+
+**Test gates encode the property:**
+
+- target ≤ 100% of budget (verified)
+- stress > 100% of budget (intentional, confirms we're past the soft cap)
+- stress / target payload ratio ∈ [2.5×, 3.5×] (linear scaling — >3.5× would imply per-sub overhead growing super-linearly, the cliff failure mode batching prevents)
+- both: exactly one batched publish per sub per window (no per-msg fanout)
 
 ## Conclusions
 

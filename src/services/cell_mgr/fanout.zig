@@ -1254,25 +1254,112 @@ test "M6.5 BW: idle / mid / hot scenarios + distance sweep" {
     const fast_window_hz: f64 = 60.0;
     const nats_framing_b: f64 = 50.0; // PUB <subj> <len>\r\n<payload>\r\n + subject
 
-    // Same hot density as the slow-lane scenario: 100 ents, 50 subs,
-    // all clustered in 200 m. Drive one fast-lane window: every entity
-    // emits one state msg, then flushBatches.
-    var hot_state = State.init(a);
-    defer hot_state.deinit();
-    var hot_fanout = Fanout.init(a, TierThresholds.default);
-    defer hot_fanout.deinit();
-    var hot_capture: CaptureSink = .{ .allocator = a };
-    defer hot_capture.deinit();
+    // Run the same fast-lane scenario at the 100-ent target and at
+    // a 300-ent stress (3× the headline benchmark, well past the
+    // 200/cell soft-target's ~60 peak fanout entities). The
+    // soft-cap claim per memory `design_soft_caps_subcell.md` is
+    // that exceeding the design point degrades **gracefully** —
+    // linearly, no cliff. Run both and compare.
+    const target = try measureFastLaneHot(a, sa, r, 100, 50, 200, fast_window_hz);
+    const stress = try measureFastLaneHot(a, sa, r, 300, 50, 200, fast_window_hz);
 
-    const n_ent_fast: usize = 100;
-    const n_sub_fast: usize = 50;
-    const fast_ents = try sa.alloc([3]f32, n_ent_fast);
-    for (fast_ents) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
-    const fast_subs = try sa.alloc([3]f32, n_sub_fast);
-    for (fast_subs) |*p| p.* = .{ (r.float(f32) - 0.5) * 200, 0, (r.float(f32) - 0.5) * 200 };
+    const ratio_payload: f64 = stress.max_payload_per_sec / target.max_payload_per_sec;
 
-    for (fast_ents, 0..) |p, i| {
-        _ = try hot_state.applyDelta(.{
+    const target_pre_pubs_per_sec: f64 = @as(f64, @floatFromInt(target.pushes)) / 50.0 * fast_window_hz;
+    const stress_pre_pubs_per_sec: f64 = @as(f64, @floatFromInt(stress.pushes)) / 50.0 * fast_window_hz;
+    const post_batch_pubs_per_sec: f64 = fast_window_hz; // 1 publish per window per sub
+    const framing_target_pre_kbps: f64 = target_pre_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
+    const framing_post_kbps: f64 = post_batch_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
+
+    std.debug.print("\n=== [M6.5] fast-lane batched: 200-soft-target vs 1.5×-stress ===\n", .{});
+    std.debug.print("All ents and subs clustered in 200 m, one fast-lane window (60 Hz).\n", .{});
+    std.debug.print("Scenario          | ents | subs |  pushes |  publishes | per-sub max | per-sub B/s | % of budget\n", .{});
+    std.debug.print("------------------+------+------+---------+------------+-------------+-------------+------------\n", .{});
+    std.debug.print(" target (200-soft) | {d:>4} | {d:>4} | {d:>7} | {d:>10} | {d:>11} | {d:>11.1} | {d:>9.2}%\n", .{
+        target.n_ents,        target.n_subs,
+        target.pushes,        target.publishes,
+        target.max_payload,   target.max_payload_per_sec,
+        target.pct_of_budget,
+    });
+    std.debug.print(" stress (1.5× ent) | {d:>4} | {d:>4} | {d:>7} | {d:>10} | {d:>11} | {d:>11.1} | {d:>9.2}%\n", .{
+        stress.n_ents,        stress.n_subs,
+        stress.pushes,        stress.publishes,
+        stress.max_payload,   stress.max_payload_per_sec,
+        stress.pct_of_budget,
+    });
+    std.debug.print("Per-sub publishes/sec: PRE-batch target {d:.0}, stress {d:.0}; POST-batch both {d:.0} (no scaling — flat @ 60 Hz).\n", .{
+        target_pre_pubs_per_sec, stress_pre_pubs_per_sec, post_batch_pubs_per_sec,
+    });
+    std.debug.print("NATS PUB framing @ 50 B/msg: target PRE {d:.1} kbps/sub, POST {d:.1} kbps/sub ({d:.1}× saving).\n", .{
+        framing_target_pre_kbps, framing_post_kbps, framing_target_pre_kbps / framing_post_kbps,
+    });
+    std.debug.print("Stress / target payload ratio: {d:.2}× for 3× ent count → linear scaling, no cliff.\n", .{ratio_payload});
+
+    // ---- gates ----
+
+    // Target (at the 200-soft-cap boundary): per-sub batched payload
+    // ≤ 100% of budget. 100 ents × 20 B + 8 B header = 2008 B/window
+    // × 60 Hz = 120.5 KB/s = 96.4 %. Inside, just barely.
+    try testing.expect(target.pct_of_budget <= 100.0);
+
+    // Stress (1.5× of the 200 soft-cap, 3× of the target ent
+    // count): explicitly above budget. The soft-cap framing per
+    // memory `design_soft_caps_subcell.md` says the system should
+    // **degrade gracefully** here, not refuse entry. Concretely:
+    // graceful = per-sub BW grows linearly in ent count, NOT
+    // exponentially. Above-budget is documented, not asserted away;
+    // the architectural lever is sub-cell partitioning, not a
+    // tighter rate.
+    try testing.expect(stress.pct_of_budget > 100.0); // confirm we're past soft cap
+    // Linearity: 3× ent count gives between 2.5× and 3.5× the
+    // payload (header amortization narrows the ratio slightly).
+    // >3.5× would imply per-sub overhead growing super-linearly —
+    // the cliff failure mode batching is supposed to prevent.
+    try testing.expect(ratio_payload >= 2.5);
+    try testing.expect(ratio_payload <= 3.5);
+
+    // Both scenarios get exactly one batched publish per sub per
+    // window — the per-sub publish count does NOT scale with ent
+    // count. This is the headline batching-degradation property:
+    // adding entities adds payload bytes, not NATS msgs.
+    try testing.expectEqual(@as(usize, 1), target.publishes / target.subs_with_payload);
+    try testing.expectEqual(@as(usize, 1), stress.publishes / stress.subs_with_payload);
+}
+
+const FastLaneStats = struct {
+    n_ents: usize,
+    n_subs: usize,
+    pushes: usize,
+    publishes: usize,
+    subs_with_payload: usize,
+    max_payload: usize,
+    max_payload_per_sec: f64,
+    pct_of_budget: f64,
+};
+
+fn measureFastLaneHot(
+    a: std.mem.Allocator,
+    sa: std.mem.Allocator,
+    r: std.Random,
+    n_ents: usize,
+    n_subs: usize,
+    span_m: f32,
+    fast_window_hz: f64,
+) !FastLaneStats {
+    var state = State.init(a);
+    defer state.deinit();
+    var fanout = Fanout.init(a, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = a };
+    defer capture.deinit();
+
+    const ents = try sa.alloc([3]f32, n_ents);
+    for (ents) |*p| p.* = .{ (r.float(f32) - 0.5) * span_m, 0, (r.float(f32) - 0.5) * span_m };
+    const subs = try sa.alloc([3]f32, n_subs);
+    for (subs) |*p| p.* = .{ (r.float(f32) - 0.5) * span_m, 0, (r.float(f32) - 0.5) * span_m };
+
+    for (ents, 0..) |p, i| {
+        _ = try state.applyDelta(.{
             .op = .enter,
             .id = @intCast(i + 1),
             .generation = 0,
@@ -1281,78 +1368,50 @@ test "M6.5 BW: idle / mid / hot scenarios + distance sweep" {
             .z = p[2],
         });
     }
-    for (fast_subs, 0..) |p, i| {
+    for (subs, 0..) |p, i| {
         const cid: u64 = 0x2000 + @as(u64, i);
-        _ = try hot_state.applySubscribe(.{
+        _ = try state.applySubscribe(.{
             .op = .enter,
             .client_id = cid,
             .x = p[0],
             .y = p[1],
             .z = p[2],
         });
-        try hot_fanout.ensureSubscriber(cid);
+        try fanout.ensureSubscriber(cid);
     }
 
-    // One fast-lane window = every entity publishes one state msg.
-    var pushes_total: usize = 0;
-    for (fast_ents, 0..) |p, i| {
+    var pushes: usize = 0;
+    for (ents, 0..) |p, i| {
         const ent_id: EntityId = .{ .id = @intCast(i + 1), .generation = 0 };
-        pushes_total += try hot_fanout.relayState(
-            &hot_state,
+        pushes += try fanout.relayState(
+            &state,
             ent_id,
             .{ .pos = p, .rot = .{ 0, 0, 0, 1 }, .vel = .{ 0, 0, 0 } },
             null,
         );
     }
-    const publishes = try hot_fanout.flushBatches(hot_capture.sink());
+    const publishes = try fanout.flushBatches(capture.sink());
 
-    // Tally: aggregate batched payload bytes, max per sub.
-    var fast_max_payload: usize = 0;
-    var fast_sum_payload: usize = 0;
+    var max_payload: usize = 0;
     var subs_with_payload: usize = 0;
-    for (fast_subs, 0..) |_, i| {
+    for (subs, 0..) |_, i| {
         const cid: u64 = 0x2000 + @as(u64, i);
-        if (hot_capture.payloadFor(cid)) |payload| {
-            if (payload.len > fast_max_payload) fast_max_payload = payload.len;
-            fast_sum_payload += payload.len;
+        if (capture.payloadFor(cid)) |payload| {
+            if (payload.len > max_payload) max_payload = payload.len;
             subs_with_payload += 1;
         }
     }
-    const max_payload_per_sec: f64 = @as(f64, @floatFromInt(fast_max_payload)) * fast_window_hz;
-    const max_pct_of_budget: f64 = max_payload_per_sec / budget_bytes_per_sec * 100.0;
+    const max_payload_per_sec: f64 = @as(f64, @floatFromInt(max_payload)) * fast_window_hz;
+    const pct_of_budget: f64 = max_payload_per_sec / budget_bytes_per_sec * 100.0;
 
-    // Pre-batch publishes/sec/sub = N_visible × 60 Hz (one publish per
-    // entity-msg per visible sub). Post-batch = 60 Hz / sub. Use
-    // pushes_total / n_sub_fast as the pre-batch upper bound.
-    const pre_batch_pubs_per_window: f64 = @as(f64, @floatFromInt(pushes_total)) / @as(f64, @floatFromInt(n_sub_fast));
-    const pre_batch_pubs_per_sec: f64 = pre_batch_pubs_per_window * fast_window_hz;
-    const post_batch_pubs_per_sec: f64 = fast_window_hz; // 1 publish per window
-    const framing_pre_kbps: f64 = pre_batch_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
-    const framing_post_kbps: f64 = post_batch_pubs_per_sec * nats_framing_b * 8.0 / 1000.0;
-
-    std.debug.print("\n=== [M6.5] fast-lane batched (hot scenario) ===\n", .{});
-    std.debug.print("100 ents × 50 subs in 200 m, one fast-lane window (60 Hz).\n", .{});
-    std.debug.print("Pushes (sub appends) per window: {d}; subs with batched payload: {d}/{d}; batched publishes: {d}.\n", .{
-        pushes_total, subs_with_payload, n_sub_fast, publishes,
-    });
-    std.debug.print("Per-sub batched payload max: {d} B; per-sec @60Hz: {d:.1} B = {d:.2}% of {d:.0} B/s budget.\n", .{
-        fast_max_payload, max_payload_per_sec, max_pct_of_budget, budget_bytes_per_sec,
-    });
-    std.debug.print("Per-sub publishes/sec: PRE-batch {d:.0}, POST-batch {d:.0} ({d:.1}× fewer NATS msgs).\n", .{
-        pre_batch_pubs_per_sec, post_batch_pubs_per_sec, pre_batch_pubs_per_sec / post_batch_pubs_per_sec,
-    });
-    std.debug.print("NATS PUB framing @ 50 B/msg: PRE-batch {d:.1} kbps/sub, POST-batch {d:.1} kbps/sub ({d:.1}× saving).\n", .{
-        framing_pre_kbps, framing_post_kbps, framing_pre_kbps / framing_post_kbps,
-    });
-
-    // Gate: post-batch payload bytes per sub stay within budget. With
-    // 100 entities × 20 B + 8 B header = 2008 B per window × 60 Hz =
-    // 120.5 KB/s = 96.4 % — tight but inside, and this is the
-    // soft-cap-1.5× extreme. Ports / fights at 200 entities visible
-    // need sub-cell partitioning per docs/08 §2.4a (memory
-    // design_soft_caps_subcell.md).
-    try testing.expect(max_pct_of_budget <= 100.0);
-    // Each sub gets exactly one batched publish per window — no
-    // empty publishes, no per-msg publishes.
-    try testing.expectEqual(@as(usize, 1), publishes / subs_with_payload);
+    return .{
+        .n_ents = n_ents,
+        .n_subs = n_subs,
+        .pushes = pushes,
+        .publishes = publishes,
+        .subs_with_payload = subs_with_payload,
+        .max_payload = max_payload,
+        .max_payload_per_sec = max_payload_per_sec,
+        .pct_of_budget = pct_of_budget,
+    };
 }
