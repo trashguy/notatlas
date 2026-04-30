@@ -43,7 +43,7 @@ const Args = struct {
     tier_yaml_path: []const u8 = "data/tier_distances.yaml",
 };
 
-const Scenario = enum { oneshot, static, churn, @"pose-stream" };
+const Scenario = enum { oneshot, static, churn, @"pose-stream", @"fire-once" };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args = try std.process.argsWithAllocator(allocator);
@@ -108,6 +108,14 @@ const Publisher = struct {
         var subject_buf: [64]u8 = undefined;
         const subject = try std.fmt.bufPrint(&subject_buf, "sim.entity.{d}.state", .{ent_id});
         const buf = try wire.encodeState(self.allocator, msg);
+        defer self.allocator.free(buf);
+        try self.client.publish(subject, buf);
+    }
+
+    fn pubFire(self: *Publisher, weapon_id: u32, msg: wire.FireMsg) !void {
+        var subject_buf: [64]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buf, "sim.entity.{d}.fire", .{weapon_id});
+        const buf = try wire.encodeFire(self.allocator, msg);
         defer self.allocator.free(buf);
         try self.client.publish(subject, buf);
     }
@@ -177,6 +185,7 @@ pub fn main() !void {
         .static => try runStatic(&pubr, args.duration_s),
         .churn => try runChurn(&pubr, args.duration_s),
         .@"pose-stream" => try runPoseStream(&pubr, args.duration_s, args.pose_n_entities, effective_rate),
+        .@"fire-once" => try runFireOnce(&pubr),
     }
 
     // Give the connection a moment to flush before close().
@@ -299,6 +308,52 @@ fn runPoseStream(p: *Publisher, duration_s: u32, n_ents: u32, rate_hz: u32) !voi
         try p.pubDelta(.{ .op = .exit, .id = k + 1, .generation = 0, .x = 0, .y = 0, .z = 0 });
     }
     try p.pubSubscribe(.{ .op = .exit, .client_id = 0xCAFE, .x = 0, .y = 0, .z = 0 });
+}
+
+fn runFireOnce(p: *Publisher) !void {
+    std.debug.print("harness: fire-once — register 3 subscribers near origin, publish 1 fire event from weapon id=42 at origin, hold 1s\n", .{});
+
+    // Three subs spread by distance: 50 m (close_combat), 300 m
+    // (visual), 1000 m (fleet_aggregate). Same shape as the
+    // relayFire unit test — first two should receive the fire,
+    // third shouldn't. cell-mgr's per-tick log will show the
+    // forward count.
+    try p.pubSubscribe(.{ .op = .enter, .client_id = 0x100, .x = 50, .y = 0, .z = 0 });
+    try p.pubSubscribe(.{ .op = .enter, .client_id = 0x101, .x = 300, .y = 0, .z = 0 });
+    try p.pubSubscribe(.{ .op = .enter, .client_id = 0x102, .x = 1000, .y = 0, .z = 0 });
+
+    // Give cell-mgr time to register the subscribers before the
+    // fire fires.
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // Cannonball from origin at 30° elevation in the +x direction.
+    // Charge 1.0 = full muzzle velocity.
+    const fire: wire.FireMsg = .{
+        .generation = 0,
+        .fire_time_s = 1000.0,
+        .mx = 0,
+        .my = 5, // muzzle 5 m above water
+        .mz = 0,
+        // Yaw 0, pitch 30° about z axis: q = (0, 0, sin(15°), cos(15°)).
+        .rx = 0,
+        .ry = 0,
+        .rz = @sin(std.math.pi * 30.0 / 360.0),
+        .rw = @cos(std.math.pi * 30.0 / 360.0),
+        .charge = 1.0,
+        .ammo_muzzle_velocity_mps = 250.0,
+        .ammo_mass_kg = 6.0,
+        .ammo_splash_radius_m = 3.0,
+        .ammo_splash_damage_hp = 50.0,
+    };
+    try p.pubFire(42, fire);
+    std.debug.print("harness: fire-once — published FireMsg on sim.entity.42.fire\n", .{});
+
+    std.Thread.sleep(1 * std.time.ns_per_s);
+
+    // Tear down so cell-mgr's log returns to a quiet state.
+    try p.pubSubscribe(.{ .op = .exit, .client_id = 0x100, .x = 0, .y = 0, .z = 0 });
+    try p.pubSubscribe(.{ .op = .exit, .client_id = 0x101, .x = 0, .y = 0, .z = 0 });
+    try p.pubSubscribe(.{ .op = .exit, .client_id = 0x102, .x = 0, .y = 0, .z = 0 });
 }
 
 fn runChurn(p: *Publisher, duration_s: u32) !void {

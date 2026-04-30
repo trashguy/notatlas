@@ -120,8 +120,13 @@ pub fn main() !void {
     // per-cell aggregate stream; for M-stack we filter by entity-
     // table membership in the relay handler.
     const sub_state = try client.subscribe("sim.entity.*.state", .{});
+    // Fire events per docs/03 §8 — broadcast to subs at visual+
+    // tier from the muzzle. Wildcard subscription pulls all
+    // weapons' fire events; per-fire geometry filter happens in
+    // `Fanout.relayFire`.
+    const sub_fire = try client.subscribe("sim.entity.*.fire", .{});
 
-    std.debug.print("cell-mgr [{d}_{d}]: subscribed to {s}, {s}, {s}, sim.entity.*.state\n", .{ args.cell_x, args.cell_y, delta_subj, sub_subj, unsub_subj });
+    std.debug.print("cell-mgr [{d}_{d}]: subscribed to {s}, {s}, {s}, sim.entity.*.state, sim.entity.*.fire\n", .{ args.cell_x, args.cell_y, delta_subj, sub_subj, unsub_subj });
 
     var state = cm_state.State.init(allocator);
     defer state.deinit();
@@ -131,6 +136,11 @@ pub fn main() !void {
 
     var nats_sink_ctx: NatsSinkCtx = .{ .client = client };
     const sink: fanout_mod.Sink = .{ .ctx = &nats_sink_ctx, .publishFn = NatsSinkCtx.publish };
+    // Separate sink for fire events — routes to `gw.client.<id>.fire`
+    // (vs the cmd subject for state/cluster) so receivers parse the
+    // two streams independently.
+    var nats_fire_sink_ctx: NatsFireSinkCtx = .{ .client = client };
+    const fire_sink: fanout_mod.Sink = .{ .ctx = &nats_fire_sink_ctx, .publishFn = NatsFireSinkCtx.publish };
 
     const start_ns: u64 = @intCast(std.time.nanoTimestamp());
     var last_slow_ns: u64 = start_ns;
@@ -139,6 +149,8 @@ pub fn main() !void {
     var state_msgs_since_log: u64 = 0;
     var fast_pushes_since_log: u64 = 0;
     var fast_publishes_since_log: u64 = 0;
+    var fire_msgs_since_log: u64 = 0;
+    var fire_forwards_since_log: u64 = 0;
 
     while (g_running.load(.acquire)) {
         // 5 ms poll budget keeps the tight-loop floor at ~200 Hz — well
@@ -154,6 +166,9 @@ pub fn main() !void {
         const drained = try drainStateSub(allocator, sub_state, &state, &fanout);
         state_msgs_since_log += drained.msgs;
         fast_pushes_since_log += drained.pushes;
+        const fire_drained = try drainFireSub(allocator, sub_fire, &state, &fanout, fire_sink);
+        fire_msgs_since_log += fire_drained.msgs;
+        fire_forwards_since_log += fire_drained.forwards;
 
         try client.maybeSendPing();
 
@@ -171,14 +186,17 @@ pub fn main() !void {
         if (now_ns -% last_slow_ns >= slow_tick_period_ns) {
             slow_tick_n += 1;
             const slow_publishes = try fanout.runTick(&state, sink);
-            std.debug.print("[cell {d}_{d}] tick {d}: {d} ents, {d} subs, {d} slow-pubs, {d} state-msgs in / {d} pushed / {d} batched-pubs (since prev log)\n", .{
+            std.debug.print("[cell {d}_{d}] tick {d}: {d} ents, {d} subs, {d} slow-pubs, {d} state-msgs in / {d} pushed / {d} batched-pubs, {d} fires in / {d} fire-fwds (since prev log)\n", .{
                 args.cell_x,          args.cell_y,             slow_tick_n,
                 state.entityCount(),  state.subscriberCount(), slow_publishes,
                 state_msgs_since_log, fast_pushes_since_log,   fast_publishes_since_log,
+                fire_msgs_since_log,  fire_forwards_since_log,
             });
             state_msgs_since_log = 0;
             fast_pushes_since_log = 0;
             fast_publishes_since_log = 0;
+            fire_msgs_since_log = 0;
+            fire_forwards_since_log = 0;
             last_slow_ns +%= slow_tick_period_ns;
         }
     }
@@ -197,6 +215,20 @@ const NatsSinkCtx = struct {
         const self: *NatsSinkCtx = @ptrCast(@alignCast(ctx));
         var subject_buf: [fanout_mod.max_subject_len]u8 = undefined;
         const subject = try std.fmt.bufPrint(&subject_buf, "gw.client.{d}.cmd", .{client_id});
+        try self.client.publish(subject, payload);
+    }
+};
+
+/// NATS-backed sink for fire events — writes to `gw.client.<id>.fire`
+/// instead of `.cmd` so receivers parse the event stream
+/// independently of the state-update stream.
+const NatsFireSinkCtx = struct {
+    client: *nats.Client,
+
+    fn publish(ctx: *anyopaque, client_id: u64, payload: []const u8) anyerror!void {
+        const self: *NatsFireSinkCtx = @ptrCast(@alignCast(ctx));
+        var subject_buf: [fanout_mod.max_subject_len]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buf, "gw.client.{d}.fire", .{client_id});
         try self.client.publish(subject, payload);
     }
 };
@@ -261,6 +293,43 @@ fn drainStateSub(
         pushes += try fanout.relayState(state, ent_id, pose, null);
     }
     return .{ .msgs = msgs, .pushes = pushes };
+}
+
+/// Drain `sim.entity.*.fire` msgs and broadcast each to subs at
+/// visual+ tier from the muzzle pose (per docs/03 §8). Per-fire
+/// payload is the raw inbound JSON `wire.FireMsg` — forwarded byte-
+/// for-byte. Unlike state msgs there's no batching: fires are sparse
+/// one-shot events. Returns counters so the per-tick log shows
+/// fire-lane volume.
+const FireDrainCounts = struct { msgs: u64, forwards: u64 };
+
+fn drainFireSub(
+    allocator: std.mem.Allocator,
+    sub: *nats.Subscription,
+    state: *cm_state.State,
+    fanout: *fanout_mod.Fanout,
+    fire_sink: fanout_mod.Sink,
+) !FireDrainCounts {
+    var msgs: u64 = 0;
+    var forwards: u64 = 0;
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        // Decode just enough to extract the muzzle position for
+        // the geometry filter; the full FireMsg JSON forwards
+        // byte-for-byte to receivers.
+        const parsed = wire.decodeFire(allocator, payload) catch |err| {
+            std.debug.print("cell-mgr: bad fire payload ({s}): {s}\n", .{ @errorName(err), payload });
+            continue;
+        };
+        defer parsed.deinit();
+        msgs += 1;
+
+        const muzzle_pos: [3]f32 = .{ parsed.value.mx, parsed.value.my, parsed.value.mz };
+        forwards += try fanout.relayFire(state, muzzle_pos, payload, fire_sink);
+    }
+    return .{ .msgs = msgs, .forwards = forwards };
 }
 
 /// `expected_op` is the op these messages should carry — the subject

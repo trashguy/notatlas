@@ -382,6 +382,49 @@ pub const Fanout = struct {
         return pushes;
     }
 
+    /// Fire-event broadcast per docs/03 §8 / docs/08 §1.3. Forward a
+    /// `FireMsg` JSON payload to every subscriber whose effective
+    /// tier on the muzzle position is ≥ visual. Fires are sparse
+    /// one-shot events — no batching; one publish per visible sub
+    /// per fire, on a separate `gw.client.<id>.fire` subject so
+    /// receivers parse them differently from state-update payloads
+    /// without inspecting payload shape.
+    ///
+    /// Pure geometry filter (same as `relayState`) — receives any
+    /// `sim.entity.*.fire` msg from any weapon, forwards to subs
+    /// whose pose is within visual range of the muzzle. The
+    /// "broadcast" model is deliberate: every observer reconstructs
+    /// the trajectory locally via `notatlas.projectile.predict`; the
+    /// fire event is the only wire cost per shot, regardless of
+    /// trajectory length. 1000 cannonballs in flight cost the same
+    /// as 1.
+    ///
+    /// `payload` is the raw JSON FireMsg bytes from the inbound NATS
+    /// msg — forwarded as-is. Returns the number of forwards made.
+    pub fn relayFire(
+        self: *Fanout,
+        state: *const State,
+        muzzle_pos: [3]f32,
+        payload: []const u8,
+        sink: Sink,
+    ) !usize {
+        var forwards: usize = 0;
+        var sub_it = state.subscribers.iterator();
+        while (sub_it.next()) |sub_entry| {
+            const sub = sub_entry.value_ptr.*;
+            // Same thresholds as relayState — fire events ride on
+            // the visual visibility budget. Future tunable: a
+            // separate "audible range" so distant cannons are heard
+            // but not rendered. Wait for live load to tell us the
+            // tradeoff before splitting the threshold.
+            const tier = replication.effectiveTier(sub, muzzle_pos, null, self.thresholds);
+            if (@intFromEnum(tier) < @intFromEnum(Tier.visual)) continue;
+            try sink.publish(sub.client_id, payload);
+            forwards += 1;
+        }
+        return forwards;
+    }
+
     /// Flush the fast-lane batches accumulated by `relayState` since
     /// the last flush. For each subscriber with non-empty pending,
     /// emits **one** batched payload (header + concatenated records)
@@ -845,6 +888,53 @@ test "fanout: flushBatches batches multiple records into one publish per sub" {
         const off = payload_header_size + rec_i * entity_record_size;
         try testing.expectEqual(rec_i + 1, readRecordId(payload[off..]));
     }
+}
+
+test "fanout: relayFire forwards to visual+ subs only, payload byte-for-byte" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    // Three subs: 50 m (close_combat), 300 m (visual), 1000 m
+    // (fleet_aggregate). Muzzle at origin. The first two should
+    // get the fire forward; the third shouldn't.
+    try applySubscribe(&state, &fanout, 0xAA, 50, 0);
+    try applySubscribe(&state, &fanout, 0xBB, 300, 0);
+    try applySubscribe(&state, &fanout, 0xCC, 1000, 0);
+
+    const fire_payload = "fake-fire-event-json-bytes";
+    const forwards = try fanout.relayFire(&state, .{ 0, 0, 0 }, fire_payload, capture.sink());
+    try testing.expectEqual(@as(usize, 2), forwards);
+
+    // Visible subs got the payload byte-for-byte.
+    const a = capture.payloadFor(0xAA).?;
+    const b = capture.payloadFor(0xBB).?;
+    try testing.expectEqualStrings(fire_payload, a);
+    try testing.expectEqualStrings(fire_payload, b);
+    try testing.expect(capture.payloadFor(0xCC) == null);
+}
+
+test "fanout: relayFire is independent of cell entity table" {
+    // Fire from a weapon NOT in cell-mgr's entity table — same
+    // pure-geometry property as the fast-lane state relay (per
+    // docs/08 §2A.3). Simulates a cross-cell cannon firing whose
+    // muzzle pose lands in a sub's visual range.
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+    var fanout = Fanout.init(testing.allocator, TierThresholds.default);
+    defer fanout.deinit();
+    var capture: CaptureSink = .{ .allocator = testing.allocator };
+    defer capture.deinit();
+
+    try applySubscribe(&state, &fanout, 0xAA, 0, 0);
+    try testing.expectEqual(@as(usize, 0), state.entityCount());
+
+    const forwards = try fanout.relayFire(&state, .{ 100, 0, 0 }, "fire-payload", capture.sink());
+    try testing.expectEqual(@as(usize, 1), forwards);
+    try testing.expect(capture.payloadFor(0xAA) != null);
 }
 
 test "fanout: flushBatches is a no-op when pending is empty" {
