@@ -39,23 +39,21 @@ plus integration with fallen-runes' gateway / ship-sim service decomp.
 |---|---|---|
 | ✓ `6ce6a33` | M6: tier-replication | Synthetic test passes — 100 entities, 50 subscribers, correct tier |
 | ✓ `c2e050d` | M7: pose-compression | 1M roundtrip poses; max <1cm error; ≤16 B wire (codec: `9d00323`; integration: `c2e050d`) |
-| ✓ `97e8049` | M8: deterministic-projectile | 1000 fires; closed-form predict matches Euler-ref within 0.15 m (~3× O(dt) drift). Vacuum ballistic v1; data/ammo/cannonball.yaml; sim.entity.<weapon>.fire wire format; integration with cell-mgr/gateway is a separate step |
-| ✓ (uncommitted) | M9: lag-comp-rollback | 60 Hz rewind buffer; 50 ms / 200 ms ping rewind matches target view to one-tick precision (~8 cm @ 5 m/s); 250 ms cap rejects "shot around corners." Hit-test routine lives at the caller; module is the rewind primitive |
-| ▢ | Integration | ship-sim service spun up; gateway routes; one cell |
-| ▢ | Combat slice | One sloop with cannons, sails, planks, AI sloop opponent |
+| ✓ `97e8049` + `ca57b02` | M8: deterministic-projectile | 1000 fires gate green (~3× O(dt) drift). ship-sim drives cannon FireMsg publishes via InputMsg.fire (1.5 s cooldown, starboard mount); cell-mgr fanout's fire-lane forwards to subs; gateway forwards to TCP with kind=1 frames. End-to-end: press F → cannonball flies. |
+| ✓ `e7d4419` | M9: lag-comp-rollback | 60 Hz rewind buffer; 50 ms / 200 ms ping rewind matches target view to one-tick precision (~8 cm @ 5 m/s); 250 ms cap rejects "shot around corners." Hit-test routine lives at the caller; module is the rewind primitive |
+| ✓ multi-commit 2026-05-01 | Integration | ship-sim service running 60 Hz Jolt+buoyancy multi-ship (`6c3f229`/`d8b884a`); JWT-validated multi-client gateway TCP↔NATS bidirectional (`51af4ee`/`ed76523`/`7b446bf`/`ff3141d`); ship-sim input subscription closes the player-control loop (`16c3701`). One cell; 30 ships verified at M1.5. |
+| ◐ partial | Combat slice | One sloop with cannons (✓ ship-sim cannon fire end-to-end via TCP). Sails (▢ rigging system not yet implemented; thrust force model is a placeholder). Planks / hull damage (▢). AI sloop opponent (▢ — needs `ai-sim` service). Closes when a sloop can sail wind-driven, take damage, and an AI opponent fights back. |
 
 **Milestone 1.5 stress test (gate before Phase 2):** ✓ shipped 2026-05-01
 - 30 boxes in one cell × 50 simulated clients × actual gateway / NATS
-  path → **PASS at 32.1% of the 1 Mbps/client budget** (321.4 kbps,
-  per-conn variance ≈ 0)
+  path → **PASS in BOTH gateway topologies:**
+  - Multi-gateway (50 procs, original verification): 32.1% of 1 Mbps/client (321.4 kbps, variance ≈ 0)
+  - Single-gateway+JWT (1 proc, 50 conns, post `7b446bf`): 17.3% of 1 Mbps/client (172.5 kbps, variance ≈ 0; lower frame rate due to single-threaded gateway loop, headline gate still passes)
 - ship-sim --ships 30 --grid --spacing 30 (worst case: all ships
   inside the 500 m visual tier from every sub at origin)
-- 50 gateway processes, ports 9000..9049 (per-process-per-client
-  workaround until gateway sub-steps 4+5 land JWT + multi-client)
-- Cannonball stream not yet integrated — fire-event lane is built
-  (cell-mgr commit 2e2bb17) but ship-sim doesn't yet drive cannon
-  fire events. With ~3× headroom in the bandwidth budget that's
-  not a blocker.
+- Cannonball stream now also integrated end-to-end (`ca57b02` + `ff3141d`)
+  — F key fires starboard cannon, fire frames return as kind=1 TCP
+  frames. Bandwidth impact negligible (sparse + JSON + small payload).
 - See `docs/research/m1_5-stress.md` for full numbers + caveats.
 
 **End-of-phase deliverable:** 4 friends + you on a sloop, fighting an AI
@@ -68,11 +66,11 @@ spatial-index, env, persistence-writer services.
 
 | Status | Milestone | Deliverable |
 |---|---|---|
-| ◐ skeleton at `30a3806` | Cell-mgr service | Subscribes to entities in its region via spatial index |
-| ▢ | Spatial-index service | Single process, sharded-ready, owns membership deltas |
+| ✓ multi-commit | Cell-mgr service | Skeleton (`30a3806`) → cluster pathway (`47f3e74`) → fast-lane callback relay (`21c0283`) → slow-lane cleanup (`54a2300`) → cross-cell visibility (`60d0241`) → fast-lane batching (`d769f65`) → fire-lane (`2e2bb17`). Subscribes to spatial-index deltas; runs 30 Hz fanout tick + 60 Hz fast-lane batched relay. |
+| ✓ `b08f339` | Spatial-index service | v1 single-process: sim.entity.*.state firehose → idx.spatial.cell.<x>_<z>.delta on cell transitions. Open: idx.spatial.query req/reply, active/standby N=3 HA, aboard-ship gating. |
 | ▢ | Env service | Wind, weather, wave seed, time of day at 5 Hz |
 | ▢ | Persistence-writer service | Sole PG writer, batches change streams |
-| ▢ | Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter |
+| ▢ | Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter (depends on spatial-index aboard-ship gating + ship-sim board/disembark) |
 | ▢ | M10: gpu-driven-instancing | 5000 instances at 60 fps; ≤20 draw calls |
 | ▢ | M11: structure-lod-merge | 500-piece anchorage merges <100 ms; far-LOD = 1 draw |
 | ▢ | M12: animation-lod | 200 animated chars at varied distance; CPU ≤2 ms |
@@ -162,7 +160,7 @@ Driven by playtest data and player demand. Possible additions:
 | ✓ verified 2026-04-28 (`93c0ae0`) | M3 stable for 5 min | Phase 0 | Buoyancy doesn't diverge |
 | ✓ verified 2026-04-28 (`d1f4976`) | M5 multi-player | Phase 0 | Ship-as-vehicle works for >1 player |
 | ✓ verified 2026-04-29 (`6ce6a33`) | M6 phase gate (synthetic + BW) | Phase 1 | 100×50 fanout correct + ≤1 Mbps slow-lane budget held |
-| ✓ verified 2026-05-01 | Milestone 1.5 (live load) | Phase 1 → 2 | 50 conns × 30 ships × actual gateway/NATS path → 32.1% of 1 Mbps/client budget |
+| ✓ verified 2026-05-01 | Milestone 1.5 (live load) | Phase 1 → 2 | 50 conns × 30 ships × actual gateway/NATS path → multi-gateway 32.1%, single-gateway+JWT 17.3% of 1 Mbps/client budget |
 | ▢ | Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
 | ▢ | Closed playtest | Phase 4 | The loop is actually fun |
 
