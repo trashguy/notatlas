@@ -1,20 +1,36 @@
 //! ship-sim — 60 Hz rigid-body authority for ships AND free-agent
 //! players per docs/08 §2A.
 //!
-//! Sub-step 3 scope: multi-ship via ECS-style entity table. State.zig
-//! now owns per-entity Jolt body + cached publish subject; main.zig
-//! spawns N ships at startup (default 5, override with `--ships N`)
-//! spread along +X so they're all in one cell and visible from any
-//! subscriber. Per tick: walk entities, apply buoyancy forces;
-//! `phys.step(1/60, 1)` once advances ALL bodies; walk entities again
-//! to read pose and publish per-entity state msgs.
+//! Sub-step 4 scope: input subscription. Wildcard NATS sub on
+//! `sim.entity.*.input` consumes the gateway's TCP→NATS publish
+//! path; per-tick the latched-most-recent input for each ship is
+//! applied as forces before buoyancy + the system step. Closes the
+//! end-to-end player-control loop: a length-prefixed JSON `InputMsg`
+//! frame from a TCP client moves a ship on the wave.
 //!
-//! This is the lever that lets us actually exercise the soft-cap
-//! (200/cell) — every gateway/cell-mgr metric was stuck at "1 entity
-//! per fast-lane msg" before.
+//! Force model:
+//!   - thrust: force along ship-forward (rotated −Z), magnitude
+//!     `thrust × THRUST_MAX_N`. Equilibrium speed against buoyancy
+//!     drag is reached in a few seconds.
+//!   - steer: lateral force at the bow point (forward × half-extent.z),
+//!     magnitude `steer × STEER_MAX_N`. Generates a yaw torque
+//!     plus a small lateral thrust — the latter is realistic-ish
+//!     "skidding into a turn" behaviour for a flat-bottomed box hull.
+//!
+//! Force application order: input forces first → buoyancy → phys.step.
+//! Buoyancy adds drag proportional to point velocity, so lateral skid
+//! gets damped naturally.
+//!
+//! Sub-step 3 scope (still): multi-ship via ECS-style entity table.
+//! State.zig owns per-entity Jolt body + cached publish subject;
+//! main.zig spawns N ships at startup (default 5, override with
+//! `--ships N`) spread along +X so they're all in one cell and
+//! visible from any subscriber. Per tick: walk entities, apply
+//! input + buoyancy forces; `phys.step(1/60, 1)` once advances ALL
+//! bodies; walk entities again to read pose and publish per-entity
+//! state msgs.
 //!
 //! Subsequent sub-steps:
-//!   4. Player input subscription on `sim.entity.<player_id>.input`.
 //!   5. Board / disembark transitions (M5.3 SoT pattern).
 //!   6. Free-agent player capsule controller + water sampling.
 //!
@@ -42,6 +58,25 @@ const phys_dt_fixed: f32 = 1.0 / 60.0;
 /// ships register on the gateway's per-second tally.
 const ship_spacing_m: f32 = 60.0;
 const ship_spawn_y: f32 = 4.0;
+
+/// Force tuning for `thrust = ±1.0`. 60 kN against a 15 t hull is
+/// 4 m/s² peak acceleration — equilibrium speed against the
+/// buoyancy drag at 8 sample points × ~15 kN/(m/s) per point lands
+/// in the 4-6 m/s range (a few hundred m of travel per minute,
+/// realistic-ish naval feel for v0). Tune in `data/ships/box.yaml`
+/// once the input loop drives a real ship config and not the M3
+/// box.
+const thrust_max_n: f32 = 60_000.0;
+/// Steer applies a lateral force at the bow → torque around +y.
+/// 30 kN at the bow (~3 m forward) gives 90 kN·m torque on a hull
+/// with rough rotational inertia ~30,000 kg·m² → 3 rad/s² peak —
+/// turns from rest to a 90° heading in ~1 s of sustained input,
+/// which feels responsive without being twitchy.
+const steer_max_n: f32 = 30_000.0;
+/// Local-frame ship forward direction. Convention: −Z is forward
+/// (matches the sandbox's M5.3 player composition where bow is
+/// toward −Z when yaw=0).
+const ship_forward_local: notatlas.math.Vec3 = .{ .x = 0, .y = 0, .z = -1 };
 
 /// YAML inputs — ship-sim must agree with the sandbox on hull + wave
 /// kernel until the spawn protocol carries them on the wire. Ran from
@@ -221,7 +256,16 @@ pub fn main() !void {
     });
     defer client.close();
 
-    std.debug.print("ship-sim [{s}]: connected; tick rate 60 Hz\n", .{args.shard});
+    // Wildcard subscribe — ship-sim doesn't know which entity ids
+    // it owns until spawn, and gateway-driven inputs may target any
+    // of them by id. Per-tick we drain pending input msgs, parse
+    // the entity id out of the subject, and update the matching
+    // entity's latched input. Unknown ids are ignored.
+    const sub_input = try client.subscribe("sim.entity.*.input", .{});
+    std.debug.print(
+        "ship-sim [{s}]: connected; tick rate 60 Hz; subscribed to sim.entity.*.input\n",
+        .{args.shard},
+    );
 
     var state = sim_state.State.init(allocator);
     defer state.deinit(&phys);
@@ -254,10 +298,16 @@ pub fn main() !void {
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
 
+        // Drain inbound input msgs into the latched-input slot of
+        // their matching entity. Done outside the tick to keep the
+        // tick body deterministic — between two ticks we apply
+        // whatever's the most recent input we've seen.
+        try drainInputSub(allocator, sub_input, &state);
+
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, &phys, &buoy, wave_params, phys_t);
+            try tick(allocator, client, &state, &phys, &buoy, wave_params, phys_t, hull.half_extents);
             tick_n += 1;
             phys_t += phys_dt_fixed;
             last_tick_ns +%= tick_period_ns;
@@ -287,9 +337,81 @@ pub fn main() !void {
     std.debug.print("ship-sim [{s}]: shutting down at tick {d}\n", .{ args.shard, tick_n });
 }
 
-/// Per-tick work — sub-step 3: buoyancy forces accumulated per
-/// entity, single system-wide `phys.step` integrates all bodies,
-/// then per-entity pose readback + state publish.
+/// Drain pending `sim.entity.*.input` msgs and update latched input
+/// on the matching entities. Unknown / missing entity ids are
+/// silently dropped — gateway hasn't been informed of the spawn set
+/// (no spawn protocol yet), so spurious inputs are expected.
+fn drainInputSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    state: *sim_state.State,
+) !void {
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const ent_id = wire.parseEntityIdFromInputSubject(owned.subject) catch continue;
+        const e = state.entities.getPtr(ent_id) orelse continue;
+        const parsed = wire.decodeInput(allocator, payload) catch continue;
+        defer parsed.deinit();
+        e.input = .{
+            .thrust = std.math.clamp(parsed.value.thrust, -1.0, 1.0),
+            .steer = std.math.clamp(parsed.value.steer, -1.0, 1.0),
+        };
+    }
+}
+
+/// Apply latched input as forces on `e`'s Jolt body before
+/// buoyancy + integration. Thrust = force along ship-forward at the
+/// body center (no torque). Steer = lateral force at the bow point
+/// (forward × half_extent.z) → yaw torque + small lateral skid.
+fn applyInputForces(
+    phys: *physics.System,
+    e: *const sim_state.Entity,
+    half_extents: [3]f32,
+) void {
+    if (e.input.thrust == 0 and e.input.steer == 0) return;
+    const pos = phys.getPosition(e.body_id) orelse return;
+    const rot = phys.getRotation(e.body_id) orelse return;
+
+    const forward_world = notatlas.math.Vec3.rotateByQuat(ship_forward_local, rot);
+    const center: [3]f32 = .{ pos[0], pos[1], pos[2] };
+
+    if (e.input.thrust != 0) {
+        const f = thrust_max_n * e.input.thrust;
+        const force: [3]f32 = .{
+            forward_world.x * f,
+            forward_world.y * f,
+            forward_world.z * f,
+        };
+        phys.addForceAtPoint(e.body_id, force, center);
+    }
+
+    if (e.input.steer != 0) {
+        // Lateral = forward × +y (right-hand rule gives ship's
+        // local +X = "starboard" as +steer direction).
+        const up: notatlas.math.Vec3 = .{ .x = 0, .y = 1, .z = 0 };
+        const lateral = notatlas.math.Vec3.cross(forward_world, up);
+        const f = steer_max_n * e.input.steer;
+        const force: [3]f32 = .{
+            lateral.x * f,
+            lateral.y * f,
+            lateral.z * f,
+        };
+        // Apply at the bow: center + forward × half_extent.z.
+        const bow_offset_m = half_extents[2];
+        const bow: [3]f32 = .{
+            pos[0] + forward_world.x * bow_offset_m,
+            pos[1] + forward_world.y * bow_offset_m,
+            pos[2] + forward_world.z * bow_offset_m,
+        };
+        phys.addForceAtPoint(e.body_id, force, bow);
+    }
+}
+
+/// Per-tick work — sub-step 4: input forces → buoyancy → single
+/// system-wide `phys.step` → per-entity pose readback + state
+/// publish.
 ///
 /// `phys_t` is the simulation clock at tick start (advances by
 /// exactly `phys_dt_fixed` each tick); buoyancy reads the wave kernel
@@ -303,7 +425,14 @@ fn tick(
     buoy: *const physics.Buoyancy,
     wave_params: notatlas.wave_query.WaveParams,
     phys_t: f32,
+    hull_half_extents: [3]f32,
 ) !void {
+    // Input forces first, then buoyancy. Order doesn't physically
+    // matter — Jolt sums all forces between steps — but reads as
+    // "what the player wants → what the water does → integrate."
+    var input_it = state.entities.valueIterator();
+    while (input_it.next()) |e| applyInputForces(phys, e, hull_half_extents);
+
     // Apply buoyancy + drag to every entity before stepping. Forces
     // accumulate inside Jolt and integrate in the single step call
     // that follows.

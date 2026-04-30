@@ -28,17 +28,29 @@ const Pose = pose_codec.Pose;
 /// `sim.entity.<id>.state` at the tier-1 visual rate (60 Hz).
 pub const Kind = enum { ship, free_agent };
 
+/// Latched input state — most recent (thrust, steer) values from
+/// `sim.entity.<id>.input`. Re-applied every tick until a newer
+/// input msg overwrites it; defaults to zero so a ship with no
+/// connected client just bobs in place.
+pub const LatchedInput = struct {
+    thrust: f32 = 0,
+    steer: f32 = 0,
+};
+
 /// One authoritative entity owned by this ship-sim. Sub-step 3:
 /// `body_id` is the Jolt handle for the rigid body; `state_subj`
 /// is the pre-formatted `sim.entity.<id>.state` subject the tick
-/// loop publishes to. Both are owned by this table — `deinit`
-/// destroys the body and frees the subject.
+/// loop publishes to. Sub-step 4: `input` carries the latched-most-
+/// recent thrust/steer the tick loop applies before stepping.
+/// All resources owned by this table — `deinit` destroys the body
+/// and frees the subject.
 pub const Entity = struct {
     id: EntityId,
     kind: Kind,
     pose: Pose,
     body_id: physics.BodyId,
     state_subj: []const u8,
+    input: LatchedInput = .{},
 
     pub fn deinit(
         self: *Entity,

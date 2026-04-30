@@ -118,6 +118,46 @@ pub fn parseEntityIdFromSubject(subject: []const u8) !u32 {
     return std.fmt.parseInt(u32, id_str, 10);
 }
 
+/// `sim.entity.<id>.input` payload — published by gateway from
+/// length-prefixed TCP frames (gateway sub-step 3) and consumed by
+/// ship-sim (sub-step 4) to drive the matching ship's Jolt body.
+///
+/// Sub-step 4 scope is thrust + steer for a ship; future sub-steps
+/// add fire / aim / sail-trim / use-action. Keep this struct minimal
+/// and additive — JSON ignores unknown fields, so a Phase 2 client
+/// sending newer fields against an older ship-sim is graceful.
+pub const InputMsg = struct {
+    /// Forward thrust in [-1, 1]. Positive = forward (ship-local
+    /// −Z), negative = reverse. Maps to a force along the ship's
+    /// world-frame forward direction.
+    thrust: f32 = 0,
+    /// Steer in [-1, 1]. Positive = right turn (yaw clockwise from
+    /// above), negative = left. Maps to a lateral force applied at
+    /// the bow → torque around +y.
+    steer: f32 = 0,
+};
+
+pub fn encodeInput(allocator: std.mem.Allocator, msg: InputMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeInput(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(InputMsg) {
+    return std.json.parseFromSlice(InputMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the entity id encoded in `sim.entity.<id>.input`. Same
+/// shape as `parseEntityIdFromSubject` but for the `.input` suffix.
+pub fn parseEntityIdFromInputSubject(subject: []const u8) !u32 {
+    const prefix = "sim.entity.";
+    const suffix = ".input";
+    if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
+    const id_str = subject[prefix.len .. subject.len - suffix.len];
+    if (id_str.len == 0) return error.BadSubject;
+    return std.fmt.parseInt(u32, id_str, 10);
+}
+
 /// `sim.entity.<weapon_id>.fire` payload — broadcast at the moment
 /// of firing per docs/03 §8. Both client and server reconstruct the
 /// trajectory locally via `notatlas.projectile.predict`. Wire shape
@@ -250,6 +290,32 @@ test "wire: parseWeaponIdFromFireSubject" {
     try testing.expectEqual(@as(u32, 42), try parseWeaponIdFromFireSubject("sim.entity.42.fire"));
     try testing.expectError(error.BadSubject, parseWeaponIdFromFireSubject("sim.entity.42.state"));
     try testing.expectError(error.BadSubject, parseWeaponIdFromFireSubject("sim.entity..fire"));
+}
+
+test "wire: input roundtrip" {
+    const orig: InputMsg = .{ .thrust = 0.85, .steer = -0.30 };
+    const buf = try encodeInput(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeInput(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig.thrust, parsed.value.thrust);
+    try testing.expectEqual(orig.steer, parsed.value.steer);
+}
+
+test "wire: parseEntityIdFromInputSubject" {
+    try testing.expectEqual(@as(u32, 42), try parseEntityIdFromInputSubject("sim.entity.42.input"));
+    try testing.expectEqual(@as(u32, 1), try parseEntityIdFromInputSubject("sim.entity.1.input"));
+    try testing.expectError(error.BadSubject, parseEntityIdFromInputSubject("sim.entity.42.state"));
+    try testing.expectError(error.BadSubject, parseEntityIdFromInputSubject("sim.entity..input"));
+}
+
+test "wire: input ignores unknown fields (forward-compat)" {
+    // A future client sends fire + aim alongside thrust/steer; older
+    // ship-sim should still parse the thrust/steer fields cleanly.
+    const future = "{\"thrust\":0.5,\"steer\":0,\"fire\":true,\"aim_pitch\":0.2}";
+    const parsed = try decodeInput(testing.allocator, future);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(f32, 0.5), parsed.value.thrust);
 }
 
 test "wire: subscribe roundtrip with boarded ship" {
