@@ -143,6 +143,13 @@ const ship_forward_local: notatlas.math.Vec3 = .{ .x = 0, .y = 0, .z = -1 };
 /// directly (FireEvent convention: muzzle direction = rotateX(rot)).
 const cannon_cooldown_s: f64 = 1.5;
 const cannon_offset_y: f32 = 1.0;
+/// Engagement-range budget for the server-side aim-pitch solver in
+/// `fireCannon`. Targets within this horizontal range get pitch
+/// compensation; out-of-range or no-target → horizontal fire (the
+/// pre-pitch-compensation behavior). Match-or-exceed the AI's
+/// `cannon_range_m` in `data/ai/pirate_sloop.lua` so AI fires are
+/// never out-of-range from the solver's perspective.
+const cannon_range_m: f32 = 200.0;
 const ammo_config_path = "data/ammo/cannonball.yaml";
 
 /// v0 sloop hull HP. Cannonball direct hits are 50 HP per
@@ -712,17 +719,75 @@ fn fireCannon(
     const pos = phys.getPosition(e.body_id) orelse return;
     const rot = phys.getRotation(e.body_id) orelse return;
 
+    // Strip pitch/roll from the ship's rotation. Cannons are gimbal-
+    // mounted at the gunport (gameplay assumption — real square-rig
+    // cannons heeled with the ship and were duly inaccurate, but
+    // forcing the AI to learn wave-pitch lead would be a deep skill
+    // tax for v0). Yaw-only basis means muzzle position + firing
+    // direction don't tilt with the swell — predictable arc per shot.
+    const yaw = yawFromQuat(rot);
+    const yaw_quat = notatlas.math.quatYaw(yaw);
+
     const local_offset: notatlas.math.Vec3 = .{
         .x = hull_half_extents[0],
         .y = cannon_offset_y,
         .z = 0,
     };
-    const world_offset = notatlas.math.Vec3.rotateByQuat(local_offset, rot);
+    const world_offset = notatlas.math.Vec3.rotateByQuat(local_offset, yaw_quat);
     const muzzle_pos: [3]f32 = .{
         pos[0] + world_offset.x,
         pos[1] + world_offset.y,
         pos[2] + world_offset.z,
     };
+
+    // Pitch compensation. Even with yaw-only fire the muzzle still
+    // bobs ±8 m on swell, and a horizontal shot from a wave crest
+    // sails over a sea-level target. Find the nearest enemy ship in
+    // cannon range and solve the closed-form vacuum-ballistic arc:
+    //   tan(θ_p) = (R ± √(R² − 4a(a − h))) / (2a)
+    // where a = g·R² / (2v²), R = horizontal range, h = muzzle.y −
+    // target.y, v = muzzle velocity. Take the low-arc (direct-fire)
+    // root. If no target in range or D<0 (out of reach), fall back
+    // to a horizontal shot.
+    var pitch_rad: f32 = 0;
+    {
+        var nearest_d2: f32 = cannon_range_m * cannon_range_m;
+        var nearest_target_y: f32 = 0;
+        var nearest_id: ?u32 = null;
+        var it = state.entities.iterator();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.* == e.id.id) continue;
+            if (kv.value_ptr.kind != .ship) continue;
+            const tp = phys.getPosition(kv.value_ptr.body_id) orelse continue;
+            const dx = tp[0] - muzzle_pos[0];
+            const dz = tp[2] - muzzle_pos[2];
+            const d2 = dx * dx + dz * dz;
+            if (d2 < nearest_d2) {
+                nearest_d2 = d2;
+                nearest_target_y = tp[1];
+                nearest_id = kv.key_ptr.*;
+            }
+        }
+        if (nearest_id != null) {
+            const range_m = @sqrt(nearest_d2);
+            const h = muzzle_pos[1] - nearest_target_y;
+            const v = ammo.muzzle_velocity_mps;
+            const a_coef = (notatlas.projectile.g_mps2 * range_m * range_m) / (2.0 * v * v);
+            const disc = range_m * range_m - 4.0 * a_coef * (a_coef - h);
+            if (disc >= 0) {
+                const x_lo = (range_m - @sqrt(disc)) / (2.0 * a_coef);
+                pitch_rad = std.math.atan(x_lo);
+            }
+        }
+    }
+
+    // aim_quat = yaw · pitch — apply pitch in ship-local frame
+    // first (around local +Z, the aft axis), then yaw to world.
+    // rotateX(aim_quat) gives the world-frame muzzle direction the
+    // FireEvent + projectile module use.
+    const half_p = pitch_rad * 0.5;
+    const pitch_quat: [4]f32 = .{ 0, 0, @sin(half_p), @cos(half_p) };
+    const aim_quat = notatlas.math.quatMul(yaw_quat, pitch_quat);
 
     const msg: wire.FireMsg = .{
         .generation = e.id.generation,
@@ -730,10 +795,10 @@ fn fireCannon(
         .mx = muzzle_pos[0],
         .my = muzzle_pos[1],
         .mz = muzzle_pos[2],
-        .rx = rot[0],
-        .ry = rot[1],
-        .rz = rot[2],
-        .rw = rot[3],
+        .rx = aim_quat[0],
+        .ry = aim_quat[1],
+        .rz = aim_quat[2],
+        .rw = aim_quat[3],
         .charge = 1.0,
         .ammo_muzzle_velocity_mps = ammo.muzzle_velocity_mps,
         .ammo_mass_kg = ammo.mass_kg,
@@ -750,7 +815,7 @@ fn fireCannon(
         .weapon_id = e.id.id,
         .fire_time_s = world_time_s,
         .muzzle_pos = muzzle_pos,
-        .muzzle_rot = rot,
+        .muzzle_rot = aim_quat,
         .charge = 1.0,
         .ammo_muzzle_velocity_mps = ammo.muzzle_velocity_mps,
         .ammo_mass_kg = ammo.mass_kg,
