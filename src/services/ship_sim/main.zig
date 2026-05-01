@@ -165,6 +165,8 @@ const projectile_hit_padding_m: f32 = 1.0;
 const hull_config_path = "data/ships/box.yaml";
 const wave_config_path = "data/waves/storm.yaml";
 
+const ShipLayout = enum { line, grid, circle };
+
 const Args = struct {
     /// Shard identifier — for now just a tag in log lines so multiple
     /// ship-sim instances are distinguishable. Sharding by
@@ -177,17 +179,21 @@ const Args = struct {
     /// we hardcode-spawn so the chain has actual N>1 traffic to
     /// stress.
     ships: u32 = 5,
-    /// Ship-to-ship spacing in m. With `--grid` ships are laid out
-    /// in a square grid centered at origin; otherwise a +X line
-    /// starting at x=0. Defaults to 60 m (line) — tighten for
-    /// stress tests where you want all ships inside one sub's
-    /// visual tier.
+    /// Ship-to-ship spacing in m. Interpreted per layout:
+    ///   - line:   step along +X between consecutive ships
+    ///   - grid:   step along both +X and +Z in the square grid
+    ///   - circle: chord distance between adjacent ships on the ring
+    ///             (radius is derived: `spacing / (2·sin(π/N))`)
+    /// Defaults to 60 m. Tighten for stress tests where you want
+    /// all ships inside one sub's visual tier.
     spacing_m: f32 = default_ship_spacing_m,
-    /// Square grid layout instead of a line. Useful when N is large
-    /// enough that a line would push outer ships outside any
-    /// subscriber's visual tier — a grid keeps everyone clustered
-    /// near origin.
-    grid: bool = false,
+    /// Spawn arrangement. `line` is the historical default and what
+    /// M1.5 stress + drive_ship.sh assume. `circle` puts ships on a
+    /// ring around origin so every ship can broadside any other —
+    /// good for naval-combat tests where line layout's ±π aim
+    /// degeneracy bites the AI. `grid` keeps everyone clustered
+    /// near origin (useful when N is large).
+    layout: ShipLayout = .line,
     /// Number of free-agent player capsules to spawn. v1 demo: 1.
     /// Each capsule gets a per-kind-tagged id of
     /// `EntityKind.player | (i+1)` so it doesn't collide with the
@@ -201,6 +207,11 @@ const Args = struct {
     wind_dir_rad: f32 = default_wind_dir_rad,
     /// Hardcoded wind speed (m/s). Override via `--wind-speed <mps>`.
     wind_speed_mps: f32 = default_wind_speed_mps,
+    /// Per-ship max HP at spawn. Override for soaks where you want
+    /// to harvest a lot of damage events without ships sinking out
+    /// of the test (`--ship-max-hp 9999` is effectively immortal).
+    /// Phase 2 lifts max HP into per-hull YAML config alongside mass.
+    ship_max_hp: f32 = sloop_max_hp,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -230,7 +241,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--spacing")) {
             out.spacing_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
         } else if (std.mem.eql(u8, a, "--grid")) {
-            out.grid = true;
+            // Backward-compat alias for --layout grid.
+            out.layout = .grid;
+        } else if (std.mem.eql(u8, a, "--layout")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.layout = std.meta.stringToEnum(ShipLayout, v) orelse {
+                std.debug.print("ship-sim: bad --layout '{s}' (line|grid|circle)\n", .{v});
+                return error.BadArg;
+            };
         } else if (std.mem.eql(u8, a, "--players")) {
             out.players = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--wind-dir")) {
@@ -238,6 +256,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wind-speed")) {
             out.wind_speed_mps = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
             if (out.wind_speed_mps < 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--ship-max-hp")) {
+            out.ship_max_hp = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+            if (out.ship_max_hp <= 0) return error.BadArg;
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -313,6 +334,7 @@ fn spawnShip(
     hull: notatlas.hull_params.HullParams,
     id: u32,
     spawn_pos: [3]f32,
+    max_hp: f32,
 ) !void {
     const body = try phys.createBox(.{
         .half_extents = hull.half_extents,
@@ -335,8 +357,8 @@ fn spawnShip(
         },
         .body_id = body,
         .state_subj = subj,
-        .hp_current = sloop_max_hp,
-        .hp_max = sloop_max_hp,
+        .hp_current = max_hp,
+        .hp_max = max_hp,
     });
 }
 
@@ -455,39 +477,65 @@ pub fn main() !void {
     var state = sim_state.State.init(allocator);
     defer state.deinit(&phys);
 
-    // Spawn N ships. Line layout = (i × spacing, y, 0); grid layout
-    // = ceil(sqrt(N))-wide square grid centered at origin. Ship ids
-    // carry the EntityKind.ship top-byte tag — matched by the input
-    // router and spatial-index when routing by kind.
+    // Spawn N ships. Layout drives placement; ship ids carry the
+    // EntityKind.ship top-byte tag — matched by the input router
+    // and spatial-index when routing by kind.
     const ship_kind = notatlas.entity_kind.Kind.ship;
-    if (args.grid) {
-        const cols: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(args.ships)))));
-        const half_extent: f32 = @as(f32, @floatFromInt(cols - 1)) * 0.5 * args.spacing_m;
-        var i: u32 = 0;
-        while (i < args.ships) : (i += 1) {
-            const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
-            const col = i % cols;
-            const row = i / cols;
-            const x: f32 = @as(f32, @floatFromInt(col)) * args.spacing_m - half_extent;
-            const z: f32 = @as(f32, @floatFromInt(row)) * args.spacing_m - half_extent;
-            const pos: [3]f32 = .{ x, ship_spawn_y, z };
-            try spawnShip(allocator, &state, &phys, hull, id, pos);
-        }
-        std.debug.print(
-            "ship-sim [{s}]: spawned {d} ships in {d}-col grid, spacing {d:.0} m, half-extent {d:.0} m\n",
-            .{ args.shard, args.ships, cols, args.spacing_m, half_extent },
-        );
-    } else {
-        var i: u32 = 0;
-        while (i < args.ships) : (i += 1) {
-            const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
-            const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * args.spacing_m, ship_spawn_y, 0 };
-            try spawnShip(allocator, &state, &phys, hull, id, pos);
-        }
-        std.debug.print(
-            "ship-sim [{s}]: spawned {d} ships in line at x=[0..{d:.0}] m, spacing {d:.0} m\n",
-            .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * args.spacing_m, args.spacing_m },
-        );
+    switch (args.layout) {
+        .grid => {
+            const cols: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(args.ships)))));
+            const half_extent: f32 = @as(f32, @floatFromInt(cols - 1)) * 0.5 * args.spacing_m;
+            var i: u32 = 0;
+            while (i < args.ships) : (i += 1) {
+                const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
+                const col = i % cols;
+                const row = i / cols;
+                const x: f32 = @as(f32, @floatFromInt(col)) * args.spacing_m - half_extent;
+                const z: f32 = @as(f32, @floatFromInt(row)) * args.spacing_m - half_extent;
+                const pos: [3]f32 = .{ x, ship_spawn_y, z };
+                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+            }
+            std.debug.print(
+                "ship-sim [{s}]: spawned {d} ships in {d}-col grid, spacing {d:.0} m, half-extent {d:.0} m\n",
+                .{ args.shard, args.ships, cols, args.spacing_m, half_extent },
+            );
+        },
+        .circle => {
+            // Chord-spacing model: --spacing is the gap between
+            // neighbours on the ring. Radius = chord / (2·sin(π/N)).
+            // For N=1 we degenerate to "ship at origin" (radius 0)
+            // and skip the divide.
+            const n_f: f32 = @floatFromInt(args.ships);
+            const radius: f32 = if (args.ships <= 1)
+                0
+            else
+                args.spacing_m / (2.0 * std.math.sin(std.math.pi / n_f));
+            var i: u32 = 0;
+            while (i < args.ships) : (i += 1) {
+                const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
+                const angle: f32 = 2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / n_f;
+                const x: f32 = radius * std.math.cos(angle);
+                const z: f32 = radius * std.math.sin(angle);
+                const pos: [3]f32 = .{ x, ship_spawn_y, z };
+                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+            }
+            std.debug.print(
+                "ship-sim [{s}]: spawned {d} ships on circle radius {d:.0} m, chord spacing {d:.0} m\n",
+                .{ args.shard, args.ships, radius, args.spacing_m },
+            );
+        },
+        .line => {
+            var i: u32 = 0;
+            while (i < args.ships) : (i += 1) {
+                const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
+                const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * args.spacing_m, ship_spawn_y, 0 };
+                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+            }
+            std.debug.print(
+                "ship-sim [{s}]: spawned {d} ships in line at x=[0..{d:.0}] m, spacing {d:.0} m\n",
+                .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * args.spacing_m, args.spacing_m },
+            );
+        },
     }
 
     // Spawn N free-agent player capsules. Each gets a tagged id
