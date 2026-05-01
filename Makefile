@@ -1,6 +1,8 @@
 .PHONY: all build run test test-release release fmt fmt-check clean help \
         setup-windows build-windows build-windows-debug \
-        nats-up nats-down nats-logs cell-mgr cell-mgr-harness ship-sim gateway
+        nats-up nats-down nats-logs pg-up pg-down pg-logs pg-psql \
+        services-up services-down \
+        cell-mgr cell-mgr-harness ship-sim gateway
 
 all: build
 
@@ -55,7 +57,7 @@ build-windows-debug:
 
 PODMAN ?= podman
 NATS_NAME ?= notatlas-nats
-NATS_IMAGE ?= docker.io/nats:2.10
+NATS_IMAGE ?= docker.io/nats:2.14
 NATS_VOLUME ?= notatlas_nats_data
 
 nats-up:
@@ -76,6 +78,44 @@ nats-down:
 
 nats-logs:
 	$(PODMAN) logs -f $(NATS_NAME)
+
+# Postgres dev instance — sole writer is persistence-writer per locked
+# architecture decision 5. Schema in infra/db/init.sql is auto-applied
+# on first start (when the named volume is empty).
+PG_NAME ?= notatlas-pg
+PG_IMAGE ?= docker.io/postgres:16-alpine
+PG_VOLUME ?= notatlas_pg_data
+PG_USER ?= notatlas
+PG_PASS ?= notatlas
+PG_DB ?= notatlas
+
+pg-up:
+	@$(PODMAN) container exists $(PG_NAME) && \
+	    $(PODMAN) start $(PG_NAME) >/dev/null || \
+	    $(PODMAN) run -d --name $(PG_NAME) \
+	        --network host \
+	        -e POSTGRES_USER=$(PG_USER) \
+	        -e POSTGRES_PASSWORD=$(PG_PASS) \
+	        -e POSTGRES_DB=$(PG_DB) \
+	        -v $(PG_VOLUME):/var/lib/postgresql/data \
+	        -v $(CURDIR)/infra/db/init.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro \
+	        $(PG_IMAGE)
+	@echo "postgres listening on 127.0.0.1:5432 (user=$(PG_USER) db=$(PG_DB))"
+
+pg-down:
+	-@$(PODMAN) stop $(PG_NAME) >/dev/null 2>&1
+	-@$(PODMAN) rm $(PG_NAME) >/dev/null 2>&1
+	@echo "postgres stopped"
+
+pg-logs:
+	$(PODMAN) logs -f $(PG_NAME)
+
+pg-psql:
+	$(PODMAN) exec -it $(PG_NAME) psql -U $(PG_USER) -d $(PG_DB)
+
+services-up: nats-up pg-up
+
+services-down: nats-down pg-down
 
 cell-mgr:
 	zig build cell-mgr -- $(ARGS)
@@ -104,6 +144,12 @@ help:
 	@echo "make nats-up             — start dev nats-server in podman"
 	@echo "make nats-down           — stop the dev nats-server"
 	@echo "make nats-logs           — tail the dev nats-server logs"
+	@echo "make pg-up               — start dev postgres in podman"
+	@echo "make pg-down             — stop the dev postgres"
+	@echo "make pg-logs             — tail the dev postgres logs"
+	@echo "make pg-psql             — open psql shell in the dev postgres"
+	@echo "make services-up         — start nats + postgres"
+	@echo "make services-down       — stop nats + postgres"
 	@echo "make cell-mgr            — run cell-mgr (pass args via ARGS=...)"
 	@echo "make cell-mgr-harness    — run cell-mgr-harness (pass args via ARGS=...)"
 	@echo "make ship-sim            — run ship-sim (pass args via ARGS=...)"

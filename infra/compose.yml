@@ -1,19 +1,18 @@
-# Dev NATS broker for notatlas services. Run via:
-#   make nats-up        # podman compose -f infra/compose.yml up -d
-#   make nats-down
-#   make nats-logs
+# Dev infrastructure for notatlas services. Run via:
+#   make nats-up    / make nats-down    / make nats-logs
+#   make pg-up      / make pg-down      / make pg-logs
+#   make services-up  (brings up both)
 #
-# Single-node, JetStream enabled, host port 4222 (client) + 8222 (monitor).
-# Standalone — sharing a NATS cluster with fallen-runes is forbidden per
-# docs/08 §4. The service mesh prefix split (sim/env/idx/gw/admin/chat
-# vs fallen-runes' fr.*) makes wildcard subscriptions collide opaquely.
+# Single-node NATS (JetStream on host port 4222 / monitor 8222) and
+# single-node Postgres (host port 5432). Both standalone — sharing
+# infrastructure with fallen-runes is forbidden per docs/08 §4.
 #
-# JetStream storage is in a named volume so streams survive container
-# restarts during dev iteration. Wipe with `podman volume rm
-# notatlas_nats_data` if you want a clean slate.
+# Persistent volumes survive container restarts during dev iteration.
+# Wipe with `podman volume rm notatlas_nats_data notatlas_pg_data` for
+# a clean slate.
 services:
   nats:
-    image: docker.io/nats:2.10
+    image: docker.io/nats:2.14
     container_name: notatlas-nats
     command:
       - "--name=notatlas-dev"
@@ -29,5 +28,19 @@ services:
       - notatlas_nats_data:/data
     restart: unless-stopped
 
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: notatlas-pg
+    environment:
+      POSTGRES_USER: notatlas
+      POSTGRES_PASSWORD: notatlas
+      POSTGRES_DB: notatlas
+    network_mode: host
+    volumes:
+      - notatlas_pg_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+    restart: unless-stopped
+
 volumes:
   notatlas_nats_data:
+  notatlas_pg_data:
