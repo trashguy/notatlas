@@ -1,0 +1,32 @@
+# Optional JetStream capture streams for events that pwriter
+# deliberately does NOT persist. Disabled by default; bounded
+# retention prevents accidental disk fill if left on.
+#
+# Use case: forensic replay (tournament audits, exploit investigation,
+# anti-cheat backfills). Enable only when you need the broker to
+# durably retain events for inspection.
+#
+# To apply changes after editing:
+#   ./scripts/apply_jetstream.sh
+#
+# The script reconciles broker state with this file: enabled streams
+# get created (or re-applied if their config drifted), disabled
+# streams get removed entirely.
+#
+# Per-entry fields:
+#   enabled       — true/false. Default false everywhere in this file.
+#   subject       — NATS subject pattern to capture.
+#   max_age_hours — broker discards messages older than this.
+#   max_bytes_gb  — broker discards oldest when this size is hit.
+#   storage       — file (durable) or memory (faster, lost on restart).
+#
+# Both `max_age` and `max_bytes` are safety caps — whichever hits
+# first. Pick conservative values; you can extend the window if a
+# specific investigation needs more.
+
+damage_forensic:
+  enabled: false
+  subject: "sim.entity.*.damage"
+  max_age_hours: 24
+  max_bytes_gb: 10
+  storage: file

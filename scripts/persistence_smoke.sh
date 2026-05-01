@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# persistence-writer smoke. Exercises all 4 streams the service drains:
+# persistence-writer smoke. Exercises the 3 streams the service drains:
 #
-#   events_damage           sim.entity.*.damage         → damage_log
 #   events_market_trade     events.market.trade         → market_trades
 #   events_handoff_cell     events.handoff.cell         → cell_handoffs
 #   events_inventory_change events.inventory.change.*   → inventories
+#
+# (Damage is intentionally NOT in pwriter — too volume-heavy for
+# row-per-event PG, only useful queries are aggregates. See memory
+# architecture_damage_not_in_pg.md.)
 #
 # For each stream: publish N synthetic events, verify N rows land,
 # restart pwriter, verify ZERO redelivery (workqueue ack-once held).
@@ -13,8 +16,8 @@
 #
 # Usage:
 #   ./scripts/persistence_smoke.sh [event_count]
-#     event_count default 10. Total publishes = N * 3 (damage + market
-#     + handoff) + N inventory updates that all collapse to 1 row.
+#     event_count default 10. Total publishes = N * 2 (market +
+#     handoff) + N inventory updates that all collapse to 1 row.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -53,8 +56,8 @@ SELECT setval('characters_id_seq', GREATEST((SELECT MAX(id) FROM characters), 1)
 SQL
 
 echo ">>> resetting tables + streams"
-$PSQL -c "TRUNCATE damage_log, market_trades, cell_handoffs, inventories RESTART IDENTITY CASCADE;" >/dev/null
-for s in events_damage events_market_trade events_handoff_cell events_inventory_change; do
+$PSQL -c "TRUNCATE market_trades, cell_handoffs, inventories RESTART IDENTITY CASCADE;" >/dev/null
+for s in events_market_trade events_handoff_cell events_inventory_change; do
   $NATS_BOX nats stream rm "$s" -f >/dev/null 2>&1 || true
 done
 
@@ -75,7 +78,7 @@ zig-out/bin/persistence-writer > "$LOG/run1.log" 2>&1 &
 PIDS+=($!)
 PWRITER_PID=$!
 
-# Wait for all 4 streams to attach.
+# Wait for all 3 streams to attach.
 for _ in $(seq 1 50); do
   if grep -q 'events_inventory_change.*ready' "$LOG/run1.log"; then break; fi
   sleep 0.1
@@ -89,8 +92,6 @@ fi
 echo ">>> publishing $N events per stream"
 for i in $(seq 1 "$N"); do
   victim=$(( 16777217 + (i % 4) ))
-  $NATS_BOX nats pub "sim.entity.${victim}.damage" \
-    "$(printf '{"victim_id":%d,"source_id":%d,"damage":%.1f,"fire_time_s":%d.0,"hit_x":1.0,"hit_y":2.0,"hit_z":3.0,"remaining_hp":%.4f}' "$victim" "$((victim+1))" "$i" "$i" "$(awk -v i="$i" -v n="$N" 'BEGIN{printf "%.4f", 1.0 - i/n}')")" >/dev/null 2>&1
 
   $NATS_BOX nats pub "events.market.trade" \
     "$(printf '{"buy_order_id":0,"sell_order_id":0,"buyer_id":1,"seller_id":1,"item_def_id":%d,"quantity":%d,"price":%d}' "$((100+i))" "$i" "$((i*50))")" >/dev/null 2>&1
@@ -104,17 +105,15 @@ for i in $(seq 1 "$N"); do
     "$(printf '{"slots":[{"slot":0,"item_def_id":42,"quantity":%d}]}' "$i")" >/dev/null 2>&1
 done
 
-# Drain time. 4 streams × 25 ms fetch = ~100 ms round-robin; allow 1.5 s.
+# Drain time. 3 streams × 25 ms fetch ≈ 75 ms round-robin; allow 1.5 s.
 sleep 1.5
 
-damage_count=$($PSQL -c "SELECT count(*) FROM damage_log;")
 market_count=$($PSQL -c "SELECT count(*) FROM market_trades;")
 handoff_count=$($PSQL -c "SELECT count(*) FROM cell_handoffs;")
 inv_count=$($PSQL -c "SELECT count(*) FROM inventories;")
 inv_version=$($PSQL -c "SELECT COALESCE(version, 0) FROM inventories WHERE character_id=1;")
 
 echo ">>> run 1 row counts:"
-echo "    damage_log:    $damage_count (expected $N)"
 echo "    market_trades: $market_count (expected $N)"
 echo "    cell_handoffs: $handoff_count (expected $N)"
 echo "    inventories:   $inv_count (expected 1, version $inv_version expected $N)"
@@ -141,7 +140,6 @@ PIDS=()
 run2_line=$(grep "shutting down" "$LOG/run2.log" || echo "missing")
 echo ">>> run 2 final: $run2_line"
 
-post_damage=$($PSQL -c "SELECT count(*) FROM damage_log;")
 post_market=$($PSQL -c "SELECT count(*) FROM market_trades;")
 post_handoff=$($PSQL -c "SELECT count(*) FROM cell_handoffs;")
 post_inv=$($PSQL -c "SELECT count(*) FROM inventories;")
@@ -160,20 +158,18 @@ check() {
     fail=1
   fi
 }
-check "run 1 damage_log"    "$damage_count" "$N"
 check "run 1 market_trades" "$market_count" "$N"
 check "run 1 cell_handoffs" "$handoff_count" "$N"
 check "run 1 inventories"   "$inv_count"    "1"
 check "run 1 inv version"   "$inv_version"  "$N"
 
 # Run 2: redelivered counters all zero.
-if echo "$run2_line" | grep -qE 'damage=0 market=0 handoff=0 inv=0'; then
-  echo "PASS: run 2 redelivered 0 events on all 4 streams"
+if echo "$run2_line" | grep -qE 'market=0 handoff=0 inv=0'; then
+  echo "PASS: run 2 redelivered 0 events on all 3 streams"
 else
   echo "FAIL: run 2 redelivered events: $run2_line"
   fail=1
 fi
-check "run 2 damage_log unchanged"    "$post_damage"  "$N"
 check "run 2 market_trades unchanged" "$post_market"  "$N"
 check "run 2 cell_handoffs unchanged" "$post_handoff" "$N"
 check "run 2 inventories unchanged"   "$post_inv"     "1"

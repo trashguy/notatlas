@@ -168,27 +168,15 @@ CREATE TABLE market_trades (
 CREATE INDEX market_trades_item_idx ON market_trades (cycle_id, item_def_id, executed_at);
 
 -- =============================================================================
--- Wipe-scoped — damage / event log (analytics aggregate)
+-- Damage events are NOT persisted here. Volume is too high (~5k/sec/cell
+-- × 100 cells × 70d = ~30B rows/cycle) and the only useful queries are
+-- aggregates (kill counts, leaderboards), not row-level. Live damage
+-- flows on `sim.entity.*.damage` core NATS; future stats-sim consumes
+-- there and rolls aggregates into a small `damage_aggregates` table
+-- (per-player-per-cycle, kilobytes total). Optional forensic capture
+-- is a broker-level config in `data/jetstream.yaml`, disabled by
+-- default. See memory `architecture_damage_not_in_pg.md`.
 -- =============================================================================
---
--- Decision 5 says the live damage log is JetStream KV with TTL. This
--- table is the persistence-writer's batched aggregate for end-of-cycle
--- stats and leaderboards — not on the read path during play. Workqueue
--- consumer ack-once → batch insert here.
-CREATE TABLE damage_log (
-    id              BIGSERIAL PRIMARY KEY,
-    cycle_id        BIGINT NOT NULL REFERENCES wipe_cycles(id) ON DELETE CASCADE,
-    attacker_id     BIGINT,                      -- entity_id (top-byte tagged)
-    victim_id       BIGINT NOT NULL,
-    damage          REAL   NOT NULL,
-    hp_after        REAL,
-    cell_x          INTEGER,
-    cell_y          INTEGER,
-    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX damage_log_victim_idx ON damage_log (cycle_id, victim_id, occurred_at);
-CREATE INDEX damage_log_attacker_idx ON damage_log (cycle_id, attacker_id, occurred_at);
 
 -- =============================================================================
 -- Wipe-scoped — cross-cell handoff log (analytics aggregate)

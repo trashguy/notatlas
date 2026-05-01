@@ -83,13 +83,18 @@ if ! grep -q 'events_inventory_change.*ready' "$LOG/pwriter.log"; then
   exit 1
 fi
 
+# Use handoff events as the cycle-id witness — pwriter writes
+# cell_handoffs.cycle_id from its cached value, so a flip is observable.
+# (Damage no longer goes through pwriter; handoff is the simplest
+# stand-in with no FK requirements.)
+
 # ---------------------------------------------------------------------------
-# Phase A: 3 damage events while on cycle 1.
+# Phase A: 3 handoff events while on cycle 1.
 # ---------------------------------------------------------------------------
-echo ">>> phase A: publishing 3 damage events on cycle 1"
+echo ">>> phase A: publishing 3 handoff events on cycle 1"
 for i in 1 2 3; do
-  $NATS_BOX nats pub "sim.entity.16777218.damage" \
-    "$(printf '{"victim_id":16777218,"source_id":16777219,"damage":%d.0,"fire_time_s":%d.0,"hit_x":1.0,"hit_y":2.0,"hit_z":3.0,"remaining_hp":0.5}' "$i" "$i")" >/dev/null 2>&1
+  $NATS_BOX nats pub "events.handoff.cell" \
+    "$(printf '{"entity_id":%d,"from_cell_x":0,"from_cell_y":0,"to_cell_x":1,"to_cell_y":0,"pos_x":%d.0,"pos_y":0.0,"pos_z":0.0}' "$((16777217+i))" "$((200+i))")" >/dev/null 2>&1
 done
 sleep 1
 
@@ -107,12 +112,12 @@ $NATS_BOX nats pub "admin.cycle.changed" '{"cycle_id":2,"label":"S1-test"}' >/de
 sleep 0.5  # let pwriter dispatch the cycle-changed message
 
 # ---------------------------------------------------------------------------
-# Phase C: 3 damage events that should land on cycle 2.
+# Phase C: 3 handoff events that should land on cycle 2.
 # ---------------------------------------------------------------------------
-echo ">>> phase C: publishing 3 damage events on cycle 2"
+echo ">>> phase C: publishing 3 handoff events on cycle 2"
 for i in 4 5 6; do
-  $NATS_BOX nats pub "sim.entity.16777218.damage" \
-    "$(printf '{"victim_id":16777218,"source_id":16777219,"damage":%d.0,"fire_time_s":%d.0,"hit_x":1.0,"hit_y":2.0,"hit_z":3.0,"remaining_hp":0.5}' "$i" "$i")" >/dev/null 2>&1
+  $NATS_BOX nats pub "events.handoff.cell" \
+    "$(printf '{"entity_id":%d,"from_cell_x":0,"from_cell_y":0,"to_cell_x":1,"to_cell_y":0,"pos_x":%d.0,"pos_y":0.0,"pos_z":0.0}' "$((16777217+i))" "$((200+i))")" >/dev/null 2>&1
 done
 sleep 1
 
@@ -123,13 +128,13 @@ PIDS=()
 # ---------------------------------------------------------------------------
 # Verdict.
 # ---------------------------------------------------------------------------
-cycle1_count=$($PSQL -c "SELECT count(*) FROM damage_log WHERE cycle_id=1;")
-cycle2_count=$($PSQL -c "SELECT count(*) FROM damage_log WHERE cycle_id=2;")
-total_count=$($PSQL -c "SELECT count(*) FROM damage_log;")
+cycle1_count=$($PSQL -c "SELECT count(*) FROM cell_handoffs WHERE cycle_id=1;")
+cycle2_count=$($PSQL -c "SELECT count(*) FROM cell_handoffs WHERE cycle_id=2;")
+total_count=$($PSQL -c "SELECT count(*) FROM cell_handoffs;")
 
 echo
 echo "=== row distribution ==="
-$PSQL -c "SELECT cycle_id, count(*) FROM damage_log GROUP BY cycle_id ORDER BY cycle_id;"
+$PSQL -c "SELECT cycle_id, count(*) FROM cell_handoffs GROUP BY cycle_id ORDER BY cycle_id;"
 echo
 echo "=== pwriter cycle-roll log ==="
 grep -E 'cycle rolled|current cycle' "$LOG/pwriter.log" || echo "(no cycle log lines!)"

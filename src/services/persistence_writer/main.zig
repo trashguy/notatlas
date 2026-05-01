@@ -6,10 +6,15 @@
 //! that wasn't durably committed.
 //!
 //! v0 streams attached:
-//!   events_damage           sim.entity.*.damage         → damage_log
 //!   events_market_trade     events.market.trade         → market_trades
 //!   events_handoff_cell     events.handoff.cell         → cell_handoffs
 //!   events_inventory_change events.inventory.change.*   → inventories
+//!
+//! Damage is NOT in pwriter — too volume-heavy for row-per-event PG
+//! and the only useful queries are aggregates. Live damage stays on
+//! `sim.entity.*.damage` core NATS; a future stats-sim consumes it.
+//! Optional forensic JetStream capture is config in
+//! `data/jetstream.yaml` (disabled by default).
 //!
 //! Per-stream wiring lives in `stream_specs[]` — adding another stream
 //! is one entry plus a handler. Round-robin pull-fetch with short
@@ -43,20 +48,10 @@ const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
 const consumer_name = "pwriter";
-const audit_stream_prefix = "audit_";
-/// 30 days in nanoseconds. Audit mirrors retain by age — long enough
-/// to span a wipe cycle (10 weeks per locked_design_caps_v0 / 70 d)
-/// in the v0 split: ~30d window of immediate forensic value, older
-/// data is exported to cold storage out-of-band before age-out. Tune
-/// per ops budget once disk usage is observable.
-const audit_max_age_ns: i64 = 30 * 24 * 60 * 60 * std.time.ns_per_s;
 
 const StreamSpec = struct {
     stream_name: []const u8,
     subject_filter: []const u8,
-    /// Per-event handler. Runs inside a SAVEPOINT — return any error
-    /// to ROLLBACK TO SAVEPOINT and skip the event. Return success to
-    /// RELEASE SAVEPOINT and let the row stick.
     handler: *const fn (
         allocator: std.mem.Allocator,
         conn: *pg.Conn,
@@ -66,12 +61,14 @@ const StreamSpec = struct {
     ) anyerror!void,
 };
 
+// Damage events are deliberately NOT in this list. The PG row would
+// be ~5k/sec/cell × 100 cells × 70d = ~30B rows per wipe — and the
+// only useful queries are aggregates (kill counts, leaderboards).
+// Live damage flows on `sim.entity.*.damage` core NATS; future
+// stats-sim and anomaly-sim consume there. Optional forensic
+// capture is a broker-level config in `data/jetstream.yaml`,
+// disabled by default. See memory `architecture_damage_not_in_pg.md`.
 const stream_specs = [_]StreamSpec{
-    .{
-        .stream_name = "events_damage",
-        .subject_filter = "sim.entity.*.damage",
-        .handler = handleDamage,
-    },
     .{
         .stream_name = "events_market_trade",
         .subject_filter = "events.market.trade",
@@ -223,12 +220,11 @@ pub fn main() !void {
     for (stream_specs, 0..) |spec, i| {
         try ensureStream(&js, spec.stream_name, spec.subject_filter);
         try ensureConsumer(nats_client, spec.stream_name);
-        try ensureAuditMirror(nats_client, spec.stream_name);
         pulls[i] = try js.pullSubscribe(spec.stream_name, consumer_name);
         pulls_initialized = i + 1;
         std.debug.print(
-            "persistence-writer: stream={s} subject={s} consumer={s} ready (mirror={s}{s})\n",
-            .{ spec.stream_name, spec.subject_filter, consumer_name, audit_stream_prefix, spec.stream_name },
+            "persistence-writer: stream={s} subject={s} consumer={s} ready\n",
+            .{ spec.stream_name, spec.subject_filter, consumer_name },
         );
     }
 
@@ -289,16 +285,16 @@ pub fn main() !void {
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
             std.debug.print(
-                "persistence-writer: cycle={d} damage={d} market={d} handoff={d} inv={d}\n",
-                .{ cycle_id, totals[0], totals[1], totals[2], totals[3] },
+                "persistence-writer: cycle={d} market={d} handoff={d} inv={d}\n",
+                .{ cycle_id, totals[0], totals[1], totals[2] },
             );
             last_log_ns = now;
         }
     }
 
     std.debug.print(
-        "persistence-writer: shutting down (damage={d} market={d} handoff={d} inv={d})\n",
-        .{ totals[0], totals[1], totals[2], totals[3] },
+        "persistence-writer: shutting down (market={d} handoff={d} inv={d})\n",
+        .{ totals[0], totals[1], totals[2] },
     );
 }
 
@@ -331,52 +327,6 @@ fn ensureStream(
         .retention = .workqueue,
         .storage = .file,
     });
-}
-
-/// Declare an `audit_<source>` mirror stream with limits retention
-/// + 30-day age-out. The workqueue source removes messages on ack,
-/// so the audit mirror is the only place a fully-acked event still
-/// exists for replay/forensics. ADR-60 (NATS 2.14) unblocks
-/// "source from a workqueue stream" — older brokers refuse this
-/// exact mirror config, so the 2.14 bump is load-bearing here.
-///
-/// nats-zig 0.2.2's StreamConfig has no `mirror` field, so we POST
-/// the JSON directly (same hand-roll pattern as ensureConsumer).
-/// Idempotent: re-create against an existing matching config returns
-/// success.
-fn ensureAuditMirror(client: *nats.Client, source_stream: []const u8) !void {
-    var name_buf: [128]u8 = undefined;
-    const audit_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ audit_stream_prefix, source_stream });
-
-    var subject_buf: [256]u8 = undefined;
-    const subject = try std.fmt.bufPrint(
-        &subject_buf,
-        "$JS.API.STREAM.CREATE.{s}",
-        .{audit_name},
-    );
-
-    var body_buf: [512]u8 = undefined;
-    const body = try std.fmt.bufPrint(
-        &body_buf,
-        \\{{"name":"{s}","mirror":{{"name":"{s}"}},"retention":"limits","storage":"file","max_age":{d},"num_replicas":1}}
-    ,
-        .{ audit_name, source_stream, audit_max_age_ns },
-    );
-
-    var msg = try client.request(subject, body, 5000);
-    defer msg.deinit();
-
-    const payload = msg.payload orelse return error.NoBrokerResponse;
-    if (std.mem.indexOf(u8, payload, "\"error\":{") != null) {
-        // err_code 10058 == "stream name already in use" with a
-        // matching config returns success in 2.14, so any error
-        // response here means the broker actually rejected.
-        std.debug.print(
-            "persistence-writer: audit mirror create rejected on {s}: {s}\n",
-            .{ audit_name, payload },
-        );
-        return error.AuditMirrorCreateRejected;
-    }
 }
 
 /// See `feedback_nats_zig_2_14_consumer_envelope.md`. nats-zig 0.2.2's
@@ -488,33 +438,6 @@ fn processBatch(
 // Per-stream handlers. Each handler runs inside a SAVEPOINT so any error
 // rolls back THIS event only and the batch tx continues.
 // ---------------------------------------------------------------------------
-
-fn handleDamage(
-    allocator: std.mem.Allocator,
-    conn: *pg.Conn,
-    cycle_id: i64,
-    subject: []const u8,
-    payload: []const u8,
-) !void {
-    const victim_id = try wire.parseVictimIdFromDamageSubject(subject);
-    var parsed = try wire.decodeDamage(allocator, payload);
-    defer parsed.deinit();
-    const dmg = parsed.value;
-
-    _ = try conn.exec(
-        \\INSERT INTO damage_log
-        \\  (cycle_id, attacker_id, victim_id, damage, hp_after, occurred_at)
-        \\VALUES ($1, $2, $3, $4, $5, NOW())
-    ,
-        .{
-            cycle_id,
-            @as(i64, dmg.source_id),
-            @as(i64, victim_id),
-            dmg.damage,
-            dmg.remaining_hp,
-        },
-    );
-}
 
 fn handleMarketTrade(
     allocator: std.mem.Allocator,
