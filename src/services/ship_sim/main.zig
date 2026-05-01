@@ -9,9 +9,16 @@
 //! frame from a TCP client moves a ship on the wave.
 //!
 //! Force model:
-//!   - thrust: force along ship-forward (rotated −Z), magnitude
-//!     `thrust × THRUST_MAX_N`. Equilibrium speed against buoyancy
-//!     drag is reached in a few seconds.
+//!   - thrust: sail trim ∈ [0, 1] (negative clamps to 0 — sails
+//!     can't reverse-thrust). Force along ship-forward scales with
+//!     the projection of wind velocity onto the ship's forward axis,
+//!     squared, signed: `force = trim × max × sign(wind∥) × (wind∥/baseline)²`.
+//!     Wind from astern pushes the bow forward; beam wind gives no
+//!     forward force in v0 (lateral lift is post-Phase-1 polish);
+//!     wind from ahead pushes the ship backward, modeling a square
+//!     rig that can't sail upwind. Wind is hardcoded for v0
+//!     (`--wind-dir`, `--wind-speed`); Phase 2 plumbs through env
+//!     service.
 //!   - steer: lateral force at the bow point (forward × half-extent.z),
 //!     magnitude `steer × STEER_MAX_N`. Generates a yaw torque
 //!     plus a small lateral thrust — the latter is realistic-ish
@@ -87,14 +94,30 @@ const board_radius_m: f32 = 8.0;
 const player_walk_force_n: f32 = 800.0;
 const player_strafe_force_n: f32 = 800.0;
 
-/// Force tuning for `thrust = ±1.0`. 60 kN against a 15 t hull is
-/// 4 m/s² peak acceleration — equilibrium speed against the
-/// buoyancy drag at 8 sample points × ~15 kN/(m/s) per point lands
-/// in the 4-6 m/s range (a few hundred m of travel per minute,
-/// realistic-ish naval feel for v0). Tune in `data/ships/box.yaml`
-/// once the input loop drives a real ship config and not the M3
-/// box.
-const thrust_max_n: f32 = 60_000.0;
+/// Sail force tuning. With `thrust = 1.0` (sails fully trimmed) and
+/// wind blowing parallel to the ship's heading at the baseline speed
+/// (10 m/s), the sail produces this many newtons of forward force —
+/// 60 kN against a 15 t hull is 4 m/s² peak acceleration, equilibrium
+/// ~5 m/s against buoyancy drag, matching the placeholder thrust the
+/// sail model replaces. `thrust` now means "sail trim" (0 = stowed,
+/// 1 = full); negative values zero the sail rather than reverse-
+/// thrusting. Tune in `data/ships/box.yaml` once sails get their own
+/// per-hull config.
+const sail_force_max_n: f32 = 60_000.0;
+/// Reference wind speed for the (wind_along / baseline)² scaling in
+/// the sail force model. At this wind speed running with the wind
+/// (wind aligned with ship forward), thrust=1.0 gives sail_force_max_n.
+/// Faster wind scales force quadratically; lighter wind likewise.
+const wind_baseline_mps: f32 = 10.0;
+/// v0 hardcoded wind direction (radians, world frame). Same
+/// convention as ship heading: 0 = blowing toward −Z (north). Phase
+/// 2 replaces with `env.cell.<x>_<y>.wind` published by the env
+/// service and consumed via the wind subscription ai-sim already
+/// drains. CLI: `--wind-dir <rad>`.
+const default_wind_dir_rad: f32 = 0;
+/// v0 hardcoded wind speed (m/s). Moderate breeze. CLI:
+/// `--wind-speed <mps>`.
+const default_wind_speed_mps: f32 = 10.0;
 /// Steer applies a lateral force at the bow → torque around +y.
 /// 30 kN at the bow (~3 m forward) gives 90 kN·m torque on a hull
 /// with rough rotational inertia ~30,000 kg·m² → 3 rad/s² peak —
@@ -171,6 +194,13 @@ const Args = struct {
     /// ship id range. Spawned at the world origin (offset along +X
     /// to clear ship#1's body).
     players: u32 = 1,
+    /// Hardcoded wind direction (radians, 0 = blowing toward −Z).
+    /// Phase 2 replaces with the env service's
+    /// `env.cell.<x>_<y>.wind` publish; for now ship-sim runs with
+    /// a constant breeze. Override via `--wind-dir <rad>`.
+    wind_dir_rad: f32 = default_wind_dir_rad,
+    /// Hardcoded wind speed (m/s). Override via `--wind-speed <mps>`.
+    wind_speed_mps: f32 = default_wind_speed_mps,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -203,6 +233,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.grid = true;
         } else if (std.mem.eql(u8, a, "--players")) {
             out.players = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--wind-dir")) {
+            out.wind_dir_rad = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+        } else if (std.mem.eql(u8, a, "--wind-speed")) {
+            out.wind_speed_mps = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+            if (out.wind_speed_mps < 0) return error.BadArg;
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -373,7 +408,7 @@ pub fn main() !void {
     const wave_params = try loadWaves(allocator, wave_config_path);
     const ammo = try loadAmmo(allocator, ammo_config_path);
     std.debug.print(
-        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m\n",
+        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m; wind dir={d:.2} rad speed={d:.1} m/s\n",
         .{
             args.shard,
             hull.half_extents[0],
@@ -385,6 +420,8 @@ pub fn main() !void {
             wave_params.amplitude_m,
             ammo.muzzle_velocity_mps,
             ammo.splash_radius_m,
+            args.wind_dir_rad,
+            args.wind_speed_mps,
         },
     );
 
@@ -503,7 +540,7 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull.half_extents, world_time_s, ammo);
+            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull.half_extents, world_time_s, ammo, args.wind_dir_rad, args.wind_speed_mps);
             tick_n += 1;
             phys_t += phys_dt_fixed;
             world_time_s += @as(f64, phys_dt_fixed);
@@ -1028,6 +1065,8 @@ fn applyShipInputForces(
     phys: *physics.System,
     e: *const sim_state.Entity,
     half_extents: [3]f32,
+    wind_dir_rad: f32,
+    wind_speed_mps: f32,
 ) void {
     if (e.input.thrust == 0 and e.input.steer == 0) return;
     const pos = phys.getPosition(e.body_id) orelse return;
@@ -1036,14 +1075,46 @@ fn applyShipInputForces(
     const forward_world = notatlas.math.Vec3.rotateByQuat(ship_forward_local, rot);
     const center: [3]f32 = .{ pos[0], pos[1], pos[2] };
 
+    // Sail model. `thrust` ∈ [-1, 1] is interpreted as sail trim
+    // (negative clamps to 0 — sails can't reverse-thrust the hull).
+    // Wind velocity vector in world frame:
+    //   wind_world = wind_speed × (sin(dir), 0, −cos(dir))
+    // (Same heading convention as the ship: dir = 0 means blowing
+    // toward −Z.)
+    //
+    // Forward force magnitude scales with the projection of wind
+    // onto the ship's forward axis, signed and squared:
+    //   force = trim × max × sign(wind∥) × (wind∥ / wind_baseline)²
+    //
+    // → wind from astern (wind∥ > 0) pushes the bow forward.
+    // → beam wind (wind∥ ≈ 0) gives zero forward force; lateral
+    //   "leeway" via beam-reach lift is post-Phase-1 polish.
+    // → wind from ahead (wind∥ < 0) pushes the ship backward, with
+    //   magnitude clamped by the same trim factor — modeling a
+    //   square-rigger that can't sail upwind. A real fore-and-aft
+    //   rig would change sign here; v0 sloop is square-rig-shaped.
     if (e.input.thrust != 0) {
-        const f = thrust_max_n * e.input.thrust;
-        const force: [3]f32 = .{
-            forward_world.x * f,
-            forward_world.y * f,
-            forward_world.z * f,
-        };
-        phys.addForceAtPoint(e.body_id, force, center);
+        const sail_trim = if (e.input.thrust > 0) e.input.thrust else 0;
+        if (sail_trim > 0) {
+            const wind_world: notatlas.math.Vec3 = .{
+                .x = wind_speed_mps * std.math.sin(wind_dir_rad),
+                .y = 0,
+                .z = -wind_speed_mps * std.math.cos(wind_dir_rad),
+            };
+            const wind_along =
+                wind_world.x * forward_world.x +
+                wind_world.y * forward_world.y +
+                wind_world.z * forward_world.z;
+            const norm = wind_along / wind_baseline_mps;
+            const sign: f32 = if (wind_along >= 0) 1.0 else -1.0;
+            const f = sail_trim * sail_force_max_n * sign * norm * norm;
+            const force: [3]f32 = .{
+                forward_world.x * f,
+                forward_world.y * f,
+                forward_world.z * f,
+            };
+            phys.addForceAtPoint(e.body_id, force, center);
+        }
     }
 
     if (e.input.steer != 0) {
@@ -1117,13 +1188,15 @@ fn tick(
     hull_half_extents: [3]f32,
     world_time_s: f64,
     ammo: notatlas.projectile.AmmoParams,
+    wind_dir_rad: f32,
+    wind_speed_mps: f32,
 ) !void {
     // Input forces first, then buoyancy. Order doesn't physically
     // matter — Jolt sums all forces between steps — but reads as
     // "what the player wants → what the water does → integrate."
     var input_it = state.entities.valueIterator();
     while (input_it.next()) |e| switch (e.kind) {
-        .ship => applyShipInputForces(phys, e, hull_half_extents),
+        .ship => applyShipInputForces(phys, e, hull_half_extents, wind_dir_rad, wind_speed_mps),
         .free_agent => applyPlayerInputForces(phys, e),
     };
 
