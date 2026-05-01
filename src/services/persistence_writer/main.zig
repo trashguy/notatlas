@@ -2,31 +2,49 @@
 //!
 //! Consumes JetStream change streams (workqueue retention) and
 //! materializes them into Postgres tables. Never on the hot path;
-//! batches writes; ack-on-success so JetStream redelivers any work
+//! batches writes; ack-on-commit so JetStream redelivers any work
 //! that wasn't durably committed.
 //!
-//! v0 scope (this commit): build wiring, NATS connect, PG connect,
-//! current-cycle probe, signal-driven shutdown. No streams declared,
-//! no consumers running. Subsequent commits attach the
-//! `events.damage` workqueue stream as the first consumer, then
-//! `events.market.trade`, `events.handoff.cell`, etc.
+//! v0 scope (this commit): connect to NATS + PG; probe current wipe
+//! cycle; declare `events_damage` workqueue stream + durable consumer
+//! `pwriter`; pull-fetch loop with batched INSERT into damage_log
+//! (single tx, ack-on-commit). Subsequent commits attach more streams
+//! (`events_market_trade`, `events_handoff_cell`, etc.).
 //!
 //! Design context:
 //!   - docs/02-architecture.md §5 — mixed persistence shape, sole-writer
-//!     decision. Damage/event log is JetStream KV (live) plus this
-//!     PG aggregate (analytics, end-of-cycle stats).
+//!     decision. The architecture lists damage events as living in
+//!     JetStream KV with TTL → wipe; this PG aggregate is the analytics
+//!     mirror (end-of-cycle stats, leaderboards). Both reads benefit:
+//!     KV serves live queries, PG serves historical.
 //!   - feedback_graceful_degradation.md — PG offline must NOT cascade
 //!     into producers. Producers keep writing to JetStream (durable);
 //!     this service catches up on reconnect. The pg.zig Pool's
 //!     reconnect-on-failure thread covers the dataplane half; the
-//!     consumer ack pattern covers the message half.
+//!     consumer ack-on-commit pattern covers the message half.
+//!
+//! Stream topology:
+//!   stream:    events_damage (workqueue, file storage)
+//!   subjects:  sim.entity.*.damage
+//!   consumer:  pwriter (durable, explicit ack, deliver_all)
+//!
+//! Producers (ship-sim today) `client.publish()` to the subject via
+//! core NATS — JetStream auto-captures because the subject matches.
+//! No producer-side change is required to enable durability.
 
 const std = @import("std");
 const nats = @import("nats");
 const pg = @import("pg");
+const wire = @import("wire");
 
-const tick_period_ns: u64 = std.time.ns_per_s / 10; // 10 Hz heartbeat
+const fetch_batch: u32 = 256;
+const fetch_timeout_ms: u32 = 100;
+const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
+
+const stream_name = "events_damage";
+const stream_subject_filter = "sim.entity.*.damage";
+const consumer_name = "pwriter";
 
 const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
@@ -133,28 +151,55 @@ pub fn main() !void {
     defer pool.deinit();
     std.debug.print("persistence-writer: pg connected\n", .{});
 
-    // Probe: which wipe cycle are we in? Surfacing this on boot makes
-    // every operator action — even an accidental restart — log the
-    // cycle context. Important when the same binary spans multiple
-    // wipes during dev.
     const cycle_id = probeCurrentCycle(pool) catch |err| {
         std.debug.print("persistence-writer: cycle probe failed: {}\n", .{err});
         return err;
     };
     std.debug.print("persistence-writer: current cycle id={d}\n", .{cycle_id});
 
-    // v0 idle loop. Real consumer attachment lands in the next commit.
+    var js = nats.JetStream.Context.init(nats_client);
+    try ensureStream(&js);
+    try ensureConsumer(nats_client);
+    std.debug.print("persistence-writer: stream={s} consumer={s} ready\n", .{
+        stream_name, consumer_name,
+    });
+
+    var pull = try js.pullSubscribe(stream_name, consumer_name);
+    defer pull.close();
+
+    var total_committed: u64 = 0;
     var last_log_ns: i128 = std.time.nanoTimestamp();
     while (!stop_flag.load(.acquire)) {
-        std.Thread.sleep(tick_period_ns);
+        const msgs = pull.fetch(fetch_batch, fetch_timeout_ms) catch |err| {
+            std.debug.print("persistence-writer: fetch err {}\n", .{err});
+            std.Thread.sleep(idle_sleep_ns);
+            continue;
+        };
+
+        if (msgs.len == 0) {
+            allocator.free(msgs);
+            std.Thread.sleep(idle_sleep_ns);
+        } else {
+            const committed = processBatch(allocator, pool, &pull, msgs, cycle_id) catch |err| blk: {
+                std.debug.print("persistence-writer: batch err {}\n", .{err});
+                break :blk 0;
+            };
+            total_committed += committed;
+            for (msgs) |*m| @constCast(m).deinit();
+            allocator.free(msgs);
+        }
+
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
-            std.debug.print("persistence-writer: idle (cycle {d})\n", .{cycle_id});
+            std.debug.print(
+                "persistence-writer: cycle={d} committed={d}\n",
+                .{ cycle_id, total_committed },
+            );
             last_log_ns = now;
         }
     }
 
-    std.debug.print("persistence-writer: shutting down\n", .{});
+    std.debug.print("persistence-writer: shutting down (committed {d})\n", .{total_committed});
 }
 
 fn probeCurrentCycle(pool: *pg.Pool) !i64 {
@@ -167,4 +212,120 @@ fn probeCurrentCycle(pool: *pg.Pool) !i64 {
         return try row.get(i64, 0);
     }
     return error.NoCurrentCycle;
+}
+
+fn ensureStream(js: *nats.JetStream.Context) !void {
+    if (js.streamInfo(stream_name)) |_| {
+        return;
+    } else |err| switch (err) {
+        nats.JetStream.Error.StreamNotFound => {},
+        else => return err,
+    }
+    _ = try js.createStream(.{
+        .name = stream_name,
+        .subjects = &.{stream_subject_filter},
+        .retention = .workqueue,
+        .storage = .file,
+    });
+}
+
+/// Hand-rolled consumer create — bypasses `js.createConsumer` because
+/// nats-zig 0.2.2 still sends the legacy ≤2.13 envelope with
+/// `durable_name` at the top level. NATS 2.14+ rejects that with
+/// `err_code 10025 invalid JSON: json: unknown field "durable_name"`
+/// and requires `{"stream_name": "...", "config": {...}}`. Fix when
+/// nats-zig publishes a 2.14-aware release; track in memory
+/// `feedback_nats_zig_2_14_consumer_envelope.md`.
+fn ensureConsumer(client: *nats.Client) !void {
+    const subject = "$JS.API.CONSUMER.CREATE." ++ stream_name ++ "." ++ consumer_name;
+    const body =
+        \\{"stream_name":"
+    ++ stream_name ++
+        \\","config":{"durable_name":"
+    ++ consumer_name ++
+        \\","ack_policy":"explicit","deliver_policy":"all","max_deliver":-1,"ack_wait":30000000000}}
+    ;
+
+    var msg = try client.request(subject, body, 5000);
+    defer msg.deinit();
+
+    const payload = msg.payload orelse return error.NoBrokerResponse;
+    // Re-create on an existing consumer with matching config returns
+    // success. Mismatched config returns an error response — surface
+    // it so a config change is loud.
+    if (std.mem.indexOf(u8, payload, "\"error\":{") != null) {
+        std.debug.print("persistence-writer: consumer create error: {s}\n", .{payload});
+        return error.ConsumerCreateRejected;
+    }
+}
+
+/// Insert one row per damage message inside a single transaction; ack
+/// every message after commit. JetStream redelivers the entire batch
+/// on un-ack, which is fine because (cycle_id, victim_id, attacker_id,
+/// damage, occurred_at) is naturally idempotent — same event landing
+/// twice produces a duplicate row, but workqueue retention guarantees
+/// the broker only redelivers if our ack didn't reach it. Tx commit
+/// happens before ack publish, so the failure window is narrow and
+/// any duplicate is observable.
+///
+/// Returns the number of rows committed (== msgs.len on the success
+/// path; 0 on tx rollback).
+fn processBatch(
+    allocator: std.mem.Allocator,
+    pool: *pg.Pool,
+    pull: *nats.JetStream.PullSubscription,
+    msgs: []nats.Protocol.Msg,
+    cycle_id: i64,
+) !u64 {
+    var conn = try pool.acquire();
+    defer conn.release();
+
+    try conn.begin();
+    errdefer conn.rollback() catch {};
+
+    for (msgs) |*m| {
+        const payload = m.payload orelse continue;
+        const subject = m.subject;
+
+        const victim_id = wire.parseVictimIdFromDamageSubject(subject) catch |err| {
+            std.debug.print(
+                "persistence-writer: bad damage subject '{s}': {}\n",
+                .{ subject, err },
+            );
+            continue;
+        };
+
+        var parsed = wire.decodeDamage(allocator, payload) catch |err| {
+            std.debug.print("persistence-writer: decode damage failed: {}\n", .{err});
+            continue;
+        };
+        defer parsed.deinit();
+        const dmg = parsed.value;
+
+        _ = try conn.exec(
+            \\INSERT INTO damage_log
+            \\  (cycle_id, attacker_id, victim_id, damage, hp_after, occurred_at)
+            \\VALUES ($1, $2, $3, $4, $5, NOW())
+        ,
+            .{
+                cycle_id,
+                @as(i64, dmg.source_id),
+                @as(i64, victim_id),
+                dmg.damage,
+                dmg.remaining_hp,
+            },
+        );
+    }
+
+    try conn.commit();
+
+    var acked: u64 = 0;
+    for (msgs) |*m| {
+        pull.ack(m) catch |err| {
+            std.debug.print("persistence-writer: ack err {}\n", .{err});
+            continue;
+        };
+        acked += 1;
+    }
+    return acked;
 }

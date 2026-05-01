@@ -493,6 +493,7 @@ pub fn build(b: *std.Build) void {
     });
     persistence_writer_mod.addImport("nats", nats_mod);
     persistence_writer_mod.addImport("pg", pg_mod);
+    persistence_writer_mod.addImport("wire", wire_mod);
     const persistence_writer = b.addExecutable(.{
         .name = "persistence-writer",
         .root_module = persistence_writer_mod,
