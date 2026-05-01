@@ -42,6 +42,7 @@ const lua = @import("lua");
 
 const ai_state = @import("state.zig");
 const dispatcher_mod = @import("dispatcher.zig");
+const perception = @import("perception.zig");
 
 const bt = notatlas.bt;
 const bt_loader = notatlas.bt_loader;
@@ -50,10 +51,19 @@ const tick_period_ns: u64 = std.time.ns_per_s / 20; // 20 Hz auth tick
 const log_interval_ns: u64 = std.time.ns_per_s;
 const watcher_interval_ns: u64 = std.time.ns_per_s; // mtime poll cadence
 
+/// Default cell side for ctx.cell derivation. Matches spatial-index's
+/// dev default (200 m) — see `src/services/spatial_index/main.zig`.
+/// Production uses 4 km per docs/06; flag to override when the world
+/// manifest scales up.
+const default_cell_side_m: f32 = 200.0;
+/// docs/09 §3 fixed-step delta for the perception ctx.
+const tick_dt: f32 = 1.0 / 20.0;
+
 const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
     archetype_path: []const u8 = "data/ai/pirate_sloop.yaml",
     leaves_path: []const u8 = "data/ai/pirate_sloop.lua",
+    cell_side_m: f32 = default_cell_side_m,
     /// Per-kind sequence numbers (low 24 bits) of ships to drive.
     /// Top byte is `Kind.ship` (0x01) — composed at runtime.
     /// Default: ship#3 (free in drive_ship.sh's 5-ship spawn).
@@ -85,6 +95,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             const v = args.next() orelse return error.MissingArg;
             out.leaves_path = try allocator.dupe(u8, v);
             have_leaves = true;
+        } else if (std.mem.eql(u8, a, "--cell-side")) {
+            out.cell_side_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+            if (out.cell_side_m <= 0) return error.BadArg;
         } else if (std.mem.eql(u8, a, "--ai-ship")) {
             const v = args.next() orelse return error.MissingArg;
             const seq = try std.fmt.parseInt(u32, v, 10);
@@ -205,7 +218,13 @@ pub fn main() !void {
     try loadLuaFile(&vm, args.leaves_path);
     std.debug.print("ai-sim: lua leaves loaded from {s}\n", .{args.leaves_path});
 
-    var disp = dispatcher_mod.LuaDispatcher{ .vm = &vm };
+    // init() stashes a self-pointer in the Lua registry so the
+    // registered set_thrust/set_steer/set_fire helpers can find their
+    // target. That stash captures the in-flight stack address — restash
+    // once `disp` is in its final slot here so the helpers see the
+    // right pointer for the rest of the process lifetime.
+    var disp = dispatcher_mod.LuaDispatcher.init(&vm);
+    disp.restash();
 
     // ----- cohort + AIs -----
     var cohort = ai_state.Cohort.init(allocator);
@@ -247,7 +266,15 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            input_pubs_total += try tickCohort(allocator, client, &cohort, &disp, tick_n);
+            input_pubs_total += try tickCohort(
+                allocator,
+                client,
+                &cohort,
+                &disp,
+                tick_n,
+                archetype.perception_radius,
+                args.cell_side_m,
+            );
             tick_n += 1;
             last_tick_ns +%= tick_period_ns;
         }
@@ -318,26 +345,39 @@ fn drainWindSub(sub: anytype) u64 {
     return count;
 }
 
-/// One full tick of the cohort: BT step every AI, publish any
-/// pending input. Returns the number of inputs published this tick.
+/// One full tick of the cohort: build perception, BT step every AI,
+/// publish any pending input. Returns the number of inputs published
+/// this tick.
+///
+/// AIs whose own pose hasn't yet been observed on `sim.entity.*.state`
+/// are skipped this tick — their leaves can't read a meaningful
+/// `ctx.own_pose` yet. Same shape as a missed gateway input: ship-sim
+/// keeps last-latched (which is "no input") until ai-sim catches up.
 fn tickCohort(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     cohort: *ai_state.Cohort,
     disp: *dispatcher_mod.LuaDispatcher,
     tick: u64,
+    perception_radius_m: u32,
+    cell_side_m: f32,
 ) !u64 {
     const now_ms: i64 = @intCast(@divFloor(@as(i128, tick) * @as(i128, std.time.ns_per_s / 20), std.time.ns_per_ms));
-    var ctx: bt.TickCtx = .{ .now_ms = now_ms, .dispatcher = disp.dispatcher() };
+    var bt_ctx: bt.TickCtx = .{ .now_ms = now_ms, .dispatcher = disp.dispatcher() };
 
     var pubs: u64 = 0;
     for (cohort.ais.items) |*ai| {
-        // Step 5: tick ignores result. Action leaves are responsible
-        // for writing into `ai.pending_input` — but step-5 leaves
-        // don't yet do that (step 6 plugs perception ctx +
-        // input-mutating actions). Tree return value is logged at
-        // debug level only.
-        _ = ai.tree.tick(&ctx);
+        const p_ctx = perception.build(cohort, .{
+            .ai_id = ai.id,
+            .perception_radius_m = @floatFromInt(perception_radius_m),
+            .cell_side_m = cell_side_m,
+            .tick = tick,
+            .dt = tick_dt,
+        }) orelse continue;
+
+        disp.beginAi(ai, &p_ctx);
+        _ = ai.tree.tick(&bt_ctx);
+        disp.endAi();
 
         if (ai.pending_input) |input| {
             try publishInput(allocator, client, ai.id, input);

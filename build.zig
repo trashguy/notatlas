@@ -433,10 +433,21 @@ pub fn build(b: *std.Build) void {
     });
     ai_sim_dispatcher_test_mod.addImport("notatlas", notatlas_mod);
     ai_sim_dispatcher_test_mod.addImport("lua", lua_mod);
+    ai_sim_dispatcher_test_mod.addImport("wire", wire_mod);
     ai_sim_dispatcher_test_mod.linkLibrary(lua);
     ai_sim_dispatcher_test_mod.link_libc = true;
     const ai_sim_dispatcher_tests = b.addTest(.{ .root_module = ai_sim_dispatcher_test_mod });
     test_step.dependOn(&b.addRunArtifact(ai_sim_dispatcher_tests).step);
+
+    const ai_sim_perception_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ai_sim/perception.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ai_sim_perception_test_mod.addImport("notatlas", notatlas_mod);
+    ai_sim_perception_test_mod.addImport("wire", wire_mod);
+    const ai_sim_perception_tests = b.addTest(.{ .root_module = ai_sim_perception_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ai_sim_perception_tests).step);
 }
 
 fn embedShader(
