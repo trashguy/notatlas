@@ -68,7 +68,7 @@ spatial-index, env, persistence-writer services.
 |---|---|---|
 | ✓ multi-commit | Cell-mgr service | Skeleton (`30a3806`) → cluster pathway (`47f3e74`) → fast-lane callback relay (`21c0283`) → slow-lane cleanup (`54a2300`) → cross-cell visibility (`60d0241`) → fast-lane batching (`d769f65`) → fire-lane (`2e2bb17`). Subscribes to spatial-index deltas; runs 30 Hz fanout tick + 60 Hz fast-lane batched relay. |
 | ✓ multi-commit | Spatial-index service | v1 complete (2026-04-30). Skeleton (`b08f339`) → aboard-ship gating via `idx.spatial.attach.*` (`3798f72`) → `idx.spatial.query.radius` req/reply (`85d6ae4`) → N=3 active/standby HA via NATS KV leader election (`af4f29f`). All round-out items shipped. Open: `idx.spatial.cell.*.delta` migration to JetStream-backed for clean failover catch-up — deferred until cell-mgr's JetStream consumer-group story lands. |
-| ▢ | Env service | Wind, weather, wave seed, time of day at 5 Hz |
+| ◐ partial | Env service | Wind shipped (`d421cca`) — 5 Hz `env.cell.<x>_<z>.wind` publishes from `data/wind.yaml`; ship-sim consumes by ship pose, ai-sim plumbs to perception ctx. Weather (storms beyond wind), wave seed, time-of-day still ▢. |
 | ▢ | Persistence-writer service | Sole PG writer, batches change streams |
 | ▢ | Cross-cell ship transit | Sloop sails from cell A to cell B with no stutter (depends on spatial-index aboard-ship gating + ship-sim board/disembark) |
 | ▢ | M10: gpu-driven-instancing | 5000 instances at 60 fps; ≤20 draw calls |
