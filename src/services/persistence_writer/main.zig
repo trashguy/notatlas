@@ -5,32 +5,32 @@
 //! batches writes; ack-on-commit so JetStream redelivers any work
 //! that wasn't durably committed.
 //!
-//! v0 scope (this commit): connect to NATS + PG; probe current wipe
-//! cycle; declare `events_damage` workqueue stream + durable consumer
-//! `pwriter`; pull-fetch loop with batched INSERT into damage_log
-//! (single tx, ack-on-commit). Subsequent commits attach more streams
-//! (`events_market_trade`, `events_handoff_cell`, etc.).
+//! v0 streams attached:
+//!   events_damage           sim.entity.*.damage         → damage_log
+//!   events_market_trade     events.market.trade         → market_trades
+//!   events_handoff_cell     events.handoff.cell         → cell_handoffs
+//!   events_inventory_change events.inventory.change.*   → inventories
+//!
+//! Per-stream wiring lives in `stream_specs[]` — adding another stream
+//! is one entry plus a handler. Round-robin pull-fetch with short
+//! per-stream timeouts so a hot stream isn't latency-blocked behind
+//! cold ones.
+//!
+//! Per-event errors (FK violation, malformed JSON, etc.) are isolated
+//! via Postgres SAVEPOINTs so one bad event doesn't roll back the
+//! batch. JetStream redelivers only un-acked messages.
 //!
 //! Design context:
 //!   - docs/02-architecture.md §5 — mixed persistence shape, sole-writer
-//!     decision. The architecture lists damage events as living in
-//!     JetStream KV with TTL → wipe; this PG aggregate is the analytics
-//!     mirror (end-of-cycle stats, leaderboards). Both reads benefit:
-//!     KV serves live queries, PG serves historical.
+//!     decision. Damage/handoff lists are JetStream KV (live) plus PG
+//!     analytics aggregates; market is purely relational; inventory is
+//!     the JSONB blob path.
 //!   - feedback_graceful_degradation.md — PG offline must NOT cascade
 //!     into producers. Producers keep writing to JetStream (durable);
-//!     this service catches up on reconnect. The pg.zig Pool's
-//!     reconnect-on-failure thread covers the dataplane half; the
-//!     consumer ack-on-commit pattern covers the message half.
-//!
-//! Stream topology:
-//!   stream:    events_damage (workqueue, file storage)
-//!   subjects:  sim.entity.*.damage
-//!   consumer:  pwriter (durable, explicit ack, deliver_all)
-//!
-//! Producers (ship-sim today) `client.publish()` to the subject via
-//! core NATS — JetStream auto-captures because the subject matches.
-//! No producer-side change is required to enable durability.
+//!     this service catches up on reconnect.
+//!   - feedback_nats_zig_2_14_consumer_envelope.md — js.createConsumer
+//!     in nats-zig 0.2.2 sends pre-2.14 JSON; we hand-roll via
+//!     client.request() until nats-zig 0.3 ships.
 
 const std = @import("std");
 const nats = @import("nats");
@@ -38,13 +38,49 @@ const pg = @import("pg");
 const wire = @import("wire");
 
 const fetch_batch: u32 = 256;
-const fetch_timeout_ms: u32 = 100;
+const fetch_timeout_ms: u32 = 25; // per-stream; round-robin wraps in ~100ms with 4 streams
 const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
-const stream_name = "events_damage";
-const stream_subject_filter = "sim.entity.*.damage";
 const consumer_name = "pwriter";
+
+const StreamSpec = struct {
+    stream_name: []const u8,
+    subject_filter: []const u8,
+    /// Per-event handler. Runs inside a SAVEPOINT — return any error
+    /// to ROLLBACK TO SAVEPOINT and skip the event. Return success to
+    /// RELEASE SAVEPOINT and let the row stick.
+    handler: *const fn (
+        allocator: std.mem.Allocator,
+        conn: *pg.Conn,
+        cycle_id: i64,
+        subject: []const u8,
+        payload: []const u8,
+    ) anyerror!void,
+};
+
+const stream_specs = [_]StreamSpec{
+    .{
+        .stream_name = "events_damage",
+        .subject_filter = "sim.entity.*.damage",
+        .handler = handleDamage,
+    },
+    .{
+        .stream_name = "events_market_trade",
+        .subject_filter = "events.market.trade",
+        .handler = handleMarketTrade,
+    },
+    .{
+        .stream_name = "events_handoff_cell",
+        .subject_filter = "events.handoff.cell",
+        .handler = handleHandoffCell,
+    },
+    .{
+        .stream_name = "events_inventory_change",
+        .subject_filter = "events.inventory.change.*",
+        .handler = handleInventoryChange,
+    },
+};
 
 const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
@@ -158,48 +194,71 @@ pub fn main() !void {
     std.debug.print("persistence-writer: current cycle id={d}\n", .{cycle_id});
 
     var js = nats.JetStream.Context.init(nats_client);
-    try ensureStream(&js);
-    try ensureConsumer(nats_client);
-    std.debug.print("persistence-writer: stream={s} consumer={s} ready\n", .{
-        stream_name, consumer_name,
-    });
+    var pulls: [stream_specs.len]nats.JetStream.PullSubscription = undefined;
+    var pulls_initialized: usize = 0;
+    defer {
+        var i: usize = pulls_initialized;
+        while (i > 0) {
+            i -= 1;
+            pulls[i].close();
+        }
+    }
 
-    var pull = try js.pullSubscribe(stream_name, consumer_name);
-    defer pull.close();
+    for (stream_specs, 0..) |spec, i| {
+        try ensureStream(&js, spec.stream_name, spec.subject_filter);
+        try ensureConsumer(nats_client, spec.stream_name);
+        pulls[i] = try js.pullSubscribe(spec.stream_name, consumer_name);
+        pulls_initialized = i + 1;
+        std.debug.print(
+            "persistence-writer: stream={s} subject={s} consumer={s} ready\n",
+            .{ spec.stream_name, spec.subject_filter, consumer_name },
+        );
+    }
 
-    var total_committed: u64 = 0;
+    var totals = [_]u64{0} ** stream_specs.len;
     var last_log_ns: i128 = std.time.nanoTimestamp();
     while (!stop_flag.load(.acquire)) {
-        const msgs = pull.fetch(fetch_batch, fetch_timeout_ms) catch |err| {
-            std.debug.print("persistence-writer: fetch err {}\n", .{err});
-            std.Thread.sleep(idle_sleep_ns);
-            continue;
-        };
-
-        if (msgs.len == 0) {
-            allocator.free(msgs);
-            std.Thread.sleep(idle_sleep_ns);
-        } else {
-            const committed = processBatch(allocator, pool, &pull, msgs, cycle_id) catch |err| blk: {
-                std.debug.print("persistence-writer: batch err {}\n", .{err});
+        var any_processed = false;
+        for (stream_specs, 0..) |spec, i| {
+            const msgs = pulls[i].fetch(fetch_batch, fetch_timeout_ms) catch |err| {
+                std.debug.print(
+                    "persistence-writer: fetch err on {s}: {}\n",
+                    .{ spec.stream_name, err },
+                );
+                continue;
+            };
+            if (msgs.len == 0) {
+                allocator.free(msgs);
+                continue;
+            }
+            const committed = processBatch(allocator, pool, &pulls[i], msgs, cycle_id, spec.handler) catch |err| blk: {
+                std.debug.print(
+                    "persistence-writer: batch err on {s}: {}\n",
+                    .{ spec.stream_name, err },
+                );
                 break :blk 0;
             };
-            total_committed += committed;
+            totals[i] += committed;
+            any_processed = true;
             for (msgs) |*m| @constCast(m).deinit();
             allocator.free(msgs);
         }
+        if (!any_processed) std.Thread.sleep(idle_sleep_ns);
 
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
             std.debug.print(
-                "persistence-writer: cycle={d} committed={d}\n",
-                .{ cycle_id, total_committed },
+                "persistence-writer: cycle={d} damage={d} market={d} handoff={d} inv={d}\n",
+                .{ cycle_id, totals[0], totals[1], totals[2], totals[3] },
             );
             last_log_ns = now;
         }
     }
 
-    std.debug.print("persistence-writer: shutting down (committed {d})\n", .{total_committed});
+    std.debug.print(
+        "persistence-writer: shutting down (damage={d} market={d} handoff={d} inv={d})\n",
+        .{ totals[0], totals[1], totals[2], totals[3] },
+    );
 }
 
 fn probeCurrentCycle(pool: *pg.Pool) !i64 {
@@ -214,7 +273,11 @@ fn probeCurrentCycle(pool: *pg.Pool) !i64 {
     return error.NoCurrentCycle;
 }
 
-fn ensureStream(js: *nats.JetStream.Context) !void {
+fn ensureStream(
+    js: *nats.JetStream.Context,
+    stream_name: []const u8,
+    subject_filter: []const u8,
+) !void {
     if (js.streamInfo(stream_name)) |_| {
         return;
     } else |err| switch (err) {
@@ -223,104 +286,108 @@ fn ensureStream(js: *nats.JetStream.Context) !void {
     }
     _ = try js.createStream(.{
         .name = stream_name,
-        .subjects = &.{stream_subject_filter},
+        .subjects = &.{subject_filter},
         .retention = .workqueue,
         .storage = .file,
     });
 }
 
-/// Hand-rolled consumer create — bypasses `js.createConsumer` because
-/// nats-zig 0.2.2 still sends the legacy ≤2.13 envelope with
-/// `durable_name` at the top level. NATS 2.14+ rejects that with
-/// `err_code 10025 invalid JSON: json: unknown field "durable_name"`
-/// and requires `{"stream_name": "...", "config": {...}}`. Fix when
-/// nats-zig publishes a 2.14-aware release; track in memory
-/// `feedback_nats_zig_2_14_consumer_envelope.md`.
-fn ensureConsumer(client: *nats.Client) !void {
-    const subject = "$JS.API.CONSUMER.CREATE." ++ stream_name ++ "." ++ consumer_name;
-    const body =
-        \\{"stream_name":"
-    ++ stream_name ++
-        \\","config":{"durable_name":"
-    ++ consumer_name ++
-        \\","ack_policy":"explicit","deliver_policy":"all","max_deliver":-1,"ack_wait":30000000000}}
-    ;
+/// See `feedback_nats_zig_2_14_consumer_envelope.md`. nats-zig 0.2.2's
+/// `js.createConsumer` sends the pre-2.14 envelope; we POST the 2.14
+/// shape directly. Accept a re-create against an existing matching
+/// config (broker returns success) and surface mismatches loudly.
+fn ensureConsumer(client: *nats.Client, stream_name: []const u8) !void {
+    var subject_buf: [256]u8 = undefined;
+    const subject = try std.fmt.bufPrint(
+        &subject_buf,
+        "$JS.API.CONSUMER.CREATE.{s}.{s}",
+        .{ stream_name, consumer_name },
+    );
+
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buf,
+        \\{{"stream_name":"{s}","config":{{"durable_name":"{s}","ack_policy":"explicit","deliver_policy":"all","max_deliver":-1,"ack_wait":30000000000}}}}
+    ,
+        .{ stream_name, consumer_name },
+    );
 
     var msg = try client.request(subject, body, 5000);
     defer msg.deinit();
 
     const payload = msg.payload orelse return error.NoBrokerResponse;
-    // Re-create on an existing consumer with matching config returns
-    // success. Mismatched config returns an error response — surface
-    // it so a config change is loud.
     if (std.mem.indexOf(u8, payload, "\"error\":{") != null) {
-        std.debug.print("persistence-writer: consumer create error: {s}\n", .{payload});
+        std.debug.print(
+            "persistence-writer: consumer create rejected on {s}: {s}\n",
+            .{ stream_name, payload },
+        );
         return error.ConsumerCreateRejected;
     }
 }
 
-/// Insert one row per damage message inside a single transaction; ack
-/// every message after commit. JetStream redelivers the entire batch
-/// on un-ack, which is fine because (cycle_id, victim_id, attacker_id,
-/// damage, occurred_at) is naturally idempotent — same event landing
-/// twice produces a duplicate row, but workqueue retention guarantees
-/// the broker only redelivers if our ack didn't reach it. Tx commit
-/// happens before ack publish, so the failure window is narrow and
-/// any duplicate is observable.
+/// Drain a fetched batch into PG. Each event runs as a single auto-
+/// committed statement (no explicit BEGIN/COMMIT) — pg.zig considers
+/// the connection unrecoverable after any tx-error, which kills
+/// SAVEPOINT-based per-event isolation. Auto-commit gives the same
+/// isolation property cheaply: a FK violation on event N doesn't
+/// affect events N±1.
 ///
-/// Returns the number of rows committed (== msgs.len on the success
-/// path; 0 on tx rollback).
+/// Ack policy:
+///   handler succeeded → ack (durable progress)
+///   handler errored   → no-ack (JetStream redelivers after ack_wait)
+///
+/// Application-level errors (FK violation on a known-bad event) will
+/// thus redeliver forever and pollute the log. The intent is that
+/// such events are producer bugs that should be fixed at the source —
+/// not silently dropped here. If a deadletter destination becomes
+/// useful, route NAKs there explicitly.
 fn processBatch(
     allocator: std.mem.Allocator,
     pool: *pg.Pool,
     pull: *nats.JetStream.PullSubscription,
     msgs: []nats.Protocol.Msg,
     cycle_id: i64,
+    handler: *const fn (
+        std.mem.Allocator,
+        *pg.Conn,
+        i64,
+        []const u8,
+        []const u8,
+    ) anyerror!void,
 ) !u64 {
     var conn = try pool.acquire();
     defer conn.release();
 
-    try conn.begin();
-    errdefer conn.rollback() catch {};
-
-    for (msgs) |*m| {
-        const payload = m.payload orelse continue;
-        const subject = m.subject;
-
-        const victim_id = wire.parseVictimIdFromDamageSubject(subject) catch |err| {
-            std.debug.print(
-                "persistence-writer: bad damage subject '{s}': {}\n",
-                .{ subject, err },
-            );
-            continue;
-        };
-
-        var parsed = wire.decodeDamage(allocator, payload) catch |err| {
-            std.debug.print("persistence-writer: decode damage failed: {}\n", .{err});
-            continue;
-        };
-        defer parsed.deinit();
-        const dmg = parsed.value;
-
-        _ = try conn.exec(
-            \\INSERT INTO damage_log
-            \\  (cycle_id, attacker_id, victim_id, damage, hp_after, occurred_at)
-            \\VALUES ($1, $2, $3, $4, $5, NOW())
-        ,
-            .{
-                cycle_id,
-                @as(i64, dmg.source_id),
-                @as(i64, victim_id),
-                dmg.damage,
-                dmg.remaining_hp,
-            },
-        );
-    }
-
-    try conn.commit();
-
     var acked: u64 = 0;
     for (msgs) |*m| {
+        const payload = m.payload orelse {
+            // Empty payload — ack and skip; nothing to write.
+            pull.ack(m) catch {};
+            continue;
+        };
+        const subject = m.subject;
+
+        handler(allocator, conn, cycle_id, subject, payload) catch |err| {
+            if (conn.err) |pg_err| {
+                std.debug.print(
+                    "persistence-writer: handler err on '{s}': {} — pg: {s}\n",
+                    .{ subject, err, pg_err.message },
+                );
+            } else {
+                std.debug.print(
+                    "persistence-writer: handler err on '{s}': {}\n",
+                    .{ subject, err },
+                );
+            }
+            // No ack — JetStream will redeliver after ack_wait.
+            // pg.zig keeps the connection in .fail state after a
+            // statement error; release+reacquire forces the pool to
+            // hand back a usable connection (or reconnect if needed).
+            conn.release();
+            conn = try pool.acquire();
+            continue;
+        };
+
         pull.ack(m) catch |err| {
             std.debug.print("persistence-writer: ack err {}\n", .{err});
             continue;
@@ -328,4 +395,132 @@ fn processBatch(
         acked += 1;
     }
     return acked;
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream handlers. Each handler runs inside a SAVEPOINT so any error
+// rolls back THIS event only and the batch tx continues.
+// ---------------------------------------------------------------------------
+
+fn handleDamage(
+    allocator: std.mem.Allocator,
+    conn: *pg.Conn,
+    cycle_id: i64,
+    subject: []const u8,
+    payload: []const u8,
+) !void {
+    const victim_id = try wire.parseVictimIdFromDamageSubject(subject);
+    var parsed = try wire.decodeDamage(allocator, payload);
+    defer parsed.deinit();
+    const dmg = parsed.value;
+
+    _ = try conn.exec(
+        \\INSERT INTO damage_log
+        \\  (cycle_id, attacker_id, victim_id, damage, hp_after, occurred_at)
+        \\VALUES ($1, $2, $3, $4, $5, NOW())
+    ,
+        .{
+            cycle_id,
+            @as(i64, dmg.source_id),
+            @as(i64, victim_id),
+            dmg.damage,
+            dmg.remaining_hp,
+        },
+    );
+}
+
+fn handleMarketTrade(
+    allocator: std.mem.Allocator,
+    conn: *pg.Conn,
+    cycle_id: i64,
+    subject: []const u8,
+    payload: []const u8,
+) !void {
+    _ = subject;
+    var parsed = try wire.decodeMarketTrade(allocator, payload);
+    defer parsed.deinit();
+    const t = parsed.value;
+
+    // Producer convention: 0 means "no FK" — stored as NULL so the
+    // ON DELETE SET NULL FK semantics work without a referential row.
+    const buy_order = if (t.buy_order_id == 0) null else @as(?i64, t.buy_order_id);
+    const sell_order = if (t.sell_order_id == 0) null else @as(?i64, t.sell_order_id);
+    const buyer = if (t.buyer_id == 0) null else @as(?i64, t.buyer_id);
+    const seller = if (t.seller_id == 0) null else @as(?i64, t.seller_id);
+
+    _ = try conn.exec(
+        \\INSERT INTO market_trades
+        \\  (cycle_id, buy_order_id, sell_order_id, buyer_id, seller_id,
+        \\   item_def_id, quantity, price, executed_at)
+        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+    ,
+        .{
+            cycle_id,
+            buy_order,
+            sell_order,
+            buyer,
+            seller,
+            t.item_def_id,
+            t.quantity,
+            t.price,
+        },
+    );
+}
+
+fn handleHandoffCell(
+    allocator: std.mem.Allocator,
+    conn: *pg.Conn,
+    cycle_id: i64,
+    subject: []const u8,
+    payload: []const u8,
+) !void {
+    _ = subject;
+    var parsed = try wire.decodeHandoffCell(allocator, payload);
+    defer parsed.deinit();
+    const h = parsed.value;
+
+    _ = try conn.exec(
+        \\INSERT INTO cell_handoffs
+        \\  (cycle_id, entity_id,
+        \\   from_cell_x, from_cell_y, to_cell_x, to_cell_y,
+        \\   pos_x, pos_y, pos_z, occurred_at)
+        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+    ,
+        .{
+            cycle_id,
+            @as(i64, h.entity_id),
+            h.from_cell_x,
+            h.from_cell_y,
+            h.to_cell_x,
+            h.to_cell_y,
+            h.pos_x,
+            h.pos_y,
+            h.pos_z,
+        },
+    );
+}
+
+fn handleInventoryChange(
+    allocator: std.mem.Allocator,
+    conn: *pg.Conn,
+    cycle_id: i64,
+    subject: []const u8,
+    payload: []const u8,
+) !void {
+    _ = allocator;
+    _ = cycle_id; // inventories.character_id PK is the wipe-scope; cycle is via characters FK
+    const character_id = try wire.parseCharacterIdFromInventorySubject(subject);
+
+    // Upsert the entire blob. version bumps on each update so a future
+    // reader can detect stale snapshots.
+    _ = try conn.exec(
+        \\INSERT INTO inventories (character_id, version, blob, updated_at)
+        \\VALUES ($1, 1, $2::jsonb, NOW())
+        \\ON CONFLICT (character_id) DO UPDATE
+        \\SET version = inventories.version + 1,
+        \\    blob = EXCLUDED.blob,
+        \\    updated_at = NOW()
+    ,
+        .{ character_id, payload },
+    );
 }

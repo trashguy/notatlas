@@ -191,6 +191,32 @@ CREATE INDEX damage_log_victim_idx ON damage_log (cycle_id, victim_id, occurred_
 CREATE INDEX damage_log_attacker_idx ON damage_log (cycle_id, attacker_id, occurred_at);
 
 -- =============================================================================
+-- Wipe-scoped — cross-cell handoff log (analytics aggregate)
+-- =============================================================================
+--
+-- One row per entity cell-transition. The live oracle is spatial-index
+-- (idx.spatial.cell.<x>_<y>.delta is the canonical wire); this PG table
+-- is the post-cycle audit trail — useful for "who-was-where-when" and
+-- detecting spawn-camp / cross-cell griefing patterns. NOT on the read
+-- path during play.
+CREATE TABLE cell_handoffs (
+    id              BIGSERIAL PRIMARY KEY,
+    cycle_id        BIGINT NOT NULL REFERENCES wipe_cycles(id) ON DELETE CASCADE,
+    entity_id       BIGINT NOT NULL,
+    from_cell_x     INTEGER NOT NULL,
+    from_cell_y     INTEGER NOT NULL,
+    to_cell_x       INTEGER NOT NULL,
+    to_cell_y       INTEGER NOT NULL,
+    pos_x           REAL,
+    pos_y           REAL,
+    pos_z           REAL,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX cell_handoffs_entity_idx ON cell_handoffs (cycle_id, entity_id, occurred_at);
+CREATE INDEX cell_handoffs_to_cell_idx ON cell_handoffs (cycle_id, to_cell_x, to_cell_y, occurred_at);
+
+-- =============================================================================
 -- Bootstrap: open the first wipe cycle.
 -- =============================================================================
 

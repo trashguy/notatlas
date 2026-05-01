@@ -291,6 +291,68 @@ pub fn parseVictimIdFromDamageSubject(subject: []const u8) !u32 {
     return std.fmt.parseInt(u32, id_str, 10);
 }
 
+/// `events.market.trade` payload — emitted by the market service
+/// when a buy + sell order match. Mirrored 1:1 into the
+/// `market_trades` PG table by persistence-writer. Order/character
+/// id fields are i64 because PG keys are BIGSERIAL; producers may
+/// emit 0 for "no matching row" and let pwriter convert to NULL via
+/// nullable FKs (ON DELETE SET NULL semantics).
+pub const MarketTradeMsg = struct {
+    buy_order_id: i64,
+    sell_order_id: i64,
+    buyer_id: i64,
+    seller_id: i64,
+    item_def_id: i32,
+    quantity: i32,
+    price: i64,
+};
+
+pub fn encodeMarketTrade(allocator: std.mem.Allocator, msg: MarketTradeMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeMarketTrade(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(MarketTradeMsg) {
+    return std.json.parseFromSlice(MarketTradeMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// `events.handoff.cell` payload — emitted when an entity transitions
+/// cells. The live oracle remains
+/// `idx.spatial.cell.<x>_<y>.delta`; this stream is the audit-trail
+/// shape, post-cycle stats and griefing detection. Mirrored into the
+/// `cell_handoffs` PG table.
+pub const HandoffCellMsg = struct {
+    entity_id: u32,
+    from_cell_x: i32,
+    from_cell_y: i32,
+    to_cell_x: i32,
+    to_cell_y: i32,
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+};
+
+pub fn encodeHandoffCell(allocator: std.mem.Allocator, msg: HandoffCellMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeHandoffCell(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(HandoffCellMsg) {
+    return std.json.parseFromSlice(HandoffCellMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the character id from `events.inventory.change.<id>`.
+/// Inventory uses subject-routed character_id (matching the damage
+/// subject pattern) because the JSON payload is the inventory blob
+/// itself — a self-contained slot snapshot — and putting character_id
+/// inside the blob would make the SQL upsert path noisier.
+pub fn parseCharacterIdFromInventorySubject(subject: []const u8) !i64 {
+    const prefix = "events.inventory.change.";
+    if (subject.len <= prefix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    const id_str = subject[prefix.len..];
+    if (id_str.len == 0) return error.BadSubject;
+    return std.fmt.parseInt(i64, id_str, 10);
+}
+
 
 /// `env.cell.<x>_<z>.wind` payload — published by env-sim per
 /// docs/02 §5 (env service @ 5 Hz). World-frame wind velocity
@@ -724,4 +786,47 @@ test "wire: parseVictimIdFromDamageSubject" {
     try testing.expectEqual(@as(u32, 16777219), try parseVictimIdFromDamageSubject("sim.entity.16777219.damage"));
     try testing.expectError(error.BadSubject, parseVictimIdFromDamageSubject("sim.entity.16777219.state"));
     try testing.expectError(error.BadSubject, parseVictimIdFromDamageSubject("sim.entity..damage"));
+}
+
+test "wire: market trade roundtrip" {
+    const orig: MarketTradeMsg = .{
+        .buy_order_id = 1001,
+        .sell_order_id = 1002,
+        .buyer_id = 7,
+        .seller_id = 9,
+        .item_def_id = 42,
+        .quantity = 5,
+        .price = 1500,
+    };
+    const buf = try encodeMarketTrade(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeMarketTrade(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: handoff cell roundtrip" {
+    const orig: HandoffCellMsg = .{
+        .entity_id = 0x01000003,
+        .from_cell_x = 0,
+        .from_cell_y = 0,
+        .to_cell_x = 1,
+        .to_cell_y = 0,
+        .pos_x = 201.5,
+        .pos_y = 0.0,
+        .pos_z = 0.3,
+    };
+    const buf = try encodeHandoffCell(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeHandoffCell(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: parseCharacterIdFromInventorySubject" {
+    try testing.expectEqual(@as(i64, 42), try parseCharacterIdFromInventorySubject("events.inventory.change.42"));
+    try testing.expectEqual(@as(i64, 1), try parseCharacterIdFromInventorySubject("events.inventory.change.1"));
+    try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.inventory.change."));
+    try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.inventory.change"));
+    try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.market.trade"));
 }
