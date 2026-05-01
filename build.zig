@@ -385,6 +385,58 @@ pub fn build(b: *std.Build) void {
     spatial_index_leader_test_mod.addImport("nats", nats_mod);
     const spatial_index_leader_tests = b.addTest(.{ .root_module = spatial_index_leader_test_mod });
     test_step.dependOn(&b.addRunArtifact(spatial_index_leader_tests).step);
+
+    // ----- ai-sim service (Phase 1 combat slice, docs/09-ai-sim.md) -----
+    //
+    // 20 Hz AI decision loop. Subscribes to sim.entity.*.state for
+    // world snapshots; publishes sim.entity.<ai_id>.input
+    // indistinguishable from gateway's player input. ship-sim
+    // consumes both via the same `sim.entity.*.input` wildcard.
+    // Pulls in `lua` (vendored 5.4) for behavior-tree leaf dispatch
+    // and `notatlas.bt` / `notatlas.bt_loader` for the BT runtime.
+    const ai_sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ai_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ai_sim_mod.addImport("notatlas", notatlas_mod);
+    ai_sim_mod.addImport("nats", nats_mod);
+    ai_sim_mod.addImport("wire", wire_mod);
+    ai_sim_mod.addImport("lua", lua_mod);
+    ai_sim_mod.linkLibrary(lua);
+    ai_sim_mod.link_libc = true;
+    const ai_sim = b.addExecutable(.{
+        .name = "ai-sim",
+        .root_module = ai_sim_mod,
+    });
+    b.installArtifact(ai_sim);
+
+    const run_ai_sim = b.addRunArtifact(ai_sim);
+    if (b.args) |args| run_ai_sim.addArgs(args);
+    const ai_sim_step = b.step("ai-sim", "Run the ai-sim service");
+    ai_sim_step.dependOn(&run_ai_sim.step);
+
+    const ai_sim_state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ai_sim/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ai_sim_state_test_mod.addImport("notatlas", notatlas_mod);
+    ai_sim_state_test_mod.addImport("wire", wire_mod);
+    const ai_sim_state_tests = b.addTest(.{ .root_module = ai_sim_state_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ai_sim_state_tests).step);
+
+    const ai_sim_dispatcher_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/ai_sim/dispatcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ai_sim_dispatcher_test_mod.addImport("notatlas", notatlas_mod);
+    ai_sim_dispatcher_test_mod.addImport("lua", lua_mod);
+    ai_sim_dispatcher_test_mod.linkLibrary(lua);
+    ai_sim_dispatcher_test_mod.link_libc = true;
+    const ai_sim_dispatcher_tests = b.addTest(.{ .root_module = ai_sim_dispatcher_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ai_sim_dispatcher_tests).step);
 }
 
 fn embedShader(
