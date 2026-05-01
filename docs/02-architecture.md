@@ -117,6 +117,14 @@ internally; quadtree later if density warrants.
 `persistence-writer` service is the sole PG writer. Consumes change
 streams from JetStream; batches PG writes; never on the hot path.
 
+**Stream shape (NATS 2.14+):** ack-once event streams (damage events,
+market trades, cross-cell handoffs) use **workqueue** retention with
+`persistence-writer` as the exactly-once consumer; audit/replay
+consumers attach via **mirror** streams (sourcing from workqueue
+streams was unblocked in 2.14, ADR-60). Producer writes once; the
+broker handles fanout. Disable redundant dedup on the audit mirror
+when the source's dedup window is authoritative.
+
 ### 6. Hibernation rules — mixed
 
 - Ship at sea = always raidable (always-on PvP)

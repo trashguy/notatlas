@@ -96,6 +96,39 @@ pub fn build(b: *std.Build) void {
     const jolt = buildJolt(b, jolt_target, optimize) catch @panic("jolt source enumeration failed");
     b.installArtifact(jolt);
 
+    // Lua 5.4 — vendored at vendor/lua (5.4.8). Built as a static C lib
+    // from the 33 library .c files under vendor/lua/src/ (lua.c and
+    // luac.c are CLI mains, intentionally excluded). See
+    // vendor/lua/PROVENANCE.md and docs/09-ai-sim.md §13 q3 for the
+    // VM-choice rationale.
+    const lua = buildLua(b, target, optimize) catch @panic("lua source enumeration failed");
+    b.installArtifact(lua);
+
+    // Shared module: thin C binding (lua_c.zig) + comptime marshaling
+    // (lua_bind.zig, ported from fallen-runes onto our own thin layer).
+    // Anyone embedding Lua imports `lua` and links the `lua` artifact.
+    const lua_mod = b.addModule("lua", .{
+        .root_source_file = b.path("src/shared/lua/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_mod.addIncludePath(b.path("vendor/lua/src"));
+    lua_mod.linkLibrary(lua);
+    lua_mod.link_libc = true;
+
+    // Lua binding tests. Cover the thin-C surface we use; a future
+    // upstream bump that changes a C API signature trips these.
+    const lua_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/shared/lua/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_test_mod.addIncludePath(b.path("vendor/lua/src"));
+    lua_test_mod.linkLibrary(lua);
+    lua_test_mod.link_libc = true;
+    const lua_tests = b.addTest(.{ .root_module = lua_test_mod });
+    test_step.dependOn(&b.addRunArtifact(lua_tests).step);
+
     // Zig-side physics module: Jolt FFI + buoyancy. Buoyancy imports
     // notatlas math/wave_query, so the dependency edge goes that way.
     const physics_mod = b.addModule("physics", .{
@@ -453,6 +486,75 @@ fn buildJolt(
         .root_module = mod,
         .linkage = .static,
     });
+}
+
+const lua_root = "vendor/lua";
+
+/// Build PUC Lua 5.4 as a static C library. Compiles the 33 library .c
+/// files under `vendor/lua/src/`, excluding the two CLI mains (`lua.c`
+/// for the standalone interpreter and `luac.c` for the bytecode
+/// compiler) — notatlas embeds Lua, not the host program.
+///
+/// Linux: defines `LUA_USE_LINUX` (POSIX + dlopen, the standard
+/// upstream Linux config minus readline since we don't ship a REPL).
+/// Windows: no defines needed; Lua's default config works.
+fn buildLua(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) !*std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addIncludePath(b.path(lua_root ++ "/src"));
+
+    if (target.result.os.tag == .linux) {
+        mod.addCMacro("LUA_USE_LINUX", "");
+    }
+
+    const sources = try collectLuaSources(b);
+
+    const c_flags: []const []const u8 = &.{
+        "-std=c99",
+        // Vendored upstream code; warnings here aren't actionable for
+        // us. Mirror Jolt's no-warnings stance.
+        "-w",
+    };
+
+    mod.addCSourceFiles(.{
+        .root = b.path(lua_root),
+        .files = sources,
+        .language = .c,
+        .flags = c_flags,
+    });
+
+    return b.addLibrary(.{
+        .name = "lua",
+        .root_module = mod,
+        .linkage = .static,
+    });
+}
+
+/// Walk `vendor/lua/src` and return every `.c` path relative to
+/// `vendor/lua/` except the two CLI mains. Globbing keeps build.zig
+/// from drifting on a 5.4.x bump.
+fn collectLuaSources(b: *std.Build) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var dir = try std.fs.cwd().openDir(lua_root ++ "/src", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".c")) continue;
+        // CLI mains — excluded; we embed Lua as a library.
+        if (std.mem.eql(u8, entry.name, "lua.c")) continue;
+        if (std.mem.eql(u8, entry.name, "luac.c")) continue;
+        const rel = try std.fmt.allocPrint(b.allocator, "src/{s}", .{entry.name});
+        try list.append(b.allocator, rel);
+    }
+    return list.toOwnedSlice(b.allocator);
 }
 
 /// Walk `vendor/JoltPhysics/Jolt` and return every `.cpp` path relative to

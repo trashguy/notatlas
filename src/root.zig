@@ -9,6 +9,8 @@ pub const pose_codec = @import("shared/pose_codec.zig");
 pub const projectile = @import("shared/projectile.zig");
 pub const lag_comp = @import("shared/lag_comp.zig");
 pub const entity_kind = @import("shared/entity_kind.zig");
+pub const bt = @import("shared/bt.zig");
+pub const bt_loader = @import("shared/bt_loader.zig");
 pub const yaml_loader = @import("yaml_loader.zig");
 
 test {

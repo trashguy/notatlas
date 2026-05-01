@@ -1,0 +1,72 @@
+# Pirate sloop AI — first archetype.
+#
+# Loaded by ai-sim per docs/09-ai-sim.md. The leaf names below
+# (low_hp, flee_to_open_water, enemy_in_range, aim_broadside,
+# fire_broadside, intercept, patrol_waypoints) must each have a
+# matching Lua function in `data/ai/pirate_sloop.lua` (not yet
+# committed — lands with the ai-sim service skeleton).
+#
+# Behavior priority (selector evaluates top-down):
+#   1. Flee if hp < 30%
+#   2. Engage if enemy in cannon range:
+#      parallel — keep aiming broadside while firing on cooldown
+#   3. Pursue if enemy spotted at all
+#   4. Otherwise patrol
+
+archetype: pirate_sloop
+description: Hostile sloop, opens fire when in range, flees below 30% hp.
+perception_radius: 600
+root: 12
+
+nodes:
+  # ------- flee branch -------
+  - id: 0
+    kind: cond
+    leaf: low_hp
+  - id: 1
+    kind: action
+    leaf: flee_to_open_water
+  - id: 2
+    kind: sequence
+    children: [0, 1]
+
+  # ------- engage branch -------
+  - id: 3
+    kind: cond
+    leaf: enemy_in_range
+  - id: 4
+    kind: action
+    leaf: aim_broadside
+  - id: 5
+    kind: action
+    leaf: fire_broadside
+  - id: 6
+    kind: cooldown
+    child: 5
+    cooldown_ms: 4000
+  - id: 7
+    kind: parallel
+    policy: any_success
+    children: [4, 6]
+  - id: 8
+    kind: sequence
+    children: [3, 7]
+
+  # ------- pursue branch -------
+  - id: 9
+    kind: cond
+    leaf: enemy_spotted
+  - id: 10
+    kind: action
+    leaf: intercept
+  - id: 11
+    kind: sequence
+    children: [9, 10]
+
+  # ------- patrol fallback -------
+  - id: 12
+    kind: selector
+    children: [2, 8, 11, 13]
+  - id: 13
+    kind: action
+    leaf: patrol_waypoints
