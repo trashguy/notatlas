@@ -43,6 +43,13 @@ const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
 const consumer_name = "pwriter";
+const audit_stream_prefix = "audit_";
+/// 30 days in nanoseconds. Audit mirrors retain by age — long enough
+/// to span a wipe cycle (10 weeks per locked_design_caps_v0 / 70 d)
+/// in the v0 split: ~30d window of immediate forensic value, older
+/// data is exported to cold storage out-of-band before age-out. Tune
+/// per ops budget once disk usage is observable.
+const audit_max_age_ns: i64 = 30 * 24 * 60 * 60 * std.time.ns_per_s;
 
 const StreamSpec = struct {
     stream_name: []const u8,
@@ -216,11 +223,12 @@ pub fn main() !void {
     for (stream_specs, 0..) |spec, i| {
         try ensureStream(&js, spec.stream_name, spec.subject_filter);
         try ensureConsumer(nats_client, spec.stream_name);
+        try ensureAuditMirror(nats_client, spec.stream_name);
         pulls[i] = try js.pullSubscribe(spec.stream_name, consumer_name);
         pulls_initialized = i + 1;
         std.debug.print(
-            "persistence-writer: stream={s} subject={s} consumer={s} ready\n",
-            .{ spec.stream_name, spec.subject_filter, consumer_name },
+            "persistence-writer: stream={s} subject={s} consumer={s} ready (mirror={s}{s})\n",
+            .{ spec.stream_name, spec.subject_filter, consumer_name, audit_stream_prefix, spec.stream_name },
         );
     }
 
@@ -323,6 +331,52 @@ fn ensureStream(
         .retention = .workqueue,
         .storage = .file,
     });
+}
+
+/// Declare an `audit_<source>` mirror stream with limits retention
+/// + 30-day age-out. The workqueue source removes messages on ack,
+/// so the audit mirror is the only place a fully-acked event still
+/// exists for replay/forensics. ADR-60 (NATS 2.14) unblocks
+/// "source from a workqueue stream" — older brokers refuse this
+/// exact mirror config, so the 2.14 bump is load-bearing here.
+///
+/// nats-zig 0.2.2's StreamConfig has no `mirror` field, so we POST
+/// the JSON directly (same hand-roll pattern as ensureConsumer).
+/// Idempotent: re-create against an existing matching config returns
+/// success.
+fn ensureAuditMirror(client: *nats.Client, source_stream: []const u8) !void {
+    var name_buf: [128]u8 = undefined;
+    const audit_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ audit_stream_prefix, source_stream });
+
+    var subject_buf: [256]u8 = undefined;
+    const subject = try std.fmt.bufPrint(
+        &subject_buf,
+        "$JS.API.STREAM.CREATE.{s}",
+        .{audit_name},
+    );
+
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buf,
+        \\{{"name":"{s}","mirror":{{"name":"{s}"}},"retention":"limits","storage":"file","max_age":{d},"num_replicas":1}}
+    ,
+        .{ audit_name, source_stream, audit_max_age_ns },
+    );
+
+    var msg = try client.request(subject, body, 5000);
+    defer msg.deinit();
+
+    const payload = msg.payload orelse return error.NoBrokerResponse;
+    if (std.mem.indexOf(u8, payload, "\"error\":{") != null) {
+        // err_code 10058 == "stream name already in use" with a
+        // matching config returns success in 2.14, so any error
+        // response here means the broker actually rejected.
+        std.debug.print(
+            "persistence-writer: audit mirror create rejected on {s}: {s}\n",
+            .{ audit_name, payload },
+        );
+        return error.AuditMirrorCreateRejected;
+    }
 }
 
 /// See `feedback_nats_zig_2_14_consumer_envelope.md`. nats-zig 0.2.2's
