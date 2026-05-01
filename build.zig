@@ -51,6 +51,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const pg_dep = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const zglfw_dep = b.dependency("zglfw", .{
         .target = target,
         .optimize = optimize,
@@ -472,6 +476,33 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_env_sim.addArgs(args);
     const env_sim_step = b.step("env-sim", "Run the env-sim service");
     env_sim_step.dependOn(&run_env_sim.step);
+
+    // ----- persistence-writer service (Phase 2, docs/02 §5) -----
+    //
+    // Sole Postgres writer per locked architecture decision 5.
+    // Consumes JetStream change streams (workqueue retention) and
+    // batches them into PG. v0 skeleton: NATS connect + PG connect +
+    // current-cycle probe + idle loop. Streams attach in follow-up
+    // commits. PG client is karlseguin/pg.zig zig-0.15 branch (see
+    // memory architecture_pg_client_pgzig.md).
+    const pg_mod = pg_dep.module("pg");
+    const persistence_writer_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/persistence_writer/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    persistence_writer_mod.addImport("nats", nats_mod);
+    persistence_writer_mod.addImport("pg", pg_mod);
+    const persistence_writer = b.addExecutable(.{
+        .name = "persistence-writer",
+        .root_module = persistence_writer_mod,
+    });
+    b.installArtifact(persistence_writer);
+
+    const run_persistence_writer = b.addRunArtifact(persistence_writer);
+    if (b.args) |args| run_persistence_writer.addArgs(args);
+    const persistence_writer_step = b.step("persistence-writer", "Run the persistence-writer service");
+    persistence_writer_step.dependOn(&run_persistence_writer.step);
 }
 
 fn embedShader(

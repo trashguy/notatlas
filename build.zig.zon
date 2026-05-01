@@ -23,6 +23,10 @@
             .url = "https://github.com/trashguy/nats-zig/archive/refs/tags/v0.2.2.tar.gz",
             .hash = "nats_zig-0.2.2-Il_iJIEGAgA0mVcEGNqnpIp4dqLJOgbe_HRzSCvMiHvw",
         },
+        .pg = .{
+            .url = "https://github.com/karlseguin/pg.zig/archive/a4351154a00488d26740b4378872be03bd562d27.tar.gz",
+            .hash = "pg-0.0.0-Wp_7gdNpBgBWiq6RQguwbekGA0sbYvjgZd4sNG_CyT0f",
+        },
     },
     .paths = .{
         "build.zig",
