@@ -1,0 +1,45 @@
+# Base hull config — the reference numbers tier hulls are tuned
+# against. Sloop currently equals base; schooner / brig override
+# specific fields via `extends: _base.yaml`.
+half_extents_x: 2.0
+half_extents_y: 1.25
+half_extents_z: 3.0
+mass_kg: 15000.0
+hp_max: 300.0
+cell_half_height: 0.625
+cell_cross_section: 6.0
+drag_per_point: 15000.0
+sail_force_max_n: 60000.0
+sail_baseline_mps: 10.0
+steer_max_n: 30000.0
+sample_points:
+  - x: -1.0
+    y: -0.625
+    z: -1.5
+  - x: 1.0
+    y: -0.625
+    z: -1.5
+  - x: -1.0
+    y: -0.625
+    z: 1.5
+  - x: 1.0
+    y: -0.625
+    z: 1.5
+  - x: -1.0
+    y: 0.625
+    z: -1.5
+  - x: 1.0
+    y: 0.625
+    z: -1.5
+  - x: -1.0
+    y: 0.625
+    z: 1.5
+  - x: 1.0
+    y: 0.625
+    z: 1.5
+cannons:
+  - offset_x: 2.0
+    offset_y: 1.0
+    offset_z: 0.0
+    cooldown_s: 1.5
+    range_m: 200.0

@@ -1,0 +1,5 @@
+# Tier-1 sloop. Identical to `_base.yaml` in v0 — left as an
+# explicit `extends:` so spawning code never references `_base`
+# directly (private), and so future sloop tweaks (e.g. balance
+# nerfs) drop in here without touching base.
+extends: _base.yaml

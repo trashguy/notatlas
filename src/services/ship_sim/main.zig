@@ -97,18 +97,6 @@ const player_strafe_force_n: f32 = 800.0;
 /// Sail force tuning. With `thrust = 1.0` (sails fully trimmed) and
 /// wind blowing parallel to the ship's heading at the baseline speed
 /// (10 m/s), the sail produces this many newtons of forward force —
-/// 60 kN against a 15 t hull is 4 m/s² peak acceleration, equilibrium
-/// ~5 m/s against buoyancy drag, matching the placeholder thrust the
-/// sail model replaces. `thrust` now means "sail trim" (0 = stowed,
-/// 1 = full); negative values zero the sail rather than reverse-
-/// thrusting. Tune in `data/ships/box.yaml` once sails get their own
-/// per-hull config.
-const sail_force_max_n: f32 = 60_000.0;
-/// Reference wind speed for the (wind_along / baseline)² scaling in
-/// the sail force model. At this wind speed running with the wind
-/// (wind aligned with ship forward), thrust=1.0 gives sail_force_max_n.
-/// Faster wind scales force quadratically; lighter wind likewise.
-const wind_baseline_mps: f32 = 10.0;
 /// v0 hardcoded wind direction (radians, world frame). Same
 /// convention as ship heading: 0 = blowing toward −Z (north). Phase
 /// 2 replaces with `env.cell.<x>_<y>.wind` published by the env
@@ -123,40 +111,14 @@ const default_wind_speed_mps: f32 = 10.0;
 /// `--cell-side` — all three live in the same world. CLI:
 /// `--cell-side <m>`.
 const default_cell_side_m: f32 = 200.0;
-/// Steer applies a lateral force at the bow → torque around +y.
-/// 30 kN at the bow (~3 m forward) gives 90 kN·m torque on a hull
-/// with rough rotational inertia ~30,000 kg·m² → 3 rad/s² peak —
-/// turns from rest to a 90° heading in ~1 s of sustained input,
-/// which feels responsive without being twitchy.
-const steer_max_n: f32 = 30_000.0;
 /// Local-frame ship forward direction. Convention: −Z is forward
 /// (matches the sandbox's M5.3 player composition where bow is
-/// toward −Z when yaw=0).
+/// toward −Z when yaw=0). Loaded from neither YAML nor swappable —
+/// it's a coordinate-system convention shared with the renderer
+/// and the AI heading math, not a per-hull tuning knob.
 const ship_forward_local: notatlas.math.Vec3 = .{ .x = 0, .y = 0, .z = -1 };
 
-/// Cannon parameters — sub-step 5 v1 has a single starboard cannon
-/// per ship at half_extent.x off centerline, 1 m above deck. Fires
-/// in ship-local +x direction (= starboard), which is the standard
-/// naval broadside orientation. Cooldown 1.5 s for fast iteration;
-/// production cannon reloads land in a per-cannon-component config
-/// later. The fire-event's `rot` is the ship's world quaternion
-/// directly (FireEvent convention: muzzle direction = rotateX(rot)).
-const cannon_cooldown_s: f64 = 1.5;
-const cannon_offset_y: f32 = 1.0;
-/// Engagement-range budget for the server-side aim-pitch solver in
-/// `fireCannon`. Targets within this horizontal range get pitch
-/// compensation; out-of-range or no-target → horizontal fire (the
-/// pre-pitch-compensation behavior). Match-or-exceed the AI's
-/// `cannon_range_m` in `data/ai/pirate_sloop.lua` so AI fires are
-/// never out-of-range from the solver's perspective.
-const cannon_range_m: f32 = 200.0;
 const ammo_config_path = "data/ammo/cannonball.yaml";
-
-/// v0 sloop hull HP. Cannonball direct hits are 50 HP per
-/// `cannonball.yaml`, so 6 direct hits sink a sloop. Phase 2 lifts
-/// this into `data/ships/<hull>.yaml` alongside mass / extents
-/// (`hull_params.HullParams.hp_max`).
-const sloop_max_hp: f32 = 300.0;
 
 /// In-flight cannonballs that haven't hit anything are reaped after
 /// this many seconds. With muzzle_velocity=250 m/s and a sloop's
@@ -174,7 +136,9 @@ const projectile_hit_padding_m: f32 = 1.0;
 /// YAML inputs — ship-sim must agree with the sandbox on hull + wave
 /// kernel until the spawn protocol carries them on the wire. Ran from
 /// project root (the build/cwd convention shared with cell-mgr).
-const hull_config_path = "data/ships/box.yaml";
+/// Hull config supports `extends:` chains; sloop is the v0 default,
+/// schooner / brigantine drop in alongside.
+const hull_config_path = "data/hulls/sloop.yaml";
 const wave_config_path = "data/waves/storm.yaml";
 
 const ShipLayout = enum { line, grid, circle, duel };
@@ -223,11 +187,12 @@ const Args = struct {
     wind_dir_rad: f32 = default_wind_dir_rad,
     /// Hardcoded wind speed (m/s). Override via `--wind-speed <mps>`.
     wind_speed_mps: f32 = default_wind_speed_mps,
-    /// Per-ship max HP at spawn. Override for soaks where you want
-    /// to harvest a lot of damage events without ships sinking out
-    /// of the test (`--ship-max-hp 9999` is effectively immortal).
-    /// Phase 2 lifts max HP into per-hull YAML config alongside mass.
-    ship_max_hp: f32 = sloop_max_hp,
+    /// Per-ship max HP at spawn. 0 = use the hull config's `hp_max`
+    /// (the canonical default for the loaded hull). Override for
+    /// soaks where you want to harvest a lot of damage events without
+    /// ships sinking out of the test (`--ship-max-hp 9999` is
+    /// effectively immortal).
+    ship_max_hp: f32 = 0,
     /// Cell side (m). Used when looking up env-sim's per-cell wind
     /// by ship pose. Must match env-sim's --cell-side.
     cell_side_m: f32 = default_cell_side_m,
@@ -323,10 +288,10 @@ fn installSignalHandlers() !void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
-fn loadHull(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.hull_params.HullParams {
+fn loadHull(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.hull_loader.Hull {
     const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
     defer gpa.free(abs);
-    return notatlas.yaml_loader.loadHullFromFile(gpa, abs);
+    return notatlas.hull_loader.loadFromFile(gpa, abs);
 }
 
 fn loadWaves(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wave_query.WaveParams {
@@ -341,7 +306,7 @@ fn loadAmmo(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.projectile.A
     return notatlas.yaml_loader.loadAmmoFromFile(gpa, abs);
 }
 
-fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.BuoyancyConfig {
+fn buoyancyConfigFromHull(hull: notatlas.hull_config.HullConfig) physics.BuoyancyConfig {
     return .{
         .sample_points = hull.sample_points,
         .cell_half_height = hull.cell_half_height,
@@ -369,7 +334,7 @@ fn spawnShip(
     allocator: std.mem.Allocator,
     state: *sim_state.State,
     phys: *physics.System,
-    hull: notatlas.hull_params.HullParams,
+    hull: notatlas.hull_config.HullConfig,
     id: u32,
     spawn_pos: [3]f32,
     max_hp: f32,
@@ -463,19 +428,33 @@ pub fn main() !void {
     defer allocator.free(args.shard);
     try installSignalHandlers();
 
-    var hull = try loadHull(allocator, hull_config_path);
-    defer hull.deinit(allocator);
+    var hull_owner = try loadHull(allocator, hull_config_path);
+    defer hull_owner.deinit();
+    const hull = hull_owner.config;
+    // Resolve final max_hp: explicit CLI override wins, else use the
+    // loaded hull's default. spawn calls below pass `effective_max_hp`.
+    const effective_max_hp: f32 = if (args.ship_max_hp > 0) args.ship_max_hp else hull.hp_max;
+    // Salvo cooldown = max of every cannon's `cooldown_s`. Mixed-
+    // cooldown batteries gate on the slowest gun for v0; per-cannon
+    // cooldown tracking is a follow-up if a tier needs it.
+    var salvo_cooldown_max: f32 = 0;
+    for (hull.cannons) |c| {
+        if (c.cooldown_s > salvo_cooldown_max) salvo_cooldown_max = c.cooldown_s;
+    }
+    const salvo_cooldown_s: f64 = @floatCast(salvo_cooldown_max);
     const wave_params = try loadWaves(allocator, wave_config_path);
     const ammo = try loadAmmo(allocator, ammo_config_path);
     std.debug.print(
-        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, {d} buoyancy samples; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m; wind dir={d:.2} rad speed={d:.1} m/s\n",
+        "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, hp_max={d:.0}, {d} buoyancy samples, {d} cannons; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m; wind dir={d:.2} rad speed={d:.1} m/s\n",
         .{
             args.shard,
             hull.half_extents[0],
             hull.half_extents[1],
             hull.half_extents[2],
             hull.mass_kg,
+            effective_max_hp,
             hull.sample_points.len,
+            hull.cannons.len,
             wave_params.seed,
             wave_params.amplitude_m,
             ammo.muzzle_velocity_mps,
@@ -540,7 +519,7 @@ pub fn main() !void {
                 const x: f32 = @as(f32, @floatFromInt(col)) * args.spacing_m - half_extent;
                 const z: f32 = @as(f32, @floatFromInt(row)) * args.spacing_m - half_extent;
                 const pos: [3]f32 = .{ x, ship_spawn_y, z };
-                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+                try spawnShip(allocator, &state, &phys, hull, id, pos, effective_max_hp);
             }
             std.debug.print(
                 "ship-sim [{s}]: spawned {d} ships in {d}-col grid, spacing {d:.0} m, half-extent {d:.0} m\n",
@@ -564,7 +543,7 @@ pub fn main() !void {
                 const x: f32 = radius * std.math.cos(angle);
                 const z: f32 = radius * std.math.sin(angle);
                 const pos: [3]f32 = .{ x, ship_spawn_y, z };
-                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+                try spawnShip(allocator, &state, &phys, hull, id, pos, effective_max_hp);
             }
             std.debug.print(
                 "ship-sim [{s}]: spawned {d} ships on circle radius {d:.0} m, chord spacing {d:.0} m\n",
@@ -576,7 +555,7 @@ pub fn main() !void {
             while (i < args.ships) : (i += 1) {
                 const id: u32 = notatlas.entity_kind.pack(ship_kind, i + 1);
                 const pos: [3]f32 = .{ @as(f32, @floatFromInt(i)) * args.spacing_m, ship_spawn_y, 0 };
-                try spawnShip(allocator, &state, &phys, hull, id, pos, args.ship_max_hp);
+                try spawnShip(allocator, &state, &phys, hull, id, pos, effective_max_hp);
             }
             std.debug.print(
                 "ship-sim [{s}]: spawned {d} ships in line at x=[0..{d:.0}] m, spacing {d:.0} m\n",
@@ -592,8 +571,8 @@ pub fn main() !void {
             // to neutralize the sail force and isolate steering.
             const id1: u32 = notatlas.entity_kind.pack(ship_kind, 1);
             const id2: u32 = notatlas.entity_kind.pack(ship_kind, 2);
-            try spawnShip(allocator, &state, &phys, hull, id1, .{ 0, ship_spawn_y, 0 }, args.ship_max_hp);
-            try spawnShip(allocator, &state, &phys, hull, id2, .{ -args.spacing_m, ship_spawn_y, 0 }, args.ship_max_hp);
+            try spawnShip(allocator, &state, &phys, hull, id1, .{ 0, ship_spawn_y, 0 }, effective_max_hp);
+            try spawnShip(allocator, &state, &phys, hull, id2, .{ -args.spacing_m, ship_spawn_y, 0 }, effective_max_hp);
             // Snap the per-tick log's ship count to what we actually
             // spawned — the ticker subtracts args.ships from total
             // entity count to derive free-agent count.
@@ -685,7 +664,7 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull.half_extents, world_time_s, ammo, args.wind_dir_rad, args.wind_speed_mps, &wind_cache, args.cell_side_m);
+            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull, salvo_cooldown_s, world_time_s, ammo, args.wind_dir_rad, args.wind_speed_mps, &wind_cache, args.cell_side_m);
             tick_n += 1;
             phys_t += phys_dt_fixed;
             world_time_s += @as(f64, phys_dt_fixed);
@@ -723,13 +702,19 @@ pub fn main() !void {
 /// in ship-local frame (= 1 m above deck, on the starboard side at
 /// midships). Fire direction: ship-local +x rotated by ship rot
 /// (FireEvent convention — `rotateX(rot)` is the muzzle forward).
+/// Fire every cannon on `e`'s hull. Each cannon spec carries its own
+/// muzzle offset + range. v0 sloop is a single starboard gun;
+/// schooner / brig hulls publishing N entries each fire on the same
+/// `input.fire` latch as a broadside salvo. Per-cannon cooldown is
+/// not yet tracked — the entity's single `next_fire_allowed_s` is
+/// set from the longest cannon cooldown on the hull.
 fn fireCannon(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     phys: *physics.System,
     state: *sim_state.State,
     e: *const sim_state.Entity,
-    hull_half_extents: [3]f32,
+    cannons: []const notatlas.hull_config.Cannon,
     world_time_s: f64,
     ammo: notatlas.projectile.AmmoParams,
 ) !void {
@@ -745,10 +730,27 @@ fn fireCannon(
     const yaw = yawFromQuat(rot);
     const yaw_quat = notatlas.math.quatYaw(yaw);
 
+    for (cannons) |cannon| {
+        try fireOneCannon(allocator, client, phys, state, e, cannon, yaw_quat, pos, world_time_s, ammo);
+    }
+}
+
+fn fireOneCannon(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    phys: *physics.System,
+    state: *sim_state.State,
+    e: *const sim_state.Entity,
+    cannon: notatlas.hull_config.Cannon,
+    yaw_quat: [4]f32,
+    pos: [3]f32,
+    world_time_s: f64,
+    ammo: notatlas.projectile.AmmoParams,
+) !void {
     const local_offset: notatlas.math.Vec3 = .{
-        .x = hull_half_extents[0],
-        .y = cannon_offset_y,
-        .z = 0,
+        .x = cannon.offset_x,
+        .y = cannon.offset_y,
+        .z = cannon.offset_z,
     };
     const world_offset = notatlas.math.Vec3.rotateByQuat(local_offset, yaw_quat);
     const muzzle_pos: [3]f32 = .{
@@ -782,7 +784,7 @@ fn fireCannon(
     // → horizontal shot.
     var pitch_rad: f32 = 0;
     {
-        var nearest_d2: f32 = cannon_range_m * cannon_range_m;
+        var nearest_d2: f32 = cannon.range_m * cannon.range_m;
         var nearest_pos: [3]f32 = .{ 0, 0, 0 };
         var nearest_vel: [3]f32 = .{ 0, 0, 0 };
         var nearest_id: ?u32 = null;
@@ -1335,7 +1337,7 @@ fn destroySunkShips(
 fn applyShipInputForces(
     phys: *physics.System,
     e: *const sim_state.Entity,
-    half_extents: [3]f32,
+    hull: notatlas.hull_config.HullConfig,
     wind_world_xz: [2]f32,
 ) void {
     if (e.input.thrust == 0 and e.input.steer == 0) return;
@@ -1368,9 +1370,9 @@ fn applyShipInputForces(
             const wind_along =
                 wind_world_xz[0] * forward_world.x +
                 wind_world_xz[1] * forward_world.z;
-            const norm = wind_along / wind_baseline_mps;
+            const norm = wind_along / hull.sail_baseline_mps;
             const sign: f32 = if (wind_along >= 0) 1.0 else -1.0;
-            const f = sail_trim * sail_force_max_n * sign * norm * norm;
+            const f = sail_trim * hull.sail_force_max_n * sign * norm * norm;
             const force: [3]f32 = .{
                 forward_world.x * f,
                 forward_world.y * f,
@@ -1385,14 +1387,14 @@ fn applyShipInputForces(
         // local +X = "starboard" as +steer direction).
         const up: notatlas.math.Vec3 = .{ .x = 0, .y = 1, .z = 0 };
         const lateral = notatlas.math.Vec3.cross(forward_world, up);
-        const f = steer_max_n * e.input.steer;
+        const f = hull.steer_max_n * e.input.steer;
         const force: [3]f32 = .{
             lateral.x * f,
             lateral.y * f,
             lateral.z * f,
         };
         // Apply at the bow: center + forward × half_extent.z.
-        const bow_offset_m = half_extents[2];
+        const bow_offset_m = hull.half_extents[2];
         const bow: [3]f32 = .{
             pos[0] + forward_world.x * bow_offset_m,
             pos[1] + forward_world.y * bow_offset_m,
@@ -1448,7 +1450,8 @@ fn tick(
     buoy_player: *const physics.Buoyancy,
     wave_params: notatlas.wave_query.WaveParams,
     phys_t: f32,
-    hull_half_extents: [3]f32,
+    hull: notatlas.hull_config.HullConfig,
+    salvo_cooldown_s: f64,
     world_time_s: f64,
     ammo: notatlas.projectile.AmmoParams,
     wind_dir_rad: f32,
@@ -1464,7 +1467,7 @@ fn tick(
         .ship => {
             const ship_pos = phys.getPosition(e.body_id) orelse e.pose.pos;
             const wind_xz = windAtPos(wind_cache, ship_pos, cell_side_m, wind_dir_rad, wind_speed_mps);
-            applyShipInputForces(phys, e, hull_half_extents, wind_xz);
+            applyShipInputForces(phys, e, hull, wind_xz);
         },
         .free_agent => applyPlayerInputForces(phys, e),
     };
@@ -1474,13 +1477,17 @@ fn tick(
     // Done before buoyancy for no particular reason; FireEvent's
     // muzzle pose is read from Jolt at this point so it reflects the
     // just-applied input forces (cannon is on a moving deck — pose
-    // is good enough at 60 Hz).
+    // is good enough at 60 Hz). All cannons on the hull fire as one
+    // broadside salvo on a single `input.fire` latch; the entity's
+    // `next_fire_allowed_s` is bumped by `salvo_cooldown_s` (= max
+    // cannon cooldown on the hull) so a tier with mixed cooldowns
+    // gates on the slowest gun.
     var fire_it = state.entities.valueIterator();
     while (fire_it.next()) |e| {
         if (e.kind != .ship) continue;
         if (e.input.fire and world_time_s >= e.next_fire_allowed_s) {
-            try fireCannon(allocator, client, phys, state, e, hull_half_extents, world_time_s, ammo);
-            e.next_fire_allowed_s = world_time_s + cannon_cooldown_s;
+            try fireCannon(allocator, client, phys, state, e, hull.cannons, world_time_s, ammo);
+            e.next_fire_allowed_s = world_time_s + salvo_cooldown_s;
         }
     }
 
@@ -1503,7 +1510,7 @@ fn tick(
     // Hits deduct hp_current and publish DamageMsg. Sinking is
     // deferred to AFTER the state publish so the final state msg
     // for a sunk ship carries hp = 0.
-    _ = try resolveProjectileImpacts(allocator, client, state, phys, hull_half_extents, world_time_s);
+    _ = try resolveProjectileImpacts(allocator, client, state, phys, hull.half_extents, world_time_s);
 
     // Read back + publish per entity. Passengers do NOT publish —
     // their pose flows through the ship's tier-3 boarded stream
