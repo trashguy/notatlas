@@ -19,7 +19,16 @@
 -- ----- tuning -----
 local cannon_range_m       = 180.0   -- enemy_in_range threshold
 local broadside_offset_rad = math.pi / 2   -- starboard (cannon side)
-local steer_gain           = 2.0 / math.pi -- diff in [-pi,pi] → [-1,1]ish
+-- PD heading controller: steer = clamp(Kp*diff - Kd*angvel_y, -1, 1).
+-- The previous P-only law (gain 2/π) commanded full ±1 across most
+-- of [-π, π] and thrashed across the ±π wrap because angular
+-- velocity blew past the target while steer stayed pinned. We keep
+-- Kp at the old 2/π so authority and time-to-aim stay roughly the
+-- same; Kd is the addition — it brakes the rotation when angvel_y
+-- is already in the desired direction so the ship coasts to the
+-- target instead of overshooting and flipping sign at the wrap.
+local steer_kp             = 2.0 / math.pi  -- proportional on heading error
+local steer_kd             = 0.5            -- damping on yaw rate (rad/s)
 
 -- ----- helpers -----
 
@@ -46,23 +55,22 @@ local function clamp(v, lo, hi)
   return v
 end
 
-local function steer_toward(desired_heading, own_heading)
+local function steer_toward(desired_heading, own_heading, angvel_y)
   -- Empirically (Jolt + ship-sim's lateral-force-at-bow setup):
   -- +steer drives heading_rad UP (Jolt's +Y rotation is CCW
   -- from above, i.e. left turn — the InputMsg "right turn"
   -- comment refers to a different visual convention). So if
   -- desired > own we want POSITIVE steer to grow heading toward
-  -- desired. Sign matches `desired - own`.
+  -- desired, and a positive angvel_y means the ship is *already*
+  -- rotating in that direction — the damping term subtracts from
+  -- the command so we coast to the target instead of overshooting.
   local diff = wrap_angle(desired_heading - own_heading)
-  return clamp(diff * steer_gain, -1.0, 1.0)
+  return clamp(steer_kp * diff - steer_kd * (angvel_y or 0.0), -1.0, 1.0)
 end
 
 -- ----- conds -----
 
 function low_hp()
-  -- Damage system not online yet — own_hp is stubbed to 1.0 in
-  -- perception.zig, so this branch never fires today. Wired for the
-  -- moment hp lands.
   return ctx.own_hp < 0.3
 end
 
@@ -85,7 +93,7 @@ function flee_to_open_water()
   -- Desired heading: opposite of bearing (run away).
   local desired = bearing + math.pi
   set_thrust(1.0)
-  set_steer(steer_toward(desired, own_heading))
+  set_steer(steer_toward(desired, own_heading, ctx.own_vel.ang.y))
   return "running"
 end
 
@@ -95,7 +103,7 @@ function intercept()
   local own_heading = heading_from_pose(ctx.own_pose)
   local bearing = bearing_to(ctx.own_pose, e)
   set_thrust(0.8)
-  set_steer(steer_toward(bearing, own_heading))
+  set_steer(steer_toward(bearing, own_heading, ctx.own_vel.ang.y))
   return "running"
 end
 
@@ -109,7 +117,7 @@ function aim_broadside()
   local desired = bearing - broadside_offset_rad
   -- Hold a moderate speed while orbiting the target.
   set_thrust(0.4)
-  set_steer(steer_toward(desired, own_heading))
+  set_steer(steer_toward(desired, own_heading, ctx.own_vel.ang.y))
   return "running"
 end
 

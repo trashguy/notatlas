@@ -1356,6 +1356,7 @@ fn tick(
         const pos = phys.getPosition(e.body_id) orelse continue;
         const rot = phys.getRotation(e.body_id) orelse continue;
         const lin_v = phys.getLinearVelocity(e.body_id) orelse continue;
+        const ang_v = phys.getAngularVelocity(e.body_id) orelse [_]f32{ 0, 0, 0 };
 
         e.pose.pos = pos;
         e.pose.rot = rot;
@@ -1372,6 +1373,7 @@ fn tick(
             .vz = lin_v[2],
             .heading_rad = yawFromQuat(rot),
             .hp = e.hpFraction(),
+            .angvel_y = ang_v[1],
         };
         const buf = try wire.encodeState(allocator, msg);
         defer allocator.free(buf);

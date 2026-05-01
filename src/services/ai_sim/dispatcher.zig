@@ -443,6 +443,103 @@ test "dispatcher: nearest_enemy nil reads as nil in lua" {
     try testing.expectEqual(false, dispatcher.cond("has_enemy"));
 }
 
+test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
+    // Smoke for the PD heading controller in pirate_sloop.lua. We
+    // re-implement steer_toward inline in the test so the assertions
+    // pin the math, not the lua file. If pirate_sloop.lua's tuning
+    // changes, this test stays anchored to the controller form.
+    var vm = try lua.Vm.init();
+    defer vm.deinit();
+
+    try vm.doString(
+        \\local kp, kd = 2.0 / math.pi, 0.5
+        \\local function clamp(v) if v <  -1 then return -1 end
+        \\                        if v >   1 then return  1 end
+        \\                        return v end
+        \\function steer()
+        \\  local diff = math.pi  -- desired requires +π rotation
+        \\  local omega = ctx.own_vel.ang.y
+        \\  set_steer(clamp(kp * diff - kd * omega))
+        \\  return "success"
+        \\end
+    );
+
+    var d = LuaDispatcher.init(&vm);
+    d.restash();
+
+    var ai: ai_state.AiShip = .{ .id = 0x01000003, .tree = undefined };
+
+    // Case 1: angvel_y = 0 → P-only command saturates to +1.0.
+    {
+        const ctx: perception.PerceptionCtx = .{
+            .tick = 0,
+            .dt = 0.05,
+            .own_pose = .{ .x = 0, .y = 0, .z = 0, .qx = 0, .qy = 0, .qz = 0, .qw = 1 },
+            .own_vel = .{
+                .lin = .{ .x = 0, .y = 0, .z = 0 },
+                .ang = .{ .x = 0, .y = 0, .z = 0 },
+            },
+            .own_hp = 1.0,
+            .wind = .{ .dir = 0, .speed = 0 },
+            .cell = .{ .x = 0, .y = 0 },
+            .nearest_enemy = null,
+        };
+        d.beginAi(&ai, &ctx);
+        defer d.endAi();
+        _ = d.dispatcher().action("steer");
+        try testing.expectApproxEqAbs(@as(f32, 1.0), ai.pending_input.?.steer, 1e-6);
+    }
+
+    // Case 2: ship is already rotating in the desired direction at
+    // ω = 1.0 rad/s. With Kp*π = 2.0 and Kd*ω = 0.5, the raw command
+    // is 1.5 → clamped to 1.0 (still demanding full rotation; the
+    // damping has authority but the error term still dominates).
+    {
+        const ctx: perception.PerceptionCtx = .{
+            .tick = 0,
+            .dt = 0.05,
+            .own_pose = .{ .x = 0, .y = 0, .z = 0, .qx = 0, .qy = 0, .qz = 0, .qw = 1 },
+            .own_vel = .{
+                .lin = .{ .x = 0, .y = 0, .z = 0 },
+                .ang = .{ .x = 0, .y = 1.0, .z = 0 },
+            },
+            .own_hp = 1.0,
+            .wind = .{ .dir = 0, .speed = 0 },
+            .cell = .{ .x = 0, .y = 0 },
+            .nearest_enemy = null,
+        };
+        d.beginAi(&ai, &ctx);
+        defer d.endAi();
+        _ = d.dispatcher().action("steer");
+        try testing.expectApproxEqAbs(@as(f32, 1.0), ai.pending_input.?.steer, 1e-6);
+    }
+
+    // Case 3: ship has overshot the target (diff would now be near
+    // 0 in real conditions; we keep diff=π to isolate the damping
+    // term). At ω = 5.0 rad/s the damping overwhelms the proportional
+    // error: 2.0 - 2.5 = -0.5 → command flips negative, braking the
+    // overshoot. This is the case the wrap-bug fix targets.
+    {
+        const ctx: perception.PerceptionCtx = .{
+            .tick = 0,
+            .dt = 0.05,
+            .own_pose = .{ .x = 0, .y = 0, .z = 0, .qx = 0, .qy = 0, .qz = 0, .qw = 1 },
+            .own_vel = .{
+                .lin = .{ .x = 0, .y = 0, .z = 0 },
+                .ang = .{ .x = 0, .y = 5.0, .z = 0 },
+            },
+            .own_hp = 1.0,
+            .wind = .{ .dir = 0, .speed = 0 },
+            .cell = .{ .x = 0, .y = 0 },
+            .nearest_enemy = null,
+        };
+        d.beginAi(&ai, &ctx);
+        defer d.endAi();
+        _ = d.dispatcher().action("steer");
+        try testing.expectApproxEqAbs(@as(f32, -0.5), ai.pending_input.?.steer, 1e-6);
+    }
+}
+
 test "dispatcher: helpers no-op when no ai is latched" {
     var vm = try lua.Vm.init();
     defer vm.deinit();

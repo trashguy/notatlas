@@ -83,6 +83,12 @@ pub const StateMsg = struct {
     /// fixture) read as fully healthy through the
     /// `ignore_unknown_fields = true` decoder.
     hp: f32 = 1.0,
+    /// Y-axis angular velocity, rad/s. Surfaced for AI heading
+    /// controllers — `ai-sim`'s broadside leaf uses it as the
+    /// derivative term in a PD steering controller. Defaults to 0
+    /// so older publishers/decoders stay forward/backward compatible
+    /// via `ignore_unknown_fields`.
+    angvel_y: f32 = 0,
 };
 
 pub fn encodeDelta(allocator: std.mem.Allocator, msg: DeltaMsg) ![]u8 {
@@ -647,6 +653,30 @@ test "wire: state hp roundtrips when explicit" {
     const parsed = try decodeState(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(@as(f32, 0.5), parsed.value.hp);
+}
+
+test "wire: state angvel_y default is 0 when absent (backward-compat)" {
+    const legacy_payload =
+        \\{"generation":1,"x":10.0,"y":0.5,"z":-3.0}
+    ;
+    const parsed = try decodeState(testing.allocator, legacy_payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(f32, 0), parsed.value.angvel_y);
+}
+
+test "wire: state angvel_y roundtrips when explicit" {
+    const orig: StateMsg = .{
+        .generation = 1,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .angvel_y = -0.42,
+    };
+    const buf = try encodeState(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeState(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(f32, -0.42), parsed.value.angvel_y);
 }
 
 test "wire: damage roundtrip" {

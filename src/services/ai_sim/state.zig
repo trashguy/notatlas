@@ -32,6 +32,10 @@ pub const WorldEntity = struct {
     /// `hp <= 0` so a sunk ship in this table doesn't become a target
     /// before its row ages out of the firehose-driven snapshot.
     hp: f32 = 1.0,
+    /// Y-axis angular velocity, rad/s — the derivative term for the
+    /// PD heading controller. Defaults to 0 for publishers that
+    /// pre-date the field.
+    angvel_y: f32 = 0,
     /// Tick on which we last received a state msg for this entity.
     /// Step 6's perception build can use this to age out stale rows.
     last_seen_tick: u64,
@@ -86,6 +90,7 @@ pub const Cohort = struct {
             .heading_rad = msg.heading_rad,
             .generation = msg.generation,
             .hp = msg.hp,
+            .angvel_y = msg.angvel_y,
             .last_seen_tick = tick,
         });
     }
@@ -146,6 +151,21 @@ test "cohort: observe captures hp" {
     }, 1);
     const e = c.entities.get(0x01000003).?;
     try testing.expectEqual(@as(f32, 0.42), e.hp);
+}
+
+test "cohort: observe captures angvel_y" {
+    var c = Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    try c.observeEntity(0x01000003, .{
+        .generation = 0,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .angvel_y = -0.7,
+    }, 1);
+    const e = c.entities.get(0x01000003).?;
+    try testing.expectEqual(@as(f32, -0.7), e.angvel_y);
 }
 
 test "cohort: addAi tracks ais" {

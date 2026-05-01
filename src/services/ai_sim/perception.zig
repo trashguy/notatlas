@@ -107,9 +107,13 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
         .qw = std.math.cos(own.heading_rad * 0.5),
     };
 
+    // ang.x and ang.z are zero in v1 — ship-sim only surfaces the Y
+    // axis (heading rate) since that's what the PD steering controller
+    // in pirate_sloop.lua needs. Lift the other axes when a leaf needs
+    // pitch/roll rate.
     const own_vel: Vel = .{
         .lin = .{ .x = own.vx, .y = own.vy, .z = own.vz },
-        .ang = .{ .x = 0, .y = 0, .z = 0 },
+        .ang = .{ .x = 0, .y = own.angvel_y, .z = 0 },
     };
 
     // Cell from own pose. Same floor()/cell_side math as
@@ -313,6 +317,32 @@ test "perception: nearestEnemy skips sunk ships" {
     }).?;
     try testing.expectEqual(live_id, ctx.nearest_enemy.?.id);
     try testing.expectEqual(@as(f32, 0.5), ctx.nearest_enemy.?.hp);
+}
+
+test "perception: own_vel.ang.y carries angvel_y from firehose" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{
+        .generation = 0,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .angvel_y = 0.6,
+    }, 1);
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
+    }).?;
+    try testing.expectEqual(@as(f32, 0.6), ctx.own_vel.ang.y);
+    try testing.expectEqual(@as(f32, 0), ctx.own_vel.ang.x);
+    try testing.expectEqual(@as(f32, 0), ctx.own_vel.ang.z);
 }
 
 test "perception: own_hp pulled from firehose StateMsg.hp" {
