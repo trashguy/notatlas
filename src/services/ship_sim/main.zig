@@ -170,7 +170,7 @@ const projectile_hit_padding_m: f32 = 1.0;
 const hull_config_path = "data/ships/box.yaml";
 const wave_config_path = "data/waves/storm.yaml";
 
-const ShipLayout = enum { line, grid, circle };
+const ShipLayout = enum { line, grid, circle, duel };
 
 const Args = struct {
     /// Shard identifier — for now just a tag in log lines so multiple
@@ -197,7 +197,11 @@ const Args = struct {
     /// ring around origin so every ship can broadside any other —
     /// good for naval-combat tests where line layout's ±π aim
     /// degeneracy bites the AI. `grid` keeps everyone clustered
-    /// near origin (useful when N is large).
+    /// near origin (useful when N is large). `duel` is a 2-ship
+    /// AI-tuning fixture: ship#1 at origin (heading 0 → facing -Z),
+    /// ship#2 at -X by `spacing_m`. Forces the AI's broadside-aim
+    /// path to rotate by ≈π — exercises the wrap-around bug that
+    /// motivated the PD heading controller. Ignores --ships.
     layout: ShipLayout = .line,
     /// Number of free-agent player capsules to spawn. v1 demo: 1.
     /// Each capsule gets a per-kind-tagged id of
@@ -431,7 +435,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try parseArgs(allocator);
+    var args = try parseArgs(allocator);
     defer allocator.free(args.nats_url);
     defer allocator.free(args.shard);
     try installSignalHandlers();
@@ -554,6 +558,26 @@ pub fn main() !void {
             std.debug.print(
                 "ship-sim [{s}]: spawned {d} ships in line at x=[0..{d:.0}] m, spacing {d:.0} m\n",
                 .{ args.shard, args.ships, @as(f32, @floatFromInt(args.ships - 1)) * args.spacing_m, args.spacing_m },
+            );
+        },
+        .duel => {
+            // Hard-coded N=2 regardless of the user's --ships. ship#1
+            // at origin (heading 0 → facing -Z); ship#2 along -X at
+            // --spacing. Bearing ship#1→ship#2 = -π/2; broadside-
+            // desired heading = -π/2 - π/2 = -π — the boundary case
+            // wrap_angle picks arbitrarily. Pair with --wind-speed 0
+            // to neutralize the sail force and isolate steering.
+            const id1: u32 = notatlas.entity_kind.pack(ship_kind, 1);
+            const id2: u32 = notatlas.entity_kind.pack(ship_kind, 2);
+            try spawnShip(allocator, &state, &phys, hull, id1, .{ 0, ship_spawn_y, 0 }, args.ship_max_hp);
+            try spawnShip(allocator, &state, &phys, hull, id2, .{ -args.spacing_m, ship_spawn_y, 0 }, args.ship_max_hp);
+            // Snap the per-tick log's ship count to what we actually
+            // spawned — the ticker subtracts args.ships from total
+            // entity count to derive free-agent count.
+            args.ships = 2;
+            std.debug.print(
+                "ship-sim [{s}]: spawned 2 ships in duel layout — ship#1 at origin, ship#2 at -{d:.0} m on +X axis\n",
+                .{ args.shard, args.spacing_m },
             );
         },
     }

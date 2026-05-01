@@ -55,17 +55,52 @@ local function clamp(v, lo, hi)
   return v
 end
 
+-- Wrap-boundary band where `diff` is undefined-up-to-sign (a
+-- target at the antipode is reachable by rotating either way).
+-- Inside this band we ignore the wrap's sign and resolve the tie
+-- with hysteresis on current rotation.
+--
+-- `wrap_band_rad` (~17°) is wide enough that the band persists
+-- through several ticks of rotation, giving ω time to commit
+-- before we exit. `wrap_omega_thresh` is the ω magnitude that
+-- counts as "rotating" — set well above wave-induced ω jitter
+-- (~±0.05 rad/s on a stationary sloop in 8 m swell) so micro-
+-- flips don't pry the latch open.
+local wrap_band_rad     = 0.3
+local wrap_omega_thresh = 0.3
+
 local function steer_toward(desired_heading, own_heading, angvel_y)
-  -- Empirically (Jolt + ship-sim's lateral-force-at-bow setup):
-  -- +steer drives heading_rad UP (Jolt's +Y rotation is CCW
-  -- from above, i.e. left turn — the InputMsg "right turn"
-  -- comment refers to a different visual convention). So if
-  -- desired > own we want POSITIVE steer to grow heading toward
-  -- desired, and a positive angvel_y means the ship is *already*
-  -- rotating in that direction — the damping term subtracts from
-  -- the command so we coast to the target instead of overshooting.
+  -- Sign convention (verified by torque calculus on the lateral-
+  -- force-at-bow model in ship-sim/main.zig applyShipInputForces):
+  --
+  --   forward_local = (0, 0, -1)
+  --   forward_world = R(rot) · forward_local
+  --   lateral       = forward_world × (0, 1, 0)        -- = ship's +X (starboard)
+  --   F_steer       = steer_max_n × steer × lateral
+  --   r_bow         = forward_world × half_extent.z    -- bow position rel. CoM
+  --   τ_y           = (r × F)_y = -bow_offset_m × steer_max_n × steer
+  --
+  -- So +steer produces a NEGATIVE Y-axis torque → ω_y decreases
+  -- → heading_rad decreases (heading is CCW-from-above with the
+  -- yawFromQuat convention). To drive heading UP, we need negative
+  -- steer. The controller therefore outputs `-(Kp*diff - Kd*ω)`.
+  --
+  -- At |diff| ≈ π the wrap is symmetric: rotating either direction
+  -- by π reaches the antipode, and infinitesimal heading drift
+  -- (waves) flips the sign of diff, which would thrash the command
+  -- at ±1. Resolve the tie by:
+  --   - if already rotating  → follow ω (commit once started)
+  --   - if at rest           → default to CCW (positive diff)
+  local omega = angvel_y or 0.0
   local diff = wrap_angle(desired_heading - own_heading)
-  return clamp(steer_kp * diff - steer_kd * (angvel_y or 0.0), -1.0, 1.0)
+  if math.abs(diff) > (math.pi - wrap_band_rad) then
+    if math.abs(omega) > wrap_omega_thresh then
+      diff = (omega >= 0) and math.abs(diff) or -math.abs(diff)
+    else
+      diff = math.abs(diff)
+    end
+  end
+  return clamp(-(steer_kp * diff - steer_kd * omega), -1.0, 1.0)
 end
 
 -- ----- conds -----

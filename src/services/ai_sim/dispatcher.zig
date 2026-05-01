@@ -448,6 +448,12 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
     // re-implement steer_toward inline in the test so the assertions
     // pin the math, not the lua file. If pirate_sloop.lua's tuning
     // changes, this test stays anchored to the controller form.
+    //
+    // Output is the negation of the PD law because +steer drives a
+    // -Y torque on the bow lateral force (verified by torque calc in
+    // ship-sim/main.zig applyShipInputForces) → ω_y decreases →
+    // heading decreases. To make heading INCREASE toward a positive
+    // diff, the controller emits NEGATIVE steer.
     var vm = try lua.Vm.init();
     defer vm.deinit();
 
@@ -459,7 +465,7 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
         \\function steer()
         \\  local diff = math.pi  -- desired requires +π rotation
         \\  local omega = ctx.own_vel.ang.y
-        \\  set_steer(clamp(kp * diff - kd * omega))
+        \\  set_steer(clamp(-(kp * diff - kd * omega)))
         \\  return "success"
         \\end
     );
@@ -469,7 +475,9 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
 
     var ai: ai_state.AiShip = .{ .id = 0x01000003, .tree = undefined };
 
-    // Case 1: angvel_y = 0 → P-only command saturates to +1.0.
+    // Case 1: angvel_y = 0, diff = +π → controller demands full
+    // negative steer (which produces +Y torque, growing ω_y, growing
+    // heading toward target).
     {
         const ctx: perception.PerceptionCtx = .{
             .tick = 0,
@@ -487,13 +495,14 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
         d.beginAi(&ai, &ctx);
         defer d.endAi();
         _ = d.dispatcher().action("steer");
-        try testing.expectApproxEqAbs(@as(f32, 1.0), ai.pending_input.?.steer, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, -1.0), ai.pending_input.?.steer, 1e-6);
     }
 
-    // Case 2: ship is already rotating in the desired direction at
-    // ω = 1.0 rad/s. With Kp*π = 2.0 and Kd*ω = 0.5, the raw command
-    // is 1.5 → clamped to 1.0 (still demanding full rotation; the
-    // damping has authority but the error term still dominates).
+    // Case 2: ship is already rotating toward the desired heading at
+    // ω = +1.0 rad/s (correct direction since heading needs to grow).
+    // Kp*π = 2.0, Kd*ω = 0.5; raw PD = 1.5; output = -1.5 → clamp to
+    // -1.0. Still demanding full counter-torque; damping has authority
+    // but the error dominates.
     {
         const ctx: perception.PerceptionCtx = .{
             .tick = 0,
@@ -511,14 +520,13 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
         d.beginAi(&ai, &ctx);
         defer d.endAi();
         _ = d.dispatcher().action("steer");
-        try testing.expectApproxEqAbs(@as(f32, 1.0), ai.pending_input.?.steer, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, -1.0), ai.pending_input.?.steer, 1e-6);
     }
 
-    // Case 3: ship has overshot the target (diff would now be near
-    // 0 in real conditions; we keep diff=π to isolate the damping
-    // term). At ω = 5.0 rad/s the damping overwhelms the proportional
-    // error: 2.0 - 2.5 = -0.5 → command flips negative, braking the
-    // overshoot. This is the case the wrap-bug fix targets.
+    // Case 3: ship is rotating well past the desired rate. ω = +5.0
+    // rad/s. Kp*π = 2.0, Kd*ω = 2.5 → raw PD = -0.5; output = +0.5,
+    // i.e. the command flips positive (away from the target direction)
+    // to brake the overshoot. This is the case the PD damping targets.
     {
         const ctx: perception.PerceptionCtx = .{
             .tick = 0,
@@ -536,7 +544,7 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
         d.beginAi(&ai, &ctx);
         defer d.endAi();
         _ = d.dispatcher().action("steer");
-        try testing.expectApproxEqAbs(@as(f32, -0.5), ai.pending_input.?.steer, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), ai.pending_input.?.steer, 1e-6);
     }
 }
 
