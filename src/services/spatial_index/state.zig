@@ -58,9 +58,20 @@ pub fn posToCell(pos_x: f32, pos_z: f32, cell_side_m: f32) CellId {
     };
 }
 
+/// Default hysteresis margin for cell transitions (m). An entity
+/// already in cell A doesn't transition to cell B until it's at
+/// least this far past the shared boundary into B. Set to 1 m so
+/// wave-induced sub-cm drift on a ship parked near a boundary
+/// (e.g. a sloop floating with `pos.z ≈ 0` at cell-side=200) doesn't
+/// thrash exit/enter deltas every state msg. Doesn't affect radius
+/// queries — pose is updated regardless. Override per-instance via
+/// `State.cell_hysteresis_m`.
+pub const default_cell_hysteresis_m: f32 = 1.0;
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     cell_side_m: f32,
+    cell_hysteresis_m: f32 = default_cell_hysteresis_m,
     /// Entity → (cell, pos). Single map keyed by entity id; the cell
     /// part drives delta generation and the pos part drives radius
     /// queries.
@@ -88,7 +99,9 @@ pub const State = struct {
     /// latest); the returned `Transition` describes whether the cell
     /// portion changed:
     ///   - null when the entity stays in the same cell as its last
-    ///     observation (steady-state — most state msgs)
+    ///     observation (steady-state — most state msgs), OR when the
+    ///     naive cell differs but the entity hasn't crossed the
+    ///     hysteresis margin past the boundary (anti-thrash)
     ///   - first sighting: `old_cell = null`, caller emits enter on
     ///     `new_cell`
     ///   - cross-cell move: `old_cell = some`, caller emits exit on
@@ -98,17 +111,56 @@ pub const State = struct {
         ent_id: u32,
         pos: [3]f32,
     ) !?Transition {
-        const new_cell = posToCell(pos[0], pos[2], self.cell_side_m);
+        const naive_cell = posToCell(pos[0], pos[2], self.cell_side_m);
         const gop = try self.entities.getOrPut(ent_id);
         if (gop.found_existing) {
             const old_cell = gop.value_ptr.cell;
             gop.value_ptr.pos = pos;
-            if (old_cell.eql(new_cell)) return null;
-            gop.value_ptr.cell = new_cell;
-            return .{ .new_cell = new_cell, .old_cell = old_cell };
+            if (old_cell.eql(naive_cell)) return null;
+            // Hysteresis: a naive cell change must clear the margin
+            // past the boundary to count. Otherwise sub-cm wave drift
+            // around `pos.z=0` thrashes deltas every state msg.
+            if (!self.crossedHysteresisBoundary(old_cell, naive_cell, pos)) {
+                return null;
+            }
+            gop.value_ptr.cell = naive_cell;
+            return .{ .new_cell = naive_cell, .old_cell = old_cell };
         }
-        gop.value_ptr.* = .{ .cell = new_cell, .pos = pos };
-        return .{ .new_cell = new_cell, .old_cell = null };
+        gop.value_ptr.* = .{ .cell = naive_cell, .pos = pos };
+        return .{ .new_cell = naive_cell, .old_cell = null };
+    }
+
+    /// True iff `pos` is at least `cell_hysteresis_m` into `naive`
+    /// past every boundary that separates it from `old`. For a single-
+    /// axis transition this is one boundary check; for diagonals
+    /// (both x and z change) both must clear, so an entity nicking
+    /// the corner doesn't bounce between three cells.
+    fn crossedHysteresisBoundary(
+        self: *const State,
+        old: CellId,
+        naive: CellId,
+        pos: [3]f32,
+    ) bool {
+        const h = self.cell_hysteresis_m;
+        if (naive.x != old.x) {
+            const boundary_x: f32 =
+                if (naive.x > old.x) @as(f32, @floatFromInt(naive.x)) * self.cell_side_m
+                else @as(f32, @floatFromInt(old.x)) * self.cell_side_m;
+            const into_new: f32 =
+                if (naive.x > old.x) pos[0] - boundary_x
+                else boundary_x - pos[0];
+            if (into_new < h) return false;
+        }
+        if (naive.z != old.z) {
+            const boundary_z: f32 =
+                if (naive.z > old.z) @as(f32, @floatFromInt(naive.z)) * self.cell_side_m
+                else @as(f32, @floatFromInt(old.z)) * self.cell_side_m;
+            const into_new: f32 =
+                if (naive.z > old.z) pos[2] - boundary_z
+                else boundary_z - pos[2];
+            if (into_new < h) return false;
+        }
+        return true;
     }
 
     /// Forget an entity (e.g. on explicit despawn). Returns the cell
@@ -215,6 +267,67 @@ test "observe: different cell returns transition" {
     const t = (try s.observe(1, .{ 250, 0, 50 })) orelse return error.ExpectedTransition;
     try testing.expectEqual(@as(?CellId, CellId{ .x = 0, .z = 0 }), t.old_cell);
     try testing.expectEqual(CellId{ .x = 1, .z = 0 }, t.new_cell);
+}
+
+test "observe: wave-jitter at z=0 boundary doesn't thrash deltas" {
+    // Sloop parked near (50, 0, 0). Wave noise drifts z by ±1 mm
+    // each tick. Without hysteresis, z=-0.001 → cell (0, -1) and
+    // z=+0.001 → cell (0, 0), oscillating exit/enter every state
+    // msg. With 1 m hysteresis, all of these stay in the original
+    // cell.
+    var s = State.init(testing.allocator, 200);
+    defer s.deinit();
+    _ = try s.observe(1, .{ 50, 0, 0.0 });
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 50, 0, -0.001 }));
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 50, 0, 0.001 }));
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 50, 0, -0.5 }));
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 50, 0, 0.5 }));
+    // Cell unchanged; pose tracked.
+    const rec = s.entities.get(1).?;
+    try testing.expectEqual(CellId{ .x = 0, .z = 0 }, rec.cell);
+    try testing.expectEqual(@as(f32, 0.5), rec.pos[2]);
+}
+
+test "observe: hysteresis releases once entity clears margin" {
+    // Entity in cell (0, 0). Walks east toward cell (1, 0) — at
+    // x=200.5 (boundary +0.5 m) we're still in cell (0, 0). At
+    // x=201.0+ we're firmly into (1, 0).
+    var s = State.init(testing.allocator, 200);
+    defer s.deinit();
+    _ = try s.observe(1, .{ 50, 0, 50 });
+    // Just past the boundary by 0.5 m — inside hysteresis margin.
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 200.5, 0, 50 }));
+    // 1.5 m past — clears the 1 m default margin.
+    const t = (try s.observe(1, .{ 201.5, 0, 50 })) orelse return error.ExpectedTransition;
+    try testing.expectEqual(@as(?CellId, CellId{ .x = 0, .z = 0 }), t.old_cell);
+    try testing.expectEqual(CellId{ .x = 1, .z = 0 }, t.new_cell);
+}
+
+test "observe: hysteresis applies symmetrically on negative-axis transitions" {
+    // Same idea, west-bound. cell (0, 0) → (-1, 0). Boundary at x=0.
+    var s = State.init(testing.allocator, 200);
+    defer s.deinit();
+    _ = try s.observe(1, .{ 50, 0, 50 });
+    // x=-0.5 nicks the boundary — still in (0, 0).
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ -0.5, 0, 50 }));
+    // x=-1.5 clears the margin.
+    const t = (try s.observe(1, .{ -1.5, 0, 50 })) orelse return error.ExpectedTransition;
+    try testing.expectEqual(CellId{ .x = -1, .z = 0 }, t.new_cell);
+}
+
+test "observe: diagonal corner-clip stays put unless both axes clear" {
+    // Entity in (0, 0). pos = (200.5, 0, 200.5) is in naive cell
+    // (1, 1) but only 0.5 m past both boundaries — should NOT
+    // transition. Avoids three-cell bouncing on a corner-graze.
+    var s = State.init(testing.allocator, 200);
+    defer s.deinit();
+    _ = try s.observe(1, .{ 50, 0, 50 });
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 200.5, 0, 200.5 }));
+    // Clear x but not z — still no transition.
+    try testing.expectEqual(@as(?Transition, null), try s.observe(1, .{ 202, 0, 200.5 }));
+    // Clear both — transition lands.
+    const t = (try s.observe(1, .{ 202, 0, 202 })) orelse return error.ExpectedTransition;
+    try testing.expectEqual(CellId{ .x = 1, .z = 1 }, t.new_cell);
 }
 
 test "observe: multiple entities tracked independently" {

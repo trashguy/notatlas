@@ -224,6 +224,13 @@ const Args = struct {
     /// Cell side (m). Used when looking up env-sim's per-cell wind
     /// by ship pose. Must match env-sim's --cell-side.
     cell_side_m: f32 = default_cell_side_m,
+    /// Optional initial linear velocity for ship#1 at spawn (m/s, +X).
+    /// 0 disables. Used by the cross-cell transit smoke harness to
+    /// move a ship across a cell boundary without an AI or interactive
+    /// driver: with `--init-vel-x 30 --wind-speed 0` ship#1 coasts
+    /// along +X for several seconds before drag damps it. Other ships
+    /// are unaffected.
+    init_vel_x_mps: f32 = 0,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -274,6 +281,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--cell-side")) {
             out.cell_side_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
             if (out.cell_side_m <= 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--init-vel-x")) {
+            out.init_vel_x_mps = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -580,6 +589,23 @@ pub fn main() !void {
                 .{ args.shard, args.spacing_m },
             );
         },
+    }
+
+    // Optional kick: cross-cell transit smoke needs ship#1 in motion
+    // without an AI or interactive driver. `--init-vel-x` sets the
+    // body's linear velocity directly; with `--wind-speed 0` no sail
+    // force kicks in to alter it, and Jolt damping bleeds the velocity
+    // off over time — enough to traverse a 200 m cell at v=30 m/s in
+    // ~7 s of coast.
+    if (args.init_vel_x_mps != 0) {
+        const ship1_id: u32 = notatlas.entity_kind.pack(ship_kind, 1);
+        if (state.entities.get(ship1_id)) |e| {
+            phys.setLinearVelocity(e.body_id, .{ args.init_vel_x_mps, 0, 0 });
+            std.debug.print(
+                "ship-sim [{s}]: ship#1 init velocity set to ({d:.1}, 0, 0) m/s\n",
+                .{ args.shard, args.init_vel_x_mps },
+            );
+        }
     }
 
     // Spawn N free-agent player capsules. Each gets a tagged id
