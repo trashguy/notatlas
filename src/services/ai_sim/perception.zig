@@ -75,6 +75,12 @@ pub const BuildOpts = struct {
     /// 1/20 — fixed-step. Future variable-rate cohort scheduling could
     /// vary this per cohort; leaves should not assume 0.05.
     dt: f32,
+    /// Per-cell wind cache — populated by main.zig's drainWindSub
+    /// from env-sim's `env.cell.<x>_<z>.wind` publishes. Indexed
+    /// by `[2]i32{cell.x, cell.z}` storing world-frame `(vx, vz)`
+    /// velocity vectors. Empty (or no entry for the AI's cell) → ctx
+    /// wind defaults to `{0, 0}`.
+    wind_cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
 };
 
 /// Build a PerceptionCtx for `opts.ai_id` from the cohort's world
@@ -118,6 +124,26 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
 
     const nearest = nearestEnemy(cohort, opts.ai_id, own.x, own.y, own.z, opts.perception_radius_m);
 
+    // Wind from env-sim's per-cell publish. Wire format is the
+    // world-frame velocity vector `(vx, vz)`; ctx.wind exposes
+    // `(dir, speed)` to Lua leaves so direction-aware checks like
+    // "wind from astern" don't have to do their own atan2 + sqrt.
+    // dir convention matches ship heading: 0 = blowing toward −Z.
+    //   speed = sqrt(vx² + vz²)
+    //   dir   = atan2(vx, −vz)
+    // Empty cache or no entry for this cell defaults to {0, 0} —
+    // same graceful-degradation pattern as the rest of ai-sim.
+    var wind: Wind = .{ .dir = 0, .speed = 0 };
+    if (opts.wind_cache.get(.{ cell.x, cell.y })) |v| {
+        const vx = v[0];
+        const vz = v[1];
+        const speed = @sqrt(vx * vx + vz * vz);
+        wind = .{
+            .dir = if (speed > 0) std.math.atan2(vx, -vz) else 0,
+            .speed = speed,
+        };
+    }
+
     return .{
         .tick = opts.tick,
         .dt = opts.dt,
@@ -127,7 +153,7 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
         // Plumbed through 2026-05-01 alongside the damage system; the
         // low_hp flee branch in pirate_sloop.lua becomes reachable.
         .own_hp = own.hp,
-        .wind = .{ .dir = 0, .speed = 0 },
+        .wind = wind,
         .cell = cell,
         .nearest_enemy = nearest,
     };
@@ -182,6 +208,10 @@ fn nearestEnemy(
 
 const testing = std.testing;
 
+/// Shared empty cache for tests — `build()`'s wind_cache pointer
+/// is never nullable; tests that don't care about wind use this.
+var empty_wind_cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
+
 test "perception: build returns null when own pose unknown" {
     var c = ai_state.Cohort.init(testing.allocator);
     defer c.deinit();
@@ -191,6 +221,7 @@ test "perception: build returns null when own pose unknown" {
         .cell_side_m = 200,
         .tick = 0,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     });
     try testing.expect(ctx == null);
 }
@@ -218,6 +249,7 @@ test "perception: nearest_enemy picks closest ship within radius" {
         .cell_side_m = 200,
         .tick = 1,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     }).?;
     try testing.expect(ctx.nearest_enemy != null);
     try testing.expectEqual(near_id, ctx.nearest_enemy.?.id);
@@ -234,6 +266,7 @@ test "perception: cell derived from own pose floor()" {
         .cell_side_m = 200,
         .tick = 1,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     }).?;
     // x=250 → floor(250/200)=1; z=-50 → floor(-50/200)=-1
     try testing.expectEqual(@as(i32, 1), ctx.cell.x);
@@ -252,6 +285,7 @@ test "perception: nearest_enemy nil when nothing in radius" {
         .cell_side_m = 200,
         .tick = 1,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     }).?;
     try testing.expect(ctx.nearest_enemy == null);
 }
@@ -275,6 +309,7 @@ test "perception: nearestEnemy skips sunk ships" {
         .cell_side_m = 200,
         .tick = 1,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     }).?;
     try testing.expectEqual(live_id, ctx.nearest_enemy.?.id);
     try testing.expectEqual(@as(f32, 0.5), ctx.nearest_enemy.?.hp);
@@ -293,6 +328,56 @@ test "perception: own_hp pulled from firehose StateMsg.hp" {
         .cell_side_m = 200,
         .tick = 1,
         .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
     }).?;
     try testing.expectEqual(@as(f32, 0.25), ctx.own_hp);
+}
+
+test "perception: wind read from cache at AI's cell" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    // x=250, z=-50 → cell (1, -1) at cell_side=200
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 250, .y = 0, .z = -50 }, 1);
+
+    var cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
+    defer cache.deinit(testing.allocator);
+    // Wind at cell (1, -1): vx=0, vz=-10 → blowing toward -Z (heading 0).
+    try cache.put(testing.allocator, .{ 1, -1 }, .{ 0, -10 });
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+        .wind_cache = &cache,
+    }).?;
+    try testing.expectApproxEqAbs(@as(f32, 10.0), ctx.wind.speed, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.wind.dir, 1e-4);
+}
+
+test "perception: wind defaults to zero when no entry for cell" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 0, .y = 0, .z = 0 }, 1);
+
+    var cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
+    defer cache.deinit(testing.allocator);
+    // Entry for a different cell — AI's cell (0,0) has no entry.
+    try cache.put(testing.allocator, .{ 5, 5 }, .{ 8, -6 });
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+        .wind_cache = &cache,
+    }).?;
+    try testing.expectEqual(@as(f32, 0), ctx.wind.speed);
+    try testing.expectEqual(@as(f32, 0), ctx.wind.dir);
 }

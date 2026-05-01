@@ -448,6 +448,30 @@ pub fn build(b: *std.Build) void {
     ai_sim_perception_test_mod.addImport("wire", wire_mod);
     const ai_sim_perception_tests = b.addTest(.{ .root_module = ai_sim_perception_test_mod });
     test_step.dependOn(&b.addRunArtifact(ai_sim_perception_tests).step);
+
+    // ----- env-sim service (Phase 2, docs/02 §5) -----
+    //
+    // Per-cell environmental sampling at 5 Hz. v0 publishes wind only
+    // (waves / tide / time-of-day to follow). Loads `data/wind.yaml`
+    // and samples `notatlas.wind_query.windAt` at each cell center.
+    const env_sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/env_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    env_sim_mod.addImport("notatlas", notatlas_mod);
+    env_sim_mod.addImport("nats", nats_mod);
+    env_sim_mod.addImport("wire", wire_mod);
+    const env_sim = b.addExecutable(.{
+        .name = "env-sim",
+        .root_module = env_sim_mod,
+    });
+    b.installArtifact(env_sim);
+
+    const run_env_sim = b.addRunArtifact(env_sim);
+    if (b.args) |args| run_env_sim.addArgs(args);
+    const env_sim_step = b.step("env-sim", "Run the env-sim service");
+    env_sim_step.dependOn(&run_env_sim.step);
 }
 
 fn embedShader(

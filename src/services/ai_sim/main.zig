@@ -237,6 +237,10 @@ pub fn main() !void {
         std.debug.print("ai-sim: registered AI ship id=0x{X:0>8} (seq={d})\n", .{ ship_id, seq });
     }
 
+    // ----- wind cache (env-sim → perception ctx.wind) -----
+    var wind_cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
+    defer wind_cache.deinit(allocator);
+
     // ----- watcher state -----
     var archetype_mtime = statMtime(args.archetype_path) catch 0;
     var leaves_mtime = statMtime(args.leaves_path) catch 0;
@@ -261,7 +265,7 @@ pub fn main() !void {
         // model — we don't act on wind yet, but we still drain so
         // messages don't pile up in the client buffer.
         state_msgs_total += try drainStateSub(allocator, sub_state, &cohort, tick_n);
-        wind_msgs_total += drainWindSub(sub_wind);
+        wind_msgs_total += drainWindSub(allocator, sub_wind, &wind_cache);
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
@@ -274,6 +278,7 @@ pub fn main() !void {
                 tick_n,
                 archetype.perception_radius,
                 args.cell_side_m,
+                &wind_cache,
             );
             tick_n += 1;
             last_tick_ns +%= tick_period_ns;
@@ -332,14 +337,20 @@ fn drainStateSub(
     return count;
 }
 
-fn drainWindSub(sub: anytype) u64 {
-    // Step-5 stub: drain to keep the buffer empty, but env service
-    // doesn't exist yet so payloads aren't decoded. Step 6 plugs
-    // wind into the perception ctx.
+fn drainWindSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    cache: *std.AutoHashMapUnmanaged([2]i32, [2]f32),
+) u64 {
     var count: u64 = 0;
     while (sub.nextMsg()) |msg| {
         var owned = msg;
         defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const cell = wire.parseCellFromWindSubject(owned.subject) catch continue;
+        const parsed = wire.decodeWind(allocator, payload) catch continue;
+        defer parsed.deinit();
+        cache.put(allocator, .{ cell.x, cell.z }, .{ parsed.value.vx, parsed.value.vz }) catch {};
         count += 1;
     }
     return count;
@@ -361,6 +372,7 @@ fn tickCohort(
     tick: u64,
     perception_radius_m: u32,
     cell_side_m: f32,
+    wind_cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
 ) !u64 {
     const now_ms: i64 = @intCast(@divFloor(@as(i128, tick) * @as(i128, std.time.ns_per_s / 20), std.time.ns_per_ms));
     var bt_ctx: bt.TickCtx = .{ .now_ms = now_ms, .dispatcher = disp.dispatcher() };
@@ -373,6 +385,7 @@ fn tickCohort(
             .cell_side_m = cell_side_m,
             .tick = tick,
             .dt = tick_dt,
+            .wind_cache = wind_cache,
         }) orelse continue;
 
         disp.beginAi(ai, &p_ctx);

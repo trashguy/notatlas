@@ -285,6 +285,52 @@ pub fn parseVictimIdFromDamageSubject(subject: []const u8) !u32 {
     return std.fmt.parseInt(u32, id_str, 10);
 }
 
+
+/// `env.cell.<x>_<z>.wind` payload — published by env-sim per
+/// docs/02 §5 (env service @ 5 Hz). World-frame wind velocity
+/// vector. (vx, vz) rather than (dir, speed) because:
+///   - ship-sim's sail force takes the dot product with ship
+///     forward — vector form skips a sin/cos round-trip per tick;
+///   - ai-sim's perception ctx exposes (dir, speed) to Lua leaves
+///     and converts at the perception-build site (one conversion
+///     per AI per tick, not per leaf).
+///
+/// Convention matches the heading scheme: `(vx=0, vz=-speed)` is
+/// wind blowing toward −Z (heading 0). Speed = sqrt(vx² + vz²).
+pub const WindMsg = struct {
+    vx: f32,
+    vz: f32,
+};
+
+pub fn encodeWind(allocator: std.mem.Allocator, msg: WindMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeWind(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(WindMsg) {
+    return std.json.parseFromSlice(WindMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the cell coordinates from an `env.cell.<x>_<z>.wind`
+/// subject. Returns `(cell_x, cell_z)` as `i32`; negative coords
+/// land via the signed-int parse path. Errors on malformed
+/// subjects or missing underscore.
+pub fn parseCellFromWindSubject(subject: []const u8) !struct { x: i32, z: i32 } {
+    const prefix = "env.cell.";
+    const suffix = ".wind";
+    if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
+    const mid = subject[prefix.len .. subject.len - suffix.len];
+    const sep = std.mem.indexOfScalar(u8, mid, '_') orelse return error.BadSubject;
+    const x_str = mid[0..sep];
+    const z_str = mid[sep + 1 ..];
+    if (x_str.len == 0 or z_str.len == 0) return error.BadSubject;
+    return .{
+        .x = try std.fmt.parseInt(i32, x_str, 10),
+        .z = try std.fmt.parseInt(i32, z_str, 10),
+    };
+}
+
 /// `idx.spatial.attach.<player_id>` payload — published by ship-sim
 /// on board / disembark transitions per docs/08 §2A.2 step 5. The
 /// spatial-index subscribes and emits the synthetic enter/exit deltas
@@ -619,6 +665,29 @@ test "wire: damage roundtrip" {
     const parsed = try decodeDamage(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: wind roundtrip" {
+    const orig: WindMsg = .{ .vx = 4.5, .vz = -7.2 };
+    const buf = try encodeWind(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeWind(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: parseCellFromWindSubject" {
+    const a = try parseCellFromWindSubject("env.cell.0_0.wind");
+    try testing.expectEqual(@as(i32, 0), a.x);
+    try testing.expectEqual(@as(i32, 0), a.z);
+
+    const b = try parseCellFromWindSubject("env.cell.-3_5.wind");
+    try testing.expectEqual(@as(i32, -3), b.x);
+    try testing.expectEqual(@as(i32, 5), b.z);
+
+    try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell.0.wind"));
+    try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell.0_0.delta"));
+    try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell._5.wind"));
 }
 
 test "wire: parseVictimIdFromDamageSubject" {

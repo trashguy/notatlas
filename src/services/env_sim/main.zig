@@ -1,0 +1,226 @@
+//! env-sim — environmental sampling service per docs/02 §5.
+//!
+//! v0 scope: wind only. 5 Hz tick (matches the locked
+//! architecture-decision tick rate for environment). On boot loads
+//! `data/wind.yaml` via `notatlas.yaml_loader.loadWindFromFile`,
+//! then once per tick samples `notatlas.wind_query.windAt` at the
+//! center of every cell in the publish set and emits
+//! `env.cell.<x>_<z>.wind { vx, vz }` per cell.
+//!
+//! Why per-cell publish (rather than one global wind subject):
+//!   - matches docs/02 §1.2 NATS scheme `env.cell.<x>_<y>.*` for
+//!     static-state subjects;
+//!   - sets up plumbing for per-cell wind variation (storms drift,
+//!     coastal effects) without a wire change;
+//!   - subscribers (ship-sim, ai-sim) wildcard-subscribe and route
+//!     by parsed cell, no per-cell sub setup needed.
+//!
+//! v0 publishes a 3×3 cell block centered on (0, 0) by default —
+//! covers the dev sandbox where ships spawn near the origin.
+//! Override via `--cell` (repeatable). Phase 2 expands to per-shard
+//! sharding (each env-sim instance owns a contiguous block of
+//! cells).
+//!
+//! Wave seed / tide / time-of-day are deferred. They live on the
+//! same service surface but each gets its own wire shape and tick
+//! cadence (waves at 5 Hz alongside wind, tide hourly, ToD every
+//! few seconds).
+
+const std = @import("std");
+const nats = @import("nats");
+const notatlas = @import("notatlas");
+const wire = @import("wire");
+
+const tick_period_ns: u64 = std.time.ns_per_s / 5; // 5 Hz
+const log_interval_ns: u64 = std.time.ns_per_s;
+
+/// Default cell side (m). Must match the value spatial-index runs
+/// with — the cell-center coordinate the wind is sampled at uses
+/// this. Phase 2 scales the world to the production 4 km cell side
+/// per docs/06; for now 200 m matches spatial-index's dev default.
+const default_cell_side_m: f32 = 200.0;
+
+const wind_config_path = "data/wind.yaml";
+
+const CellCoord = struct { x: i32, z: i32 };
+
+const Args = struct {
+    nats_url: []const u8 = "nats://127.0.0.1:4222",
+    cell_side_m: f32 = default_cell_side_m,
+    /// Set of (cell_x, cell_z) coordinates to publish wind for.
+    /// Empty → defaults to a 3×3 block centered on (0, 0).
+    cells: []const CellCoord = &.{},
+};
+
+fn parseArgs(allocator: std.mem.Allocator) !Args {
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.next();
+
+    var out: Args = .{};
+    var have_nats = false;
+    var cells: std.ArrayListUnmanaged(CellCoord) = .{};
+    errdefer cells.deinit(allocator);
+
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--nats")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.nats_url = try allocator.dupe(u8, v);
+            have_nats = true;
+        } else if (std.mem.eql(u8, a, "--cell-side")) {
+            out.cell_side_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+            if (out.cell_side_m <= 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--cell")) {
+            const v = args.next() orelse return error.MissingArg;
+            const sep = std.mem.indexOfScalar(u8, v, '_') orelse {
+                std.debug.print("env-sim: bad --cell '{s}' (want X_Z, e.g. 0_0)\n", .{v});
+                return error.BadArg;
+            };
+            const x = try std.fmt.parseInt(i32, v[0..sep], 10);
+            const z = try std.fmt.parseInt(i32, v[sep + 1 ..], 10);
+            try cells.append(allocator, .{ .x = x, .z = z });
+        } else {
+            std.debug.print("env-sim: unknown arg '{s}'\n", .{a});
+            return error.BadArg;
+        }
+    }
+    if (!have_nats) out.nats_url = try allocator.dupe(u8, out.nats_url);
+
+    if (cells.items.len == 0) {
+        // Default: 3×3 around origin.
+        var z: i32 = -1;
+        while (z <= 1) : (z += 1) {
+            var x: i32 = -1;
+            while (x <= 1) : (x += 1) {
+                try cells.append(allocator, .{ .x = x, .z = z });
+            }
+        }
+    }
+    out.cells = try cells.toOwnedSlice(allocator);
+    return out;
+}
+
+fn freeArgs(allocator: std.mem.Allocator, a: *Args) void {
+    allocator.free(a.nats_url);
+    allocator.free(a.cells);
+}
+
+var g_running: std.atomic.Value(bool) = .init(true);
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    g_running.store(false, .release);
+}
+
+fn installSignalHandlers() !void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = &handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
+fn loadWind(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wind_query.WindParams {
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel_path);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadWindFromFile(gpa, abs);
+}
+
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = try parseArgs(allocator);
+    defer freeArgs(allocator, &args);
+    try installSignalHandlers();
+
+    const wind_params = try loadWind(allocator, wind_config_path);
+    defer wind_params.deinit(allocator);
+
+    std.debug.print(
+        "env-sim: connecting to {s}; cell_side={d:.0} m; publishing wind for {d} cell(s); base_speed={d:.1} m/s base_dir={d:.2} rad\n",
+        .{
+            args.nats_url,
+            args.cell_side_m,
+            args.cells.len,
+            wind_params.base_speed_mps,
+            wind_params.base_direction_rad,
+        },
+    );
+
+    var client = try nats.Client.connect(allocator, .{
+        .servers = &.{args.nats_url},
+        .name = "env-sim",
+    });
+    defer client.close();
+
+    const start_ns: u64 = @intCast(std.time.nanoTimestamp());
+    var last_tick_ns: u64 = start_ns;
+    var last_log_ns: u64 = start_ns;
+    var pubs_in_window: u64 = 0;
+    var tick_n: u64 = 0;
+
+    // World clock in seconds since boot — drives the slow shift in
+    // base direction (windAt is a function of (x, z, t) not a
+    // monotonic counter). f64 because the wipe cycle is ~10 weeks.
+    var world_time_s: f64 = 0;
+
+    while (g_running.load(.acquire)) {
+        try client.processIncomingTimeout(5);
+        try client.maybeSendPing();
+
+        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        if (now_ns -% last_tick_ns >= tick_period_ns) {
+            // Catch-up loop in case a long log flush or GC pause put
+            // us behind. Bound the catch-up at 5 to avoid spiral
+            // catch-up making things worse.
+            var ticks_due: u32 = 0;
+            while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < 5) : (ticks_due += 1) {
+                pubs_in_window += try publishTick(allocator, client, wind_params, args.cells, args.cell_side_m, world_time_s);
+                tick_n += 1;
+                world_time_s += 1.0 / 5.0;
+                last_tick_ns +%= tick_period_ns;
+            }
+        }
+
+        if (now_ns -% last_log_ns >= log_interval_ns) {
+            std.debug.print(
+                "[env-sim] {d} ticks last 1 s (target 5); {d} cells × 5 Hz = {d} pubs/s expected, {d} actual\n",
+                .{ tick_n -% (tick_n -| 5), args.cells.len, args.cells.len * 5, pubs_in_window },
+            );
+            pubs_in_window = 0;
+            last_log_ns = now_ns;
+        }
+    }
+
+    std.debug.print("env-sim: shutting down at tick {d}\n", .{tick_n});
+}
+
+fn publishTick(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    params: notatlas.wind_query.WindParams,
+    cells: []const CellCoord,
+    cell_side_m: f32,
+    world_time_s: f64,
+) !u64 {
+    var count: u64 = 0;
+    const t: f32 = @floatCast(world_time_s);
+    for (cells) |c| {
+        // Sample at the cell's center in world coords.
+        const cx_world: f32 = (@as(f32, @floatFromInt(c.x)) + 0.5) * cell_side_m;
+        const cz_world: f32 = (@as(f32, @floatFromInt(c.z)) + 0.5) * cell_side_m;
+        const w = notatlas.wind_query.windAt(params, cx_world, cz_world, t);
+
+        const msg: wire.WindMsg = .{ .vx = w[0], .vz = w[1] };
+        var subj_buf: [64]u8 = undefined;
+        const subj = try std.fmt.bufPrint(&subj_buf, "env.cell.{d}_{d}.wind", .{ c.x, c.z });
+        const buf = try wire.encodeWind(allocator, msg);
+        defer allocator.free(buf);
+        try client.publish(subj, buf);
+        count += 1;
+    }
+    return count;
+}

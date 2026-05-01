@@ -118,6 +118,11 @@ const default_wind_dir_rad: f32 = 0;
 /// v0 hardcoded wind speed (m/s). Moderate breeze. CLI:
 /// `--wind-speed <mps>`.
 const default_wind_speed_mps: f32 = 10.0;
+/// Cell side (m) used when looking up env-sim's per-cell wind by
+/// ship pose. Must match env-sim's `--cell-side` and spatial-index's
+/// `--cell-side` — all three live in the same world. CLI:
+/// `--cell-side <m>`.
+const default_cell_side_m: f32 = 200.0;
 /// Steer applies a lateral force at the bow → torque around +y.
 /// 30 kN at the bow (~3 m forward) gives 90 kN·m torque on a hull
 /// with rough rotational inertia ~30,000 kg·m² → 3 rad/s² peak —
@@ -212,6 +217,9 @@ const Args = struct {
     /// of the test (`--ship-max-hp 9999` is effectively immortal).
     /// Phase 2 lifts max HP into per-hull YAML config alongside mass.
     ship_max_hp: f32 = sloop_max_hp,
+    /// Cell side (m). Used when looking up env-sim's per-cell wind
+    /// by ship pose. Must match env-sim's --cell-side.
+    cell_side_m: f32 = default_cell_side_m,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -259,6 +267,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--ship-max-hp")) {
             out.ship_max_hp = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
             if (out.ship_max_hp <= 0) return error.BadArg;
+        } else if (std.mem.eql(u8, a, "--cell-side")) {
+            out.cell_side_m = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+            if (out.cell_side_m <= 0) return error.BadArg;
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -469,10 +480,19 @@ pub fn main() !void {
     // the entity id out of the subject, and update the matching
     // entity's latched input. Unknown ids are ignored.
     const sub_input = try client.subscribe("sim.entity.*.input", .{});
+    // Wind from env-sim. Drained each tick into a per-cell cache;
+    // applyShipInputForces looks up wind by ship pose. If env-sim
+    // isn't running, the cache stays empty and we fall back to the
+    // CLI args (--wind-dir, --wind-speed). Same graceful-degradation
+    // pattern as the existing services.
+    const sub_wind = try client.subscribe("env.cell.*.wind", .{});
     std.debug.print(
-        "ship-sim [{s}]: connected; tick rate 60 Hz; subscribed to sim.entity.*.input\n",
+        "ship-sim [{s}]: connected; tick rate 60 Hz; subscribed to sim.entity.*.input, env.cell.*.wind\n",
         .{args.shard},
     );
+
+    var wind_cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
+    defer wind_cache.deinit(allocator);
 
     var state = sim_state.State.init(allocator);
     defer state.deinit(&phys);
@@ -584,11 +604,14 @@ pub fn main() !void {
         // inline. Mutations are safe here because phys.step hasn't
         // been called yet for the upcoming tick.
         try drainInputSub(allocator, client, sub_input, &state, &phys);
+        // Drain env-sim wind updates into the per-cell cache. Best-
+        // effort: malformed payloads dropped silently.
+        drainWindSub(allocator, sub_wind, &wind_cache);
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
         while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < max_ticks_per_loop) : (ticks_due += 1) {
-            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull.half_extents, world_time_s, ammo, args.wind_dir_rad, args.wind_speed_mps);
+            try tick(allocator, client, &state, &phys, &buoy_ship, &buoy_player, wave_params, phys_t, hull.half_extents, world_time_s, ammo, args.wind_dir_rad, args.wind_speed_mps, &wind_cache, args.cell_side_m);
             tick_n += 1;
             phys_t += phys_dt_fixed;
             world_time_s += @as(f64, phys_dt_fixed);
@@ -711,6 +734,45 @@ fn fireCannon(
 /// requested transition. This is safe to do here (between ticks)
 /// because ship-sim hasn't called `phys.step` yet for the upcoming
 /// tick.
+/// Drain `env.cell.*.wind` into the per-cell cache. Malformed
+/// payloads or unparseable subjects are dropped silently.
+/// applyShipInputForces consumes by ship pose.
+fn drainWindSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    cache: *std.AutoHashMapUnmanaged([2]i32, [2]f32),
+) void {
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const cell = wire.parseCellFromWindSubject(owned.subject) catch continue;
+        const parsed = wire.decodeWind(allocator, payload) catch continue;
+        defer parsed.deinit();
+        cache.put(allocator, .{ cell.x, cell.z }, .{ parsed.value.vx, parsed.value.vz }) catch {};
+    }
+}
+
+/// Look up wind for a world position by computing its cell and
+/// checking the env-sim cache. Falls back to (sin(d), -cos(d))×s
+/// from the CLI defaults if no env publish has been received for
+/// that cell yet — same convention as ship-sim's --wind-dir.
+fn windAtPos(
+    cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
+    pos: [3]f32,
+    cell_side_m: f32,
+    fallback_dir_rad: f32,
+    fallback_speed_mps: f32,
+) [2]f32 {
+    const cx: i32 = @intFromFloat(@floor(pos[0] / cell_side_m));
+    const cz: i32 = @intFromFloat(@floor(pos[2] / cell_side_m));
+    if (cache.get(.{ cx, cz })) |v| return v;
+    return .{
+        fallback_speed_mps * std.math.sin(fallback_dir_rad),
+        -fallback_speed_mps * std.math.cos(fallback_dir_rad),
+    };
+}
+
 fn drainInputSub(
     allocator: std.mem.Allocator,
     client: *nats.Client,
@@ -1113,8 +1175,7 @@ fn applyShipInputForces(
     phys: *physics.System,
     e: *const sim_state.Entity,
     half_extents: [3]f32,
-    wind_dir_rad: f32,
-    wind_speed_mps: f32,
+    wind_world_xz: [2]f32,
 ) void {
     if (e.input.thrust == 0 and e.input.steer == 0) return;
     const pos = phys.getPosition(e.body_id) orelse return;
@@ -1125,10 +1186,9 @@ fn applyShipInputForces(
 
     // Sail model. `thrust` ∈ [-1, 1] is interpreted as sail trim
     // (negative clamps to 0 — sails can't reverse-thrust the hull).
-    // Wind velocity vector in world frame:
-    //   wind_world = wind_speed × (sin(dir), 0, −cos(dir))
-    // (Same heading convention as the ship: dir = 0 means blowing
-    // toward −Z.)
+    // Wind velocity vector in world frame is supplied by the caller
+    // (sampled from env-sim's per-cell publish, falling back to the
+    // CLI defaults when env-sim is offline).
     //
     // Forward force magnitude scales with the projection of wind
     // onto the ship's forward axis, signed and squared:
@@ -1144,15 +1204,9 @@ fn applyShipInputForces(
     if (e.input.thrust != 0) {
         const sail_trim = if (e.input.thrust > 0) e.input.thrust else 0;
         if (sail_trim > 0) {
-            const wind_world: notatlas.math.Vec3 = .{
-                .x = wind_speed_mps * std.math.sin(wind_dir_rad),
-                .y = 0,
-                .z = -wind_speed_mps * std.math.cos(wind_dir_rad),
-            };
             const wind_along =
-                wind_world.x * forward_world.x +
-                wind_world.y * forward_world.y +
-                wind_world.z * forward_world.z;
+                wind_world_xz[0] * forward_world.x +
+                wind_world_xz[1] * forward_world.z;
             const norm = wind_along / wind_baseline_mps;
             const sign: f32 = if (wind_along >= 0) 1.0 else -1.0;
             const f = sail_trim * sail_force_max_n * sign * norm * norm;
@@ -1238,13 +1292,19 @@ fn tick(
     ammo: notatlas.projectile.AmmoParams,
     wind_dir_rad: f32,
     wind_speed_mps: f32,
+    wind_cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
+    cell_side_m: f32,
 ) !void {
     // Input forces first, then buoyancy. Order doesn't physically
     // matter — Jolt sums all forces between steps — but reads as
     // "what the player wants → what the water does → integrate."
     var input_it = state.entities.valueIterator();
     while (input_it.next()) |e| switch (e.kind) {
-        .ship => applyShipInputForces(phys, e, hull_half_extents, wind_dir_rad, wind_speed_mps),
+        .ship => {
+            const ship_pos = phys.getPosition(e.body_id) orelse e.pose.pos;
+            const wind_xz = windAtPos(wind_cache, ship_pos, cell_side_m, wind_dir_rad, wind_speed_mps);
+            applyShipInputForces(phys, e, hull_half_extents, wind_xz);
+        },
         .free_agent => applyPlayerInputForces(phys, e),
     };
 
