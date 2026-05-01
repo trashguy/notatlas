@@ -187,11 +187,20 @@ pub fn main() !void {
     defer pool.deinit();
     std.debug.print("persistence-writer: pg connected\n", .{});
 
-    const cycle_id = probeCurrentCycle(pool) catch |err| {
+    var cycle_id: i64 = probeCurrentCycle(pool) catch |err| {
         std.debug.print("persistence-writer: cycle probe failed: {}\n", .{err});
         return err;
     };
     std.debug.print("persistence-writer: current cycle id={d}\n", .{cycle_id});
+
+    // `admin.cycle.changed` is the wipe-rollover signal. We don't
+    // trust the message payload — instead we re-probe wipe_cycles to
+    // get the new authoritative cycle id. This way a malformed or
+    // late-delivered notification can't pin pwriter to the wrong
+    // cycle. Core NATS (best-effort): if we miss the message, the
+    // boot-time probe corrects on next restart.
+    const cycle_sub = try nats_client.subscribe("admin.cycle.changed", .{});
+    defer nats_client.unsubscribe(cycle_sub) catch {};
 
     var js = nats.JetStream.Context.init(nats_client);
     var pulls: [stream_specs.len]nats.JetStream.PullSubscription = undefined;
@@ -218,6 +227,30 @@ pub fn main() !void {
     var totals = [_]u64{0} ** stream_specs.len;
     var last_log_ns: i128 = std.time.nanoTimestamp();
     while (!stop_flag.load(.acquire)) {
+        // pull.fetch internally calls processIncoming which dispatches
+        // ALL routed messages — so cycle_sub is being filled by the
+        // fetches below. Drain any pending cycle-changed notifications
+        // before processing events so a rolled cycle takes effect on
+        // the next handler call.
+        while (cycle_sub.nextMsg()) |msg_orig| {
+            var cmsg = msg_orig;
+            defer cmsg.deinit();
+            const new_cycle = probeCurrentCycle(pool) catch |err| {
+                std.debug.print(
+                    "persistence-writer: cycle re-probe failed: {}\n",
+                    .{err},
+                );
+                continue;
+            };
+            if (new_cycle != cycle_id) {
+                std.debug.print(
+                    "persistence-writer: cycle rolled {d} -> {d}\n",
+                    .{ cycle_id, new_cycle },
+                );
+                cycle_id = new_cycle;
+            }
+        }
+
         var any_processed = false;
         for (stream_specs, 0..) |spec, i| {
             const msgs = pulls[i].fetch(fetch_batch, fetch_timeout_ms) catch |err| {
