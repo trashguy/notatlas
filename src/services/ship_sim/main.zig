@@ -238,6 +238,11 @@ const Args = struct {
     /// along +X for several seconds before drag damps it. Other ships
     /// are unaffected.
     init_vel_x_mps: f32 = 0,
+    /// Optional initial linear velocity for ship#2 (the duel target)
+    /// at spawn (m/s, +X). Only honored in `--layout duel`. Lets the
+    /// pitch-lead smoke put the target ship in motion so the
+    /// closed-form prediction in `fireCannon` is exercised. 0 disables.
+    duel_target_vel_x_mps: f32 = 0,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -290,6 +295,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             if (out.cell_side_m <= 0) return error.BadArg;
         } else if (std.mem.eql(u8, a, "--init-vel-x")) {
             out.init_vel_x_mps = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
+        } else if (std.mem.eql(u8, a, "--duel-target-vel-x")) {
+            out.duel_target_vel_x_mps = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingArg);
         } else {
             std.debug.print("ship-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -614,6 +621,16 @@ pub fn main() !void {
             );
         }
     }
+    if (args.layout == .duel and args.duel_target_vel_x_mps != 0) {
+        const ship2_id: u32 = notatlas.entity_kind.pack(ship_kind, 2);
+        if (state.entities.get(ship2_id)) |e| {
+            phys.setLinearVelocity(e.body_id, .{ args.duel_target_vel_x_mps, 0, 0 });
+            std.debug.print(
+                "ship-sim [{s}]: ship#2 (duel target) init velocity set to ({d:.1}, 0, 0) m/s\n",
+                .{ args.shard, args.duel_target_vel_x_mps },
+            );
+        }
+    }
 
     // Spawn N free-agent player capsules. Each gets a tagged id
     // (`EntityKind.player | seq`) and is placed offset along +X from
@@ -740,19 +757,34 @@ fn fireCannon(
         pos[2] + world_offset.z,
     };
 
-    // Pitch compensation. Even with yaw-only fire the muzzle still
-    // bobs ±8 m on swell, and a horizontal shot from a wave crest
-    // sails over a sea-level target. Find the nearest enemy ship in
-    // cannon range and solve the closed-form vacuum-ballistic arc:
-    //   tan(θ_p) = (R ± √(R² − 4a(a − h))) / (2a)
-    // where a = g·R² / (2v²), R = horizontal range, h = muzzle.y −
-    // target.y, v = muzzle velocity. Take the low-arc (direct-fire)
-    // root. If no target in range or D<0 (out of reach), fall back
-    // to a horizontal shot.
+    // Pitch compensation with target-velocity lead. Closed-form
+    // ballistic solver: for muzzle.y above target by h at horizontal
+    // range R, with muzzle velocity v,
+    //
+    //   a = g·R² / (2v²)
+    //   tan(θ_p) = (R ± √(R² − 4a(a − h))) / (2a)         (low-arc root)
+    //
+    // For a stationary target this is one-shot. For a moving target
+    // the *aim point* — where we predict the target will be when
+    // the cannonball arrives — depends on flight time, which depends
+    // on the pitch we're solving for. Solve via fixed-point iteration:
+    // start with the target's current pose, compute pitch + flight
+    // time, advance the aim point along target velocity, repeat.
+    // Converges in 2–3 iterations for typical sloop ranges.
+    //
+    // Lead is PITCH-only — yaw stays starboard (broadside fixed-aim
+    // per docs/03 §8: players aim the ship, not the cannon). This
+    // handles approach/retreat motion. Cross-track motion remains
+    // uncompensated; that's where the EVE-transversal model lands
+    // (`design_eve_transversal_hit_model.md`).
+    //
+    // No target in range, or solver discriminant < 0 (out of reach)
+    // → horizontal shot.
     var pitch_rad: f32 = 0;
     {
         var nearest_d2: f32 = cannon_range_m * cannon_range_m;
-        var nearest_target_y: f32 = 0;
+        var nearest_pos: [3]f32 = .{ 0, 0, 0 };
+        var nearest_vel: [3]f32 = .{ 0, 0, 0 };
         var nearest_id: ?u32 = null;
         var it = state.entities.iterator();
         while (it.next()) |kv| {
@@ -764,19 +796,33 @@ fn fireCannon(
             const d2 = dx * dx + dz * dz;
             if (d2 < nearest_d2) {
                 nearest_d2 = d2;
-                nearest_target_y = tp[1];
+                nearest_pos = tp;
+                nearest_vel = phys.getLinearVelocity(kv.value_ptr.body_id) orelse .{ 0, 0, 0 };
                 nearest_id = kv.key_ptr.*;
             }
         }
         if (nearest_id != null) {
-            const range_m = @sqrt(nearest_d2);
-            const h = muzzle_pos[1] - nearest_target_y;
             const v = ammo.muzzle_velocity_mps;
-            const a_coef = (notatlas.projectile.g_mps2 * range_m * range_m) / (2.0 * v * v);
-            const disc = range_m * range_m - 4.0 * a_coef * (a_coef - h);
-            if (disc >= 0) {
+            // Initial aim point: target's current pose. Refine over
+            // a few iterations using the predicted flight time.
+            var aim_x: f32 = nearest_pos[0];
+            var aim_y: f32 = nearest_pos[1];
+            var aim_z: f32 = nearest_pos[2];
+            var lead_iter: u32 = 0;
+            while (lead_iter < 3) : (lead_iter += 1) {
+                const dx = aim_x - muzzle_pos[0];
+                const dz = aim_z - muzzle_pos[2];
+                const range_m = @sqrt(dx * dx + dz * dz);
+                const h = muzzle_pos[1] - aim_y;
+                const a_coef = (notatlas.projectile.g_mps2 * range_m * range_m) / (2.0 * v * v);
+                const disc = range_m * range_m - 4.0 * a_coef * (a_coef - h);
+                if (disc < 0) break; // out of range — keep last pitch (or 0)
                 const x_lo = (range_m - @sqrt(disc)) / (2.0 * a_coef);
                 pitch_rad = std.math.atan(x_lo);
+                const t_flight = range_m / (v * @cos(pitch_rad));
+                aim_x = nearest_pos[0] + nearest_vel[0] * t_flight;
+                aim_y = nearest_pos[1] + nearest_vel[1] * t_flight;
+                aim_z = nearest_pos[2] + nearest_vel[2] * t_flight;
             }
         }
     }
