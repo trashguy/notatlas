@@ -19,6 +19,14 @@
 -- ----- tuning -----
 local cannon_range_m       = 180.0   -- enemy_in_range threshold
 local broadside_offset_rad = math.pi / 2   -- starboard (cannon side)
+-- aim_broadside thrust gating: while |heading error| is larger
+-- than this, sails are slack (thrust=0) so the ship doesn't sail
+-- itself off-aim during a rotation. Once within band, moderate
+-- orbit thrust resumes. ~17° band picked so a square-rigger with
+-- typical 5-10 s rotation time isn't penalized for the last few
+-- degrees of alignment.
+local aim_thrust_band_rad  = 0.3
+local aim_orbit_thrust     = 0.4
 -- PD heading controller: steer = clamp(Kp*diff - Kd*angvel_y, -1, 1).
 -- The previous P-only law (gain 2/π) commanded full ±1 across most
 -- of [-π, π] and thrashed across the ±π wrap because angular
@@ -150,8 +158,17 @@ function aim_broadside()
   -- Want enemy on starboard (+90° from forward), so own heading
   -- should be bearing - π/2.
   local desired = bearing - broadside_offset_rad
-  -- Hold a moderate speed while orbiting the target.
-  set_thrust(0.4)
+  local diff = wrap_angle(desired - own_heading)
+  -- While |diff| is large the ship needs to rotate first; sailing
+  -- forward in that window drags the firing solution off-target
+  -- (with wind from astern the ship sails away from the orbit).
+  -- Slack the sails until the rotation is mostly done, then resume
+  -- orbital thrust to maintain a moving target profile.
+  if math.abs(diff) > aim_thrust_band_rad then
+    set_thrust(0.0)
+  else
+    set_thrust(aim_orbit_thrust)
+  end
   set_steer(steer_toward(desired, own_heading, ctx.own_vel.ang.y))
   return "running"
 end
