@@ -78,6 +78,11 @@ pub const StateMsg = struct {
     vy: f32 = 0,
     vz: f32 = 0,
     heading_rad: f32 = 0,
+    /// Normalized hull HP in [0, 1]. 1.0 = full health, 0.0 = sunk.
+    /// Defaulted to 1.0 so older publishers (and the cell-mgr-harness
+    /// fixture) read as fully healthy through the
+    /// `ignore_unknown_fields = true` decoder.
+    hp: f32 = 1.0,
 };
 
 pub fn encodeDelta(allocator: std.mem.Allocator, msg: DeltaMsg) ![]u8 {
@@ -219,6 +224,59 @@ pub fn decodeFire(allocator: std.mem.Allocator, payload: []const u8) !std.json.P
 pub fn parseWeaponIdFromFireSubject(subject: []const u8) !u32 {
     const prefix = "sim.entity.";
     const suffix = ".fire";
+    if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
+    const id_str = subject[prefix.len .. subject.len - suffix.len];
+    if (id_str.len == 0) return error.BadSubject;
+    return std.fmt.parseInt(u32, id_str, 10);
+}
+
+
+/// `sim.entity.<victim_id>.damage` event payload — published by
+/// ship-sim per docs/04 combat-slice gate's "plank/hull damage"
+/// line item. Authority is server-side: ship-sim tracks each
+/// in-flight cannonball's deterministic trajectory (per M8 closed-
+/// form) and tests against ship AABBs each tick. On hit, deduct,
+/// publish this event, retire the projectile.
+///
+/// `remaining_hp` is the post-damage normalized HP fraction [0, 1].
+/// 0 means the victim was sunk by this hit — a final state msg
+/// with `hp = 0` is published immediately after, then the entity
+/// is removed from the sim.
+///
+/// `source_id` is the firing weapon's tagged entity id — usually
+/// a ship in v1 (cannon mounted on a sloop). `fire_time_s` echoes
+/// the originating FireMsg so consumers can correlate damage
+/// events with the projectile that caused them (visual hit feedback,
+/// kill-feed UI, etc.).
+pub const DamageMsg = struct {
+    victim_id: u32,
+    source_id: u32,
+    /// Absolute damage inflicted (HP units). Splash falloff is
+    /// already applied — this is "what HP was deducted" rather
+    /// than the raw splash_damage_hp.
+    damage: f32,
+    fire_time_s: f64,
+    hit_x: f32,
+    hit_y: f32,
+    hit_z: f32,
+    /// Post-damage normalized HP in [0, 1]. 0 = sunk.
+    remaining_hp: f32,
+};
+
+pub fn encodeDamage(allocator: std.mem.Allocator, msg: DamageMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeDamage(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(DamageMsg) {
+    return std.json.parseFromSlice(DamageMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the victim id from a `sim.entity.<id>.damage` subject.
+pub fn parseVictimIdFromDamageSubject(subject: []const u8) !u32 {
+    const prefix = "sim.entity.";
+    const suffix = ".damage";
     if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
     if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
     if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
@@ -516,4 +574,55 @@ test "wire: subscribe roundtrip with boarded ship" {
     const parsed = try decodeSubscribe(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: state hp default is 1.0 when absent (backward-compat)" {
+    // Older publishers don't include `hp`. The decoder must default
+    // to 1.0 — anything else would silently mark every existing
+    // entity as damaged on rollout.
+    const legacy_payload =
+        \\{"generation":1,"x":10.0,"y":0.5,"z":-3.0}
+    ;
+    const parsed = try decodeState(testing.allocator, legacy_payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(f32, 1.0), parsed.value.hp);
+}
+
+test "wire: state hp roundtrips when explicit" {
+    const orig: StateMsg = .{
+        .generation = 1,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .hp = 0.5,
+    };
+    const buf = try encodeState(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeState(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(f32, 0.5), parsed.value.hp);
+}
+
+test "wire: damage roundtrip" {
+    const orig: DamageMsg = .{
+        .victim_id = 0x01000003,
+        .source_id = 0x01000001,
+        .damage = 50.0,
+        .fire_time_s = 12.345,
+        .hit_x = 100.0,
+        .hit_y = 0.5,
+        .hit_z = -2.0,
+        .remaining_hp = 0.83,
+    };
+    const buf = try encodeDamage(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeDamage(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: parseVictimIdFromDamageSubject" {
+    try testing.expectEqual(@as(u32, 16777219), try parseVictimIdFromDamageSubject("sim.entity.16777219.damage"));
+    try testing.expectError(error.BadSubject, parseVictimIdFromDamageSubject("sim.entity.16777219.state"));
+    try testing.expectError(error.BadSubject, parseVictimIdFromDamageSubject("sim.entity..damage"));
 }

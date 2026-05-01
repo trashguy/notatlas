@@ -13,12 +13,12 @@
 //! Notable v1 stubs:
 //!   - `wind` defaults to {dir=0, speed=0} until env service ships.
 //!     env.cell.<x>_<y>.wind is drained today but not yet decoded.
-//!   - `own_hp` defaults to 1.0 until the damage system lands. The
-//!     `low_hp` flee branch in pirate_sloop.yaml will never fire
-//!     until then — that's correct, not a bug.
 //!   - `threats` (slice of nearby hostiles) is deferred to a follow-up.
 //!     `lua_bind.pushValue` doesn't yet handle slice-of-struct; nearest_
 //!     _enemy alone is enough for the v0 demo.
+//!
+//! `own_hp` is now real (post-damage-system, 2026-05-01) — sourced
+//! from the firehose `StateMsg.hp` ship-sim publishes each tick.
 
 const std = @import("std");
 const notatlas = @import("notatlas");
@@ -123,7 +123,10 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
         .dt = opts.dt,
         .own_pose = own_pose,
         .own_vel = own_vel,
-        .own_hp = 1.0,
+        // Real HP from the firehose (set by ship-sim's StateMsg.hp).
+        // Plumbed through 2026-05-01 alongside the damage system; the
+        // low_hp flee branch in pirate_sloop.lua becomes reachable.
+        .own_hp = own.hp,
         .wind = .{ .dir = 0, .speed = 0 },
         .cell = cell,
         .nearest_enemy = nearest,
@@ -151,6 +154,12 @@ fn nearestEnemy(
         // step-6c+ refinement.
         if (notatlas.entity_kind.kindOf(id) != .ship) continue;
         const e = entry.value_ptr.*;
+        // Skip sunk ships — their row hangs around in the cohort
+        // table until ship-sim's final hp=0 state msg ages out, but
+        // they aren't a valid target. ship-sim removes the body the
+        // tick after the hp=0 publish, so the firehose stops; this
+        // filter just covers the in-flight tick.
+        if (e.hp <= 0) continue;
         const dx = e.x - sx;
         const dy = e.y - sy;
         const dz = e.z - sz;
@@ -164,7 +173,7 @@ fn nearestEnemy(
                 .y = e.y,
                 .z = e.z,
                 .dist = @sqrt(d2),
-                .hp = 1.0,
+                .hp = e.hp,
             };
         }
     }
@@ -245,4 +254,45 @@ test "perception: nearest_enemy nil when nothing in radius" {
         .dt = 0.05,
     }).?;
     try testing.expect(ctx.nearest_enemy == null);
+}
+
+test "perception: nearestEnemy skips sunk ships" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 0, .y = 0, .z = 0, .hp = 1.0 }, 1);
+    // Closer ship but sunk — must be skipped.
+    const sunk_id = notatlas.entity_kind.pack(.ship, 1);
+    try c.observeEntity(sunk_id, .{ .generation = 0, .x = 50, .y = 0, .z = 0, .hp = 0.0 }, 1);
+    // Farther ship still alive — should win.
+    const live_id = notatlas.entity_kind.pack(.ship, 2);
+    try c.observeEntity(live_id, .{ .generation = 0, .x = 200, .y = 0, .z = 0, .hp = 0.5 }, 1);
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+    }).?;
+    try testing.expectEqual(live_id, ctx.nearest_enemy.?.id);
+    try testing.expectEqual(@as(f32, 0.5), ctx.nearest_enemy.?.hp);
+}
+
+test "perception: own_hp pulled from firehose StateMsg.hp" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 0, .y = 0, .z = 0, .hp = 0.25 }, 1);
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+    }).?;
+    try testing.expectEqual(@as(f32, 0.25), ctx.own_hp);
 }

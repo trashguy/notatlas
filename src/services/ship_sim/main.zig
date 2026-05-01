@@ -117,6 +117,25 @@ const cannon_cooldown_s: f64 = 1.5;
 const cannon_offset_y: f32 = 1.0;
 const ammo_config_path = "data/ammo/cannonball.yaml";
 
+/// v0 sloop hull HP. Cannonball direct hits are 50 HP per
+/// `cannonball.yaml`, so 6 direct hits sink a sloop. Phase 2 lifts
+/// this into `data/ships/<hull>.yaml` alongside mass / extents
+/// (`hull_params.HullParams.hp_max`).
+const sloop_max_hp: f32 = 300.0;
+
+/// In-flight cannonballs that haven't hit anything are reaped after
+/// this many seconds. With muzzle_velocity=250 m/s and a sloop's
+/// cannon range ~200 m, real flights last <1 s; the rest is splash
+/// budget so a high-arc lob doesn't get prematurely retired.
+const projectile_lifetime_s: f64 = 6.0;
+
+/// Hit-test bounding sphere radius (m) added to each ship's AABB
+/// half-extent for cannonball impact detection. Modest fudge factor
+/// — splash is in the wire payload but v0 doesn't apply splash
+/// falloff (single-target hit), so this radius generously covers
+/// the AABB→sphere slop and a near-miss explosion.
+const projectile_hit_padding_m: f32 = 1.0;
+
 /// YAML inputs — ship-sim must agree with the sandbox on hull + wave
 /// kernel until the spawn protocol carries them on the wire. Ran from
 /// project root (the build/cwd convention shared with cell-mgr).
@@ -281,6 +300,8 @@ fn spawnShip(
         },
         .body_id = body,
         .state_subj = subj,
+        .hp_current = sloop_max_hp,
+        .hp_max = sloop_max_hp,
     });
 }
 
@@ -524,6 +545,7 @@ fn fireCannon(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     phys: *physics.System,
+    state: *sim_state.State,
     e: *const sim_state.Entity,
     hull_half_extents: [3]f32,
     world_time_s: f64,
@@ -538,13 +560,18 @@ fn fireCannon(
         .z = 0,
     };
     const world_offset = notatlas.math.Vec3.rotateByQuat(local_offset, rot);
+    const muzzle_pos: [3]f32 = .{
+        pos[0] + world_offset.x,
+        pos[1] + world_offset.y,
+        pos[2] + world_offset.z,
+    };
 
     const msg: wire.FireMsg = .{
         .generation = e.id.generation,
         .fire_time_s = world_time_s,
-        .mx = pos[0] + world_offset.x,
-        .my = pos[1] + world_offset.y,
-        .mz = pos[2] + world_offset.z,
+        .mx = muzzle_pos[0],
+        .my = muzzle_pos[1],
+        .mz = muzzle_pos[2],
         .rx = rot[0],
         .ry = rot[1],
         .rz = rot[2],
@@ -555,6 +582,23 @@ fn fireCannon(
         .ammo_splash_radius_m = ammo.splash_radius_m,
         .ammo_splash_damage_hp = ammo.splash_damage_hp,
     };
+
+    // Track the cannonball server-side so the next ticks can resolve
+    // impact. Append BEFORE publishing — if the publish fails the
+    // tracking entry will be reaped by lifetime expiry, which is the
+    // less-bad failure mode (a rendered shot with no damage authority
+    // would feel worse than the inverse).
+    try state.projectiles.append(state.allocator, .{
+        .weapon_id = e.id.id,
+        .fire_time_s = world_time_s,
+        .muzzle_pos = muzzle_pos,
+        .muzzle_rot = rot,
+        .charge = 1.0,
+        .ammo_muzzle_velocity_mps = ammo.muzzle_velocity_mps,
+        .ammo_mass_kg = ammo.mass_kg,
+        .ammo_splash_radius_m = ammo.splash_radius_m,
+        .ammo_splash_damage_hp = ammo.splash_damage_hp,
+    });
 
     var subj_buf: [64]u8 = undefined;
     const subj = try std.fmt.bufPrint(&subj_buf, "sim.entity.{d}.fire", .{e.id.id});
@@ -813,6 +857,169 @@ fn publishAttach(
     try client.publish(subj, buf);
 }
 
+
+/// Walk the in-flight projectile list, evaluate each against ship
+/// AABBs, apply damage on hit, retire on hit or lifetime expiry.
+/// Returns the count of impacts resolved this tick (logged at the
+/// 1 Hz cadence so we can see hit rate without per-impact spam).
+///
+/// Self-exclusion: a ship's own cannonball can't hit it. Without
+/// this the muzzle pose (which sits inside the firing ship's AABB
+/// for the first frame of flight) would self-damage every shot.
+///
+/// v0 single-target: the first ship the trajectory enters consumes
+/// the round. Splash falloff onto secondary ships in radius is a
+/// damage-tuning polish item past Phase 1.
+fn resolveProjectileImpacts(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    state: *sim_state.State,
+    phys: *physics.System,
+    hull_half_extents: [3]f32,
+    world_time_s: f64,
+) !u32 {
+    var hits: u32 = 0;
+    var i: usize = 0;
+    while (i < state.projectiles.items.len) {
+        const p = state.projectiles.items[i];
+        const dt = @as(f32, @floatCast(world_time_s - p.fire_time_s));
+        if (dt > projectile_lifetime_s) {
+            _ = state.projectiles.swapRemove(i);
+            continue;
+        }
+
+        const ev: notatlas.projectile.FireEvent = .{
+            .weapon = .{ .id = p.weapon_id, .generation = 0 },
+            .fire_time_s = p.fire_time_s,
+            .muzzle = .{
+                .pos = p.muzzle_pos,
+                .rot = p.muzzle_rot,
+                .vel = .{ 0, 0, 0 },
+            },
+            .charge = p.charge,
+            .ammo = .{
+                .muzzle_velocity_mps = p.ammo_muzzle_velocity_mps,
+                .mass_kg = p.ammo_mass_kg,
+                .splash_radius_m = p.ammo_splash_radius_m,
+                .splash_damage_hp = p.ammo_splash_damage_hp,
+            },
+        };
+        const proj_pos = notatlas.projectile.predict(ev, dt);
+
+        var hit_id: ?u32 = null;
+        var ent_it = state.entities.iterator();
+        while (ent_it.next()) |entry| {
+            const ent = entry.value_ptr;
+            if (ent.kind != .ship) continue;
+            if (ent.id.id == p.weapon_id) continue;
+            if (ent.isSunk()) continue;
+            const ship_pos = phys.getPosition(ent.body_id) orelse continue;
+            const dx = @abs(proj_pos[0] - ship_pos[0]);
+            const dy = @abs(proj_pos[1] - ship_pos[1]);
+            const dz = @abs(proj_pos[2] - ship_pos[2]);
+            if (dx <= hull_half_extents[0] + projectile_hit_padding_m and
+                dy <= hull_half_extents[1] + projectile_hit_padding_m and
+                dz <= hull_half_extents[2] + projectile_hit_padding_m)
+            {
+                hit_id = ent.id.id;
+                break;
+            }
+        }
+
+        if (hit_id) |victim_id| {
+            const victim = state.entities.getPtr(victim_id).?;
+            const damage = p.ammo_splash_damage_hp;
+            const remaining = victim.applyDamage(damage);
+            try publishDamage(allocator, client, .{
+                .victim_id = victim_id,
+                .source_id = p.weapon_id,
+                .damage = damage,
+                .fire_time_s = p.fire_time_s,
+                .hit_x = proj_pos[0],
+                .hit_y = proj_pos[1],
+                .hit_z = proj_pos[2],
+                .remaining_hp = remaining,
+            });
+            std.debug.print(
+                "ship-sim: hit 0x{X:0>8} ← 0x{X:0>8} for {d:.0} hp (remaining {d:.2})\n",
+                .{ victim_id, p.weapon_id, damage, remaining },
+            );
+            hits += 1;
+            _ = state.projectiles.swapRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+    return hits;
+}
+
+fn publishDamage(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    msg: wire.DamageMsg,
+) !void {
+    var subj_buf: [64]u8 = undefined;
+    const subj = try std.fmt.bufPrint(&subj_buf, "sim.entity.{d}.damage", .{msg.victim_id});
+    const buf = try wire.encodeDamage(allocator, msg);
+    defer allocator.free(buf);
+    try client.publish(subj, buf);
+}
+
+/// Reap any ship whose hp dropped to zero this tick. Passengers are
+/// ejected via `applyDisembark` so they re-spawn as free-agent
+/// capsules at the ship's last pose with lever-arm-inherited velocity
+/// (and spatial-index sees a clean cell-enter delta on their attach
+/// subject). Buffer of 64 sunk-ids per tick is generous for a v0
+/// where AI shoots one ship at a time; bump or move to ArrayList if
+/// mass-sinkings become a thing.
+fn destroySunkShips(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    state: *sim_state.State,
+    phys: *physics.System,
+) !u32 {
+    var sunk_buf: [64]u32 = undefined;
+    var n: usize = 0;
+    var it = state.entities.iterator();
+    while (it.next()) |entry| {
+        const e = entry.value_ptr;
+        if (e.kind == .ship and e.isSunk()) {
+            if (n >= sunk_buf.len) break;
+            sunk_buf[n] = e.id.id;
+            n += 1;
+        }
+    }
+    if (n == 0) return 0;
+
+    for (sunk_buf[0..n]) |ship_id| {
+        // Snapshot passenger ids first — applyDisembark mutates the
+        // passengers map.
+        var pids: [16]u32 = undefined;
+        var pi: usize = 0;
+        var pit = state.passengers.iterator();
+        while (pit.next()) |pe| {
+            if (pe.value_ptr.ship_id == ship_id and pi < pids.len) {
+                pids[pi] = pe.value_ptr.player_id;
+                pi += 1;
+            }
+        }
+        for (pids[0..pi]) |pid| {
+            applyDisembark(allocator, client, state, phys, pid) catch |err| {
+                std.debug.print(
+                    "ship-sim: forced disembark failed for player 0x{X:0>8} on sinking ship 0x{X:0>8} ({s})\n",
+                    .{ pid, ship_id, @errorName(err) },
+                );
+            };
+        }
+
+        const e = state.entities.getPtr(ship_id) orelse continue;
+        std.debug.print("ship-sim: ship 0x{X:0>8} SUNK\n", .{ship_id});
+        e.deinit(allocator, phys);
+        _ = state.entities.remove(ship_id);
+    }
+    return @intCast(n);
+}
+
 /// Apply latched input as forces on a ship body before buoyancy +
 /// integration. Thrust = force along ship-forward at the body center
 /// (no torque). Steer = lateral force at the bow point
@@ -930,7 +1137,7 @@ fn tick(
     while (fire_it.next()) |e| {
         if (e.kind != .ship) continue;
         if (e.input.fire and world_time_s >= e.next_fire_allowed_s) {
-            try fireCannon(allocator, client, phys, e, hull_half_extents, world_time_s, ammo);
+            try fireCannon(allocator, client, phys, state, e, hull_half_extents, world_time_s, ammo);
             e.next_fire_allowed_s = world_time_s + cannon_cooldown_s;
         }
     }
@@ -949,6 +1156,12 @@ fn tick(
     // tick — Jolt sub-stepping is not yet load-bearing here; if it
     // becomes one (high-velocity tunneling at 60 Hz), bump.
     phys.step(phys_dt_fixed, 1);
+
+    // Resolve cannonball impacts using the just-stepped ship poses.
+    // Hits deduct hp_current and publish DamageMsg. Sinking is
+    // deferred to AFTER the state publish so the final state msg
+    // for a sunk ship carries hp = 0.
+    _ = try resolveProjectileImpacts(allocator, client, state, phys, hull_half_extents, world_time_s);
 
     // Read back + publish per entity. Passengers do NOT publish —
     // their pose flows through the ship's tier-3 boarded stream
@@ -977,9 +1190,16 @@ fn tick(
             .vy = lin_v[1],
             .vz = lin_v[2],
             .heading_rad = yawFromQuat(rot),
+            .hp = e.hpFraction(),
         };
         const buf = try wire.encodeState(allocator, msg);
         defer allocator.free(buf);
         try client.publish(e.state_subj, buf);
     }
+
+    // Reap sunk ships AFTER publishing the final hp=0 state msg.
+    // Passengers are ejected via the existing disembark path so
+    // spatial-index gets a clean cell-enter delta and the player's
+    // state subject restarts publishing.
+    _ = try destroySunkShips(allocator, client, state, phys);
 }

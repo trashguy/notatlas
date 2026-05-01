@@ -26,6 +26,12 @@ pub const WorldEntity = struct {
     vz: f32,
     heading_rad: f32,
     generation: u16,
+    /// Normalized hull HP in [0, 1] from StateMsg.hp. Default 1.0 so
+    /// publishers that don't yet emit hp (free-agent capsules, env
+    /// fixtures) read as healthy. perception.nearestEnemy filters
+    /// `hp <= 0` so a sunk ship in this table doesn't become a target
+    /// before its row ages out of the firehose-driven snapshot.
+    hp: f32 = 1.0,
     /// Tick on which we last received a state msg for this entity.
     /// Step 6's perception build can use this to age out stale rows.
     last_seen_tick: u64,
@@ -79,6 +85,7 @@ pub const Cohort = struct {
             .vz = msg.vz,
             .heading_rad = msg.heading_rad,
             .generation = msg.generation,
+            .hp = msg.hp,
             .last_seen_tick = tick,
         });
     }
@@ -124,6 +131,21 @@ test "cohort: observe overwrites existing entity" {
     const e = c.entities.get(0x01000001).?;
     try testing.expectEqual(@as(f32, 100), e.x);
     try testing.expectEqual(@as(u64, 7), e.last_seen_tick);
+}
+
+test "cohort: observe captures hp" {
+    var c = Cohort.init(testing.allocator);
+    defer c.deinit();
+
+    try c.observeEntity(0x01000003, .{
+        .generation = 0,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .hp = 0.42,
+    }, 1);
+    const e = c.entities.get(0x01000003).?;
+    try testing.expectEqual(@as(f32, 0.42), e.hp);
 }
 
 test "cohort: addAi tracks ais" {

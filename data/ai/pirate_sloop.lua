@@ -47,6 +47,12 @@ local function clamp(v, lo, hi)
 end
 
 local function steer_toward(desired_heading, own_heading)
+  -- Empirically (Jolt + ship-sim's lateral-force-at-bow setup):
+  -- +steer drives heading_rad UP (Jolt's +Y rotation is CCW
+  -- from above, i.e. left turn — the InputMsg "right turn"
+  -- comment refers to a different visual convention). So if
+  -- desired > own we want POSITIVE steer to grow heading toward
+  -- desired. Sign matches `desired - own`.
   local diff = wrap_angle(desired_heading - own_heading)
   return clamp(diff * steer_gain, -1.0, 1.0)
 end
