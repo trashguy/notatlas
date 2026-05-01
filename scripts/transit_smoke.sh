@@ -4,16 +4,24 @@
 # --init-vel-x, and watches the cell-handoff path:
 #
 #   1. spatial-index emits exit on cell.0_0 + enter on cell.1_0 at
-#      the x=200 boundary (one event each, no thrash).
+#      the x=200 boundary (one event each, no thrash thanks to
+#      cell hysteresis).
 #   2. cell-mgr 0_0's entity table shows the ship until handoff,
 #      then drops it; cell-mgr 1_0 picks it up.
-#   3. A synthetic subscriber registered with both cells receives
-#      ship state continuously across the boundary — no gap.
+#   3. A synthetic subscriber registered with cell 1_0 ONLY
+#      (its primary/home cell, per the cell-mgr design — see
+#      fanout.zig relayState docstring + docs/08 §2A) receives
+#      ship state continuously across the boundary, including
+#      while the ship is still in cell 0_0. The cell-mgr that
+#      owns the sub forwards every entity within visual tier of
+#      the sub's pose, regardless of which cell the entity is in.
 #
 # Pass criterion (visual): the dumped deltas show exactly one
 # exit on 0_0 followed by one enter on 1_0, both near x=201
-# (1 m past the boundary, per `cell_hysteresis_m`). The
-# subscribed-client byte rate stays > 0 throughout the transit.
+# (1 m past the boundary, per `cell_hysteresis_m`). cell-mgr 0_0
+# reports `0 subs` throughout (sub is on 1_0). cell-mgr 1_0
+# reports `1 subs` and pushes ~2 state-msgs/tick the entire run.
+# Frame count to client_id=999 stays > 0.
 #
 # Usage:
 #   ./scripts/transit_smoke.sh [init_vel_mps]
@@ -66,11 +74,18 @@ $NATS_BOX nats sub -s nats://127.0.0.1:4222 'gw.client.999.cmd' \
   > "$LOG/fanout.log" 2>&1 &
 PIDS+=($!)
 
-# Register synthetic subscriber for client_id=999 on BOTH cells —
-# straddling the boundary so the ship is in visual range whether
-# it's in 0_0 or 1_0. Pos at (200, 0, 0): centered on the boundary.
-SUB_PAYLOAD='{"op":"enter","client_id":999,"x":200,"y":0,"z":0}'
-$NATS_BOX nats pub -s nats://127.0.0.1:4222 'cm.cell.0_0.subscribe' "$SUB_PAYLOAD" >/dev/null 2>&1
+# Register the synthetic subscriber with its PRIMARY cell only,
+# per the cell-mgr design (docs/08 §2A + fanout.zig relayState
+# docstring): the cell-mgr that owns the sub forwards every
+# entity within visual tier of the sub's pose, regardless of
+# which cell the entity itself is in. So a sub at (300, 0, 0)
+# registered solely with cell 1_0 still receives state for ships
+# in cell 0_0 or 2_0 if they're close enough — cross-cell
+# visibility is a (sub × entity-pose) geometry computation, not a
+# per-cell subscription. The earlier version of this smoke
+# registered the sub with BOTH cells and counted duplicate
+# forwards; that's a misuse of the API, not a relayState bug.
+SUB_PAYLOAD='{"op":"enter","client_id":999,"x":300,"y":0,"z":0}'
 $NATS_BOX nats pub -s nats://127.0.0.1:4222 'cm.cell.1_0.subscribe' "$SUB_PAYLOAD" >/dev/null 2>&1
 
 # Kick the ship.
@@ -87,17 +102,21 @@ echo
 echo "=== spatial-index deltas ==="
 grep -E 'Received on|"op"' "$LOG/deltas.log" | head -20
 echo
-echo "=== cell-mgr 0_0 entity-count timeline (>0 only) ==="
+echo "=== cell-mgr 0_0 (no sub registered here — should report 0 subs) ==="
+echo "ent>0 lines (sample):"
 grep -E '[1-9][0-9]* ents' "$LOG/cm-0_0.log" | tail -3
+echo "max subs seen: $(awk -F'ents, ' '/ents/ {split($2, a, " subs"); print a[1]}' "$LOG/cm-0_0.log" | sort -nu | tail -1)"
 echo
-echo "=== cell-mgr 1_0 entity-count timeline (>0 only) ==="
+echo "=== cell-mgr 1_0 (primary cell for sub at x=300) ==="
+echo "ent>0 lines (sample):"
 grep -E '[1-9][0-9]* ents' "$LOG/cm-1_0.log" | tail -3
+echo "max subs seen: $(awk -F'ents, ' '/ents/ {split($2, a, " subs"); print a[1]}' "$LOG/cm-1_0.log" | sort -nu | tail -1)"
 echo
 echo "=== fanout delivery for client_id=999 ==="
 # fanout.log is mostly binary (PayloadHeader + pose codec); count
 # the text frame banners nats-box prints between msgs.
 echo "frames received: $(grep -ac '^\[#' "$LOG/fanout.log" || true)"
-grep -aE '^\[#|Received on' "$LOG/fanout.log" | head -4
+echo "(should be > 0 the entire transit; ~450 frames over 5 s on dev box)"
 echo
 echo "=== ship#1 final state ==="
 $NATS_BOX nats sub -s nats://127.0.0.1:4222 'sim.entity.16777217.state' --count 1 2>/dev/null \
