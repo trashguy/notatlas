@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# persistence-writer smoke. Exercises the 3 streams the service drains:
+# persistence-writer smoke. Exercises the 4 streams the service drains:
 #
-#   events_market_trade     events.market.trade         → market_trades
-#   events_handoff_cell     events.handoff.cell         → cell_handoffs
-#   events_inventory_change events.inventory.change.*   → inventories
+#   events_session          events.session              → sessions       (tier=fast)
+#   events_market_trade     events.market.trade         → market_trades  (tier=slow)
+#   events_handoff_cell     events.handoff.cell         → cell_handoffs  (tier=slow)
+#   events_inventory_change events.inventory.change.*   → inventories    (tier=slow)
 #
 # (Damage is intentionally NOT in pwriter — too volume-heavy for
 # row-per-event PG, only useful queries are aggregates. See memory
@@ -56,8 +57,8 @@ SELECT setval('characters_id_seq', GREATEST((SELECT MAX(id) FROM characters), 1)
 SQL
 
 echo ">>> resetting tables + streams"
-$PSQL -c "TRUNCATE market_trades, cell_handoffs, inventories RESTART IDENTITY CASCADE;" >/dev/null
-for s in events_market_trade events_handoff_cell events_inventory_change; do
+$PSQL -c "TRUNCATE sessions, market_trades, cell_handoffs, inventories RESTART IDENTITY CASCADE;" >/dev/null
+for s in events_session events_market_trade events_handoff_cell events_inventory_change; do
   $NATS_BOX nats stream rm "$s" -f >/dev/null 2>&1 || true
 done
 
@@ -78,7 +79,7 @@ zig-out/bin/persistence-writer > "$LOG/run1.log" 2>&1 &
 PIDS+=($!)
 PWRITER_PID=$!
 
-# Wait for all 3 streams to attach.
+# Wait for all 4 streams to attach.
 for _ in $(seq 1 50); do
   if grep -q 'events_inventory_change.*ready' "$LOG/run1.log"; then break; fi
   sleep 0.1
@@ -93,6 +94,15 @@ echo ">>> publishing $N events per stream"
 for i in $(seq 1 "$N"); do
   victim=$(( 16777217 + (i % 4) ))
 
+  # Tier-0 fast-lane: alternating login/disconnect on a single account.
+  if (( i % 2 == 1 )); then
+    kind="login"; reason_field=""
+  else
+    kind="disconnect"; reason_field=',"reason":"client_close"'
+  fi
+  $NATS_BOX nats pub "events.session" \
+    "$(printf '{"account_id":1,"character_id":1,"kind":"%s"%s}' "$kind" "$reason_field")" >/dev/null 2>&1
+
   $NATS_BOX nats pub "events.market.trade" \
     "$(printf '{"buy_order_id":0,"sell_order_id":0,"buyer_id":1,"seller_id":1,"item_def_id":%d,"quantity":%d,"price":%d}' "$((100+i))" "$i" "$((i*50))")" >/dev/null 2>&1
 
@@ -105,15 +115,18 @@ for i in $(seq 1 "$N"); do
     "$(printf '{"slots":[{"slot":0,"item_def_id":42,"quantity":%d}]}' "$i")" >/dev/null 2>&1
 done
 
-# Drain time. 3 streams × 25 ms fetch ≈ 75 ms round-robin; allow 1.5 s.
+# Drain time. Fast lane drains to completion; slow tier round-robin
+# 3 streams × 25 ms ≈ 75 ms. Allow 1.5 s end-to-end.
 sleep 1.5
 
+session_count=$($PSQL -c "SELECT count(*) FROM sessions;")
 market_count=$($PSQL -c "SELECT count(*) FROM market_trades;")
 handoff_count=$($PSQL -c "SELECT count(*) FROM cell_handoffs;")
 inv_count=$($PSQL -c "SELECT count(*) FROM inventories;")
 inv_version=$($PSQL -c "SELECT COALESCE(version, 0) FROM inventories WHERE character_id=1;")
 
 echo ">>> run 1 row counts:"
+echo "    sessions:      $session_count (expected $N)"
 echo "    market_trades: $market_count (expected $N)"
 echo "    cell_handoffs: $handoff_count (expected $N)"
 echo "    inventories:   $inv_count (expected 1, version $inv_version expected $N)"
@@ -137,9 +150,10 @@ kill -INT "$PWRITER_PID"
 wait "$PWRITER_PID" 2>/dev/null || true
 PIDS=()
 
-run2_line=$(grep "shutting down" "$LOG/run2.log" || echo "missing")
+run2_line=$(grep " shutdown " "$LOG/run2.log" || echo "missing")
 echo ">>> run 2 final: $run2_line"
 
+post_session=$($PSQL -c "SELECT count(*) FROM sessions;")
 post_market=$($PSQL -c "SELECT count(*) FROM market_trades;")
 post_handoff=$($PSQL -c "SELECT count(*) FROM cell_handoffs;")
 post_inv=$($PSQL -c "SELECT count(*) FROM inventories;")
@@ -158,18 +172,20 @@ check() {
     fail=1
   fi
 }
-check "run 1 market_trades" "$market_count" "$N"
+check "run 1 sessions"      "$session_count" "$N"
+check "run 1 market_trades" "$market_count"  "$N"
 check "run 1 cell_handoffs" "$handoff_count" "$N"
-check "run 1 inventories"   "$inv_count"    "1"
-check "run 1 inv version"   "$inv_version"  "$N"
+check "run 1 inventories"   "$inv_count"     "1"
+check "run 1 inv version"   "$inv_version"   "$N"
 
-# Run 2: redelivered counters all zero.
-if echo "$run2_line" | grep -qE 'market=0/0 handoff=0/0 inv=0/0'; then
-  echo "PASS: run 2 redelivered 0 events on all 3 streams (committed=0 dedup=0)"
+# Run 2: redelivered counters all zero on every stream.
+if echo "$run2_line" | grep -qE 'session=0/0 market=0/0 handoff=0/0 inv=0/0'; then
+  echo "PASS: run 2 redelivered 0 events on all 4 streams (committed=0 dedup=0)"
 else
   echo "FAIL: run 2 redelivered events: $run2_line"
   fail=1
 fi
+check "run 2 sessions unchanged"      "$post_session" "$N"
 check "run 2 market_trades unchanged" "$post_market"  "$N"
 check "run 2 cell_handoffs unchanged" "$post_handoff" "$N"
 check "run 2 inventories unchanged"   "$post_inv"     "1"

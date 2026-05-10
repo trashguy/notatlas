@@ -339,6 +339,34 @@ pub fn decodeHandoffCell(allocator: std.mem.Allocator, payload: []const u8) !std
     return std.json.parseFromSlice(HandoffCellMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `events.session` payload — emitted by gateway on login / logout /
+/// disconnect. Tier-0 fast-lane stream in pwriter: hibernation grace
+/// timer can't start until the disconnect row is durable, so this is
+/// the only stream with sub-second SLA. Volume is human-scale (one
+/// row per player session-event), so single-subject flat shape is
+/// fine; kind-routed subjects would just complicate the consumer
+/// without paying for the partitioning.
+///
+/// `character_id == 0` means "no character context" — pre-select
+/// disconnects, lobby actions. pwriter stores NULL via the nullable FK.
+/// `reason` is freeform; expected vocabulary {"client_close","timeout",
+/// "kicked","crash","unknown"} but not enforced — adding new reasons
+/// is a producer-only change.
+pub const SessionMsg = struct {
+    account_id: i64,
+    character_id: i64 = 0,
+    kind: []const u8, // "login" | "logout" | "disconnect"
+    reason: ?[]const u8 = null,
+};
+
+pub fn encodeSession(allocator: std.mem.Allocator, msg: SessionMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeSession(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(SessionMsg) {
+    return std.json.parseFromSlice(SessionMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 /// Extract the character id from `events.inventory.change.<id>`.
 /// Inventory uses subject-routed character_id (matching the damage
 /// subject pattern) because the JSON payload is the inventory blob
@@ -829,4 +857,36 @@ test "wire: parseCharacterIdFromInventorySubject" {
     try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.inventory.change."));
     try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.inventory.change"));
     try testing.expectError(error.BadSubject, parseCharacterIdFromInventorySubject("events.market.trade"));
+}
+
+test "wire: session roundtrip with reason" {
+    const orig: SessionMsg = .{
+        .account_id = 7,
+        .character_id = 42,
+        .kind = "disconnect",
+        .reason = "client_close",
+    };
+    const buf = try encodeSession(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeSession(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 7), parsed.value.account_id);
+    try testing.expectEqual(@as(i64, 42), parsed.value.character_id);
+    try testing.expectEqualStrings("disconnect", parsed.value.kind);
+    try testing.expectEqualStrings("client_close", parsed.value.reason.?);
+}
+
+test "wire: session roundtrip — no character (lobby), no reason" {
+    const orig: SessionMsg = .{
+        .account_id = 9,
+        .kind = "login",
+    };
+    const buf = try encodeSession(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeSession(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 9), parsed.value.account_id);
+    try testing.expectEqual(@as(i64, 0), parsed.value.character_id);
+    try testing.expectEqualStrings("login", parsed.value.kind);
+    try testing.expect(parsed.value.reason == null);
 }

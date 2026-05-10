@@ -5,10 +5,19 @@
 //! batches writes; ack-on-commit so JetStream redelivers any work
 //! that wasn't durably committed.
 //!
-//! v0 streams attached:
-//!   events_market_trade     events.market.trade         → market_trades
-//!   events_handoff_cell     events.handoff.cell         → cell_handoffs
-//!   events_inventory_change events.inventory.change.*   → inventories
+//! v0 streams attached, by SLA tier:
+//!   tier=fast (sub-second p99 — game-mechanic correctness)
+//!     events_session          events.session              → sessions
+//!   tier=slow (10s p99 — analytics)
+//!     events_market_trade     events.market.trade         → market_trades
+//!     events_handoff_cell     events.handoff.cell         → cell_handoffs
+//!     events_inventory_change events.inventory.change.*   → inventories
+//!
+//! The fast lane is checked first every iteration with timeout=0 and
+//! drained to completion before any slow-tier work runs. Hibernation
+//! grace timer can't start until pwriter has durably stored the
+//! disconnect row, so session events MUST NOT be latency-blocked behind
+//! a flooded analytics stream.
 //!
 //! Damage is NOT in pwriter — too volume-heavy for row-per-event PG
 //! and the only useful queries are aggregates. Live damage stays on
@@ -17,9 +26,8 @@
 //! `data/jetstream.yaml` (disabled by default).
 //!
 //! Per-stream wiring lives in `stream_specs[]` — adding another stream
-//! is one entry plus a handler. Round-robin pull-fetch with short
-//! per-stream timeouts so a hot stream isn't latency-blocked behind
-//! cold ones.
+//! is one entry plus a handler. Within a tier the order is round-robin;
+//! tier itself is the priority dimension.
 //!
 //! Per-event errors (FK violation, malformed JSON, etc.) are isolated
 //! via Postgres SAVEPOINTs so one bad event doesn't roll back the
@@ -43,7 +51,18 @@ const pg = @import("pg");
 const wire = @import("wire");
 
 const fetch_batch: u32 = 256;
-const fetch_timeout_ms: u32 = 25; // per-stream; round-robin wraps in ~100ms with 4 streams
+// Slow tier: round-robin pull with a small timeout so cold streams don't
+// block hot ones. Three slow streams × 25 ms = ~75 ms wrap.
+const fetch_timeout_slow_ms: u32 = 25;
+// Fast tier: small non-zero timeout. timeout=0 looks tempting (non-
+// blocking poll, drain to completion via outer loop) but nats-zig 0.2.2's
+// PullSubscription.fetch publishes the NEXT request and then loops on
+// `now < deadline` — with deadline=now, the loop body never executes and
+// the broker's response is dropped on the floor. 5 ms is enough for a
+// local-broker round-trip and small enough that an idle fast lane only
+// burns 5 ms per outer iteration; an active lane returns as soon as the
+// batch arrives and the drain-loop continues immediately.
+const fetch_timeout_fast_ms: u32 = 5;
 const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
@@ -58,9 +77,25 @@ const ack_wait_ns: u64 = 300 * std.time.ns_per_s;
 
 const Outcome = enum { inserted, dedup_skipped };
 
+/// Drain priority. fast streams are drained to completion (timeout=0
+/// pull) before any slow stream runs. The classification is not a
+/// throughput decision — it's a correctness decision: fast-tier streams
+/// gate a downstream game mechanic (hibernation grace timer for
+/// sessions; future: trade-confirmation latency for market). Slow-tier
+/// is post-cycle analytics where 10s of lag is invisible.
+const Tier = enum { fast, slow };
+
 const StreamSpec = struct {
     stream_name: []const u8,
     subject_filter: []const u8,
+    /// Short label used in periodic log lines and status emissions.
+    /// Avoids leaking the `events_` prefix into observability.
+    label: []const u8,
+    tier: Tier,
+    /// SLA budget — published with status in commit C, used here only
+    /// as a self-documenting field on the spec. Breach detection lives
+    /// alongside the metrics emitter.
+    sla_p99_ms: u32,
     handler: *const fn (
         allocator: std.mem.Allocator,
         conn: *pg.Conn,
@@ -80,18 +115,35 @@ const StreamSpec = struct {
 // disabled by default. See memory `architecture_damage_not_in_pg.md`.
 const stream_specs = [_]StreamSpec{
     .{
+        .stream_name = "events_session",
+        .subject_filter = "events.session",
+        .label = "session",
+        .tier = .fast,
+        .sla_p99_ms = 200,
+        .handler = handleSession,
+    },
+    .{
         .stream_name = "events_market_trade",
         .subject_filter = "events.market.trade",
+        .label = "market",
+        .tier = .slow,
+        .sla_p99_ms = 10_000,
         .handler = handleMarketTrade,
     },
     .{
         .stream_name = "events_handoff_cell",
         .subject_filter = "events.handoff.cell",
+        .label = "handoff",
+        .tier = .slow,
+        .sla_p99_ms = 10_000,
         .handler = handleHandoffCell,
     },
     .{
         .stream_name = "events_inventory_change",
         .subject_filter = "events.inventory.change.*",
+        .label = "inv",
+        .tier = .slow,
+        .sla_p99_ms = 10_000,
         .handler = handleInventoryChange,
     },
 };
@@ -267,56 +319,102 @@ pub fn main() !void {
         }
 
         var any_processed = false;
-        for (stream_specs, 0..) |spec, i| {
-            const msgs = pulls[i].fetch(fetch_batch, fetch_timeout_ms) catch |err| {
-                std.debug.print(
-                    "persistence-writer: fetch err on {s}: {}\n",
-                    .{ spec.stream_name, err },
-                );
-                continue;
-            };
-            if (msgs.len == 0) {
-                allocator.free(msgs);
-                continue;
+
+        // Pass 1: drain fast streams to completion. Loop until every
+        // fast stream returns empty in a single sweep. timeout=0 keeps
+        // each fetch non-blocking so this is a tight inner loop only
+        // while there's actual fast-tier work; an idle fast lane costs
+        // ~one round-trip per outer iteration.
+        var fast_quiet = false;
+        while (!fast_quiet) {
+            fast_quiet = true;
+            for (stream_specs, 0..) |spec, i| {
+                if (spec.tier != .fast) continue;
+                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms)) |stats| {
+                    if (stats.committed + stats.dedup_skipped > 0) {
+                        fast_quiet = false;
+                        any_processed = true;
+                        committed_totals[i] += stats.committed;
+                        dedup_totals[i] += stats.dedup_skipped;
+                    }
+                } else |_| {}
             }
-            const stats = processBatch(allocator, pool, &pulls[i], msgs, cycle_id, spec.handler) catch |err| blk: {
-                std.debug.print(
-                    "persistence-writer: batch err on {s}: {}\n",
-                    .{ spec.stream_name, err },
-                );
-                break :blk BatchStats{};
-            };
-            committed_totals[i] += stats.committed;
-            dedup_totals[i] += stats.dedup_skipped;
-            any_processed = true;
-            for (msgs) |*m| @constCast(m).deinit();
-            allocator.free(msgs);
+        }
+
+        // Pass 2: round-robin slow streams once. Hot slow streams get
+        // amortized over fast-lane drain cycles; this is fine because
+        // slow-tier SLAs are seconds, not milliseconds.
+        for (stream_specs, 0..) |spec, i| {
+            if (spec.tier != .slow) continue;
+            if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms)) |stats| {
+                if (stats.committed + stats.dedup_skipped > 0) {
+                    any_processed = true;
+                    committed_totals[i] += stats.committed;
+                    dedup_totals[i] += stats.dedup_skipped;
+                }
+            } else |_| {}
         }
         if (!any_processed) std.Thread.sleep(idle_sleep_ns);
 
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
-            std.debug.print(
-                "persistence-writer: cycle={d} market={d}/{d} handoff={d}/{d} inv={d}/{d} (committed/dedup)\n",
-                .{
-                    cycle_id,
-                    committed_totals[0], dedup_totals[0],
-                    committed_totals[1], dedup_totals[1],
-                    committed_totals[2], dedup_totals[2],
-                },
-            );
+            logTotals(cycle_id, "tick", &committed_totals, &dedup_totals);
             last_log_ns = now;
         }
     }
 
-    std.debug.print(
-        "persistence-writer: shutting down (market={d}/{d} handoff={d}/{d} inv={d}/{d} committed/dedup)\n",
-        .{
-            committed_totals[0], dedup_totals[0],
-            committed_totals[1], dedup_totals[1],
-            committed_totals[2], dedup_totals[2],
-        },
-    );
+    logTotals(cycle_id, "shutdown", &committed_totals, &dedup_totals);
+}
+
+/// Fetch + process one batch from a stream. Returns null on fetch error
+/// (already logged); empty batches return zero-stat. Caller summates.
+fn drainBatch(
+    allocator: std.mem.Allocator,
+    pool: *pg.Pool,
+    pull: *nats.JetStream.PullSubscription,
+    spec: StreamSpec,
+    cycle_id: i64,
+    timeout_ms: u32,
+) !BatchStats {
+    const msgs = pull.fetch(fetch_batch, timeout_ms) catch |err| {
+        std.debug.print(
+            "persistence-writer: fetch err on {s}: {}\n",
+            .{ spec.stream_name, err },
+        );
+        return err;
+    };
+    defer {
+        for (msgs) |*m| @constCast(m).deinit();
+        allocator.free(msgs);
+    }
+    if (msgs.len == 0) return BatchStats{};
+
+    return processBatch(allocator, pool, pull, msgs, cycle_id, spec.handler) catch |err| {
+        std.debug.print(
+            "persistence-writer: batch err on {s}: {}\n",
+            .{ spec.stream_name, err },
+        );
+        return BatchStats{};
+    };
+}
+
+/// Format committed/dedup totals dynamically over stream_specs so adding
+/// a stream doesn't require touching the log line.
+fn logTotals(
+    cycle_id: i64,
+    phase: []const u8,
+    committed_totals: *const [stream_specs.len]u64,
+    dedup_totals: *const [stream_specs.len]u64,
+) void {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.print("persistence-writer: {s} cycle={d}", .{ phase, cycle_id }) catch return;
+    inline for (stream_specs, 0..) |spec, i| {
+        w.print(" {s}={d}/{d}", .{ spec.label, committed_totals[i], dedup_totals[i] }) catch return;
+    }
+    w.print(" (committed/dedup)\n", .{}) catch return;
+    std.debug.print("{s}", .{fbs.getWritten()});
 }
 
 fn probeCurrentCycle(pool: *pg.Pool) !i64 {
@@ -514,6 +612,44 @@ fn processBatch(
 // Per-stream handlers. Each handler runs inside a SAVEPOINT so any error
 // rolls back THIS event only and the batch tx continues.
 // ---------------------------------------------------------------------------
+
+/// Tier-0 fast-lane handler. Hibernation grace timer reads
+/// (character_id, occurred_at DESC) so the disconnect row needs to be
+/// durable before the gateway finishes its disconnect path. INSERT is
+/// idempotent on stream_seq.
+fn handleSession(
+    allocator: std.mem.Allocator,
+    conn: *pg.Conn,
+    cycle_id: i64,
+    subject: []const u8,
+    payload: []const u8,
+    stream_seq: u64,
+) !Outcome {
+    _ = subject;
+    var parsed = try wire.decodeSession(allocator, payload);
+    defer parsed.deinit();
+    const s = parsed.value;
+
+    const character: ?i64 = if (s.character_id == 0) null else s.character_id;
+    const reason: ?[]const u8 = s.reason;
+
+    const rows = try conn.exec(
+        \\INSERT INTO sessions
+        \\  (stream_seq, cycle_id, account_id, character_id, kind, reason, occurred_at)
+        \\VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        \\ON CONFLICT (stream_seq) DO NOTHING
+    ,
+        .{
+            @as(i64, @intCast(stream_seq)),
+            cycle_id,
+            s.account_id,
+            character,
+            s.kind,
+            reason,
+        },
+    );
+    return if ((rows orelse 0) == 0) .dedup_skipped else .inserted;
+}
 
 fn handleMarketTrade(
     allocator: std.mem.Allocator,

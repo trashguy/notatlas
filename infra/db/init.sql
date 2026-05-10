@@ -82,6 +82,29 @@ CREATE TABLE disciplines (
     UNIQUE (character_id, discipline)
 );
 
+-- Session events: login / logout / disconnect rows. Tier-0 fast lane in
+-- pwriter — game-mechanic correctness depends on sub-second p99 latency
+-- to PG (the hibernation grace timer can't start until the disconnect
+-- row is durable). Volume is human-scale (order of player-count, not
+-- tick-rate), so JSONB is unnecessary; flat columns + indexes win.
+--
+-- character_id is nullable: pre-character-select disconnects (lobby
+-- timeout, account-level kicks) only have an account context. Hibernation
+-- grace timer queries the index `(character_id, occurred_at DESC)`.
+CREATE TABLE sessions (
+    id           BIGSERIAL PRIMARY KEY,
+    stream_seq   BIGINT NOT NULL UNIQUE,
+    cycle_id     BIGINT NOT NULL REFERENCES wipe_cycles(id) ON DELETE CASCADE,
+    account_id   BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    character_id BIGINT REFERENCES characters(id) ON DELETE CASCADE,
+    kind         VARCHAR(16) NOT NULL CHECK (kind IN ('login','logout','disconnect')),
+    reason       TEXT,
+    occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX sessions_account_idx ON sessions (account_id, occurred_at DESC);
+CREATE INDEX sessions_character_idx ON sessions (character_id, occurred_at DESC) WHERE character_id IS NOT NULL;
+
 -- Inventory: one JSONB blob per character (decision 5, JSONB row).
 -- Shape sketched, not locked — slot list with item_def_id + quantity +
 -- durability + per-slot metadata. Versioned so persistence-writer can
