@@ -66,6 +66,22 @@ const fetch_timeout_fast_ms: u32 = 5;
 const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
+// Status snapshot cadence. 5 s is a common ops compromise: long enough
+// that breach detection has signal (>30 s sustained = real breach, not
+// a single slow batch), short enough that the dashboard doesn't feel
+// stale. Aligns with admin.cycle.changed cadence — both are
+// human-observable, not hot-path.
+const status_interval_ns: u64 = 5 * std.time.ns_per_s;
+// Sustained-lag breach: lag_p99 over SLA continuously for this long
+// trips a breach. Single slow batches don't count — only sustained
+// pressure does.
+const breach_lag_window_ns: i128 = 30 * std.time.ns_per_s;
+// Stalled-progress breach: no successful inserts for this long while
+// pending > 0 = pwriter is stuck. Different signal from lag — covers
+// the case where pwriter is running but every batch errors.
+const breach_stall_window_ns: i128 = 5 * 60 * std.time.ns_per_s;
+const breach_stall_pending_threshold: u64 = 1000;
+
 const consumer_name = "pwriter";
 
 // 300s. Long enough that a slow batch (PG hiccup, lock wait) doesn't cause
@@ -76,6 +92,60 @@ const consumer_name = "pwriter";
 const ack_wait_ns: u64 = 300 * std.time.ns_per_s;
 
 const Outcome = enum { inserted, dedup_skipped };
+
+const AckMeta = struct {
+    stream_seq: u64,
+    publish_time_ns: i128,
+};
+
+/// Ring buffer of recent per-message lag samples (ms from broker
+/// publish-timestamp to commit-time). 256 samples at 1 fast-stream
+/// in-flight is ~one minute of recent activity at session cadence;
+/// for slow-tier analytics it's much less but lag-quality concerns
+/// are different anyway. p99 sorts a copy on demand — fine since
+/// status publishes at 0.2 Hz (5 s cadence).
+const LagBuffer = struct {
+    samples_ms: [256]u32 = undefined,
+    count: u16 = 0, // saturates at 256
+    head: u8 = 0, // wraps at 256
+
+    fn record(self: *LagBuffer, lag_ms: u32) void {
+        self.samples_ms[self.head] = lag_ms;
+        self.head +%= 1;
+        if (self.count < 256) self.count += 1;
+    }
+
+    fn p99(self: *const LagBuffer) u32 {
+        if (self.count == 0) return 0;
+        var copy: [256]u32 = undefined;
+        const n = self.count;
+        @memcpy(copy[0..n], self.samples_ms[0..n]);
+        std.mem.sort(u32, copy[0..n], {}, std.sort.asc(u32));
+        // Floor of 99th percentile: idx = ceil(n * 0.99) - 1, but for
+        // small n (n < 100) p99 collapses to max — that's fine for
+        // observability; what we care about is "is the tail bad?"
+        const idx = if (n == 1) 0 else (@as(usize, n) * 99 + 99) / 100 - 1;
+        return copy[idx];
+    }
+};
+
+const StreamMetrics = struct {
+    committed: u64 = 0,
+    dedup_skipped: u64 = 0,
+    failed: u64 = 0,
+    /// Time-of-last-successful-commit, ns since UNIX epoch (i128 to
+    /// match std.time.nanoTimestamp). 0 = no inserts yet this run.
+    last_insert_ns: i128 = 0,
+    /// Filled by publishStatus from JS consumer-info; observability only.
+    pending: u64 = 0,
+    lag: LagBuffer = .{},
+    /// Resolved at startup from spec.sla_p99_ms with optional CLI
+    /// override applied. Held per-stream so per-tier overrides land
+    /// here without touching the comptime spec table.
+    sla_p99_ms: u32 = 0,
+    /// Breach-onset timestamp (ns since UNIX epoch). 0 = not breaching.
+    breach_since_ns: i128 = 0,
+};
 
 /// Drain priority. fast streams are drained to completion (timeout=0
 /// pull) before any slow stream runs. The classification is not a
@@ -155,6 +225,11 @@ const Args = struct {
     pg_user: []const u8 = "notatlas",
     pg_pass: []const u8 = "notatlas",
     pg_db: []const u8 = "notatlas",
+    /// SLA overrides — null preserves the comptime default in
+    /// stream_specs[].sla_p99_ms. Tournaments can tighten or loosen
+    /// per-tier without recompiling.
+    fast_sla_ms: ?u32 = null,
+    slow_sla_ms: ?u32 = null,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -176,17 +251,23 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.pg_pass = try allocator.dupe(u8, args.next() orelse return error.MissingArg);
         } else if (std.mem.eql(u8, a, "--pg-db")) {
             out.pg_db = try allocator.dupe(u8, args.next() orelse return error.MissingArg);
+        } else if (std.mem.eql(u8, a, "--fast-sla-ms")) {
+            out.fast_sla_ms = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--slow-sla-ms")) {
+            out.slow_sla_ms = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print(
                 \\persistence-writer — sole Postgres writer.
                 \\
                 \\Options:
-                \\  --nats <url>       (default nats://127.0.0.1:4222)
-                \\  --pg-host <host>   (default 127.0.0.1)
-                \\  --pg-port <port>   (default 5432)
-                \\  --pg-user <user>   (default notatlas)
-                \\  --pg-pass <pass>   (default notatlas)
-                \\  --pg-db <db>       (default notatlas)
+                \\  --nats <url>          (default nats://127.0.0.1:4222)
+                \\  --pg-host <host>      (default 127.0.0.1)
+                \\  --pg-port <port>      (default 5432)
+                \\  --pg-user <user>      (default notatlas)
+                \\  --pg-pass <pass>      (default notatlas)
+                \\  --pg-db <db>          (default notatlas)
+                \\  --fast-sla-ms <ms>    override tier=fast SLA (default 200)
+                \\  --slow-sla-ms <ms>    override tier=slow SLA (default 10000)
                 \\
             , .{});
             std.process.exit(0);
@@ -290,9 +371,20 @@ pub fn main() !void {
         );
     }
 
-    var committed_totals = [_]u64{0} ** stream_specs.len;
-    var dedup_totals = [_]u64{0} ** stream_specs.len;
+    // Per-stream runtime metrics. SLA defaults from comptime spec, with
+    // optional CLI override per tier (tournaments tighten fast-lane;
+    // ops loosen slow-lane during analytics replays).
+    var metrics: [stream_specs.len]StreamMetrics = undefined;
+    inline for (stream_specs, 0..) |spec, i| {
+        const sla = switch (spec.tier) {
+            .fast => args.fast_sla_ms orelse spec.sla_p99_ms,
+            .slow => args.slow_sla_ms orelse spec.sla_p99_ms,
+        };
+        metrics[i] = .{ .sla_p99_ms = sla };
+    }
+
     var last_log_ns: i128 = std.time.nanoTimestamp();
+    var last_status_ns: i128 = std.time.nanoTimestamp();
     while (!stop_flag.load(.acquire)) {
         // pull.fetch internally calls processIncoming which dispatches
         // ALL routed messages — so cycle_sub is being filled by the
@@ -330,12 +422,14 @@ pub fn main() !void {
             fast_quiet = true;
             for (stream_specs, 0..) |spec, i| {
                 if (spec.tier != .fast) continue;
-                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms)) |stats| {
-                    if (stats.committed + stats.dedup_skipped > 0) {
-                        fast_quiet = false;
+                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms, &metrics[i].lag)) |stats| {
+                    if (stats.nonzero()) {
+                        if (stats.committed + stats.dedup_skipped > 0) fast_quiet = false;
                         any_processed = true;
-                        committed_totals[i] += stats.committed;
-                        dedup_totals[i] += stats.dedup_skipped;
+                        metrics[i].committed += stats.committed;
+                        metrics[i].dedup_skipped += stats.dedup_skipped;
+                        metrics[i].failed += stats.failed;
+                        if (stats.last_insert_ns != 0) metrics[i].last_insert_ns = stats.last_insert_ns;
                     }
                 } else |_| {}
             }
@@ -346,11 +440,13 @@ pub fn main() !void {
         // slow-tier SLAs are seconds, not milliseconds.
         for (stream_specs, 0..) |spec, i| {
             if (spec.tier != .slow) continue;
-            if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms)) |stats| {
-                if (stats.committed + stats.dedup_skipped > 0) {
+            if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms, &metrics[i].lag)) |stats| {
+                if (stats.nonzero()) {
                     any_processed = true;
-                    committed_totals[i] += stats.committed;
-                    dedup_totals[i] += stats.dedup_skipped;
+                    metrics[i].committed += stats.committed;
+                    metrics[i].dedup_skipped += stats.dedup_skipped;
+                    metrics[i].failed += stats.failed;
+                    if (stats.last_insert_ns != 0) metrics[i].last_insert_ns = stats.last_insert_ns;
                 }
             } else |_| {}
         }
@@ -358,12 +454,16 @@ pub fn main() !void {
 
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
-            logTotals(cycle_id, "tick", &committed_totals, &dedup_totals);
+            logTotals(cycle_id, "tick", &metrics);
             last_log_ns = now;
+        }
+        if (now - last_status_ns >= status_interval_ns) {
+            publishStatus(nats_client, cycle_id, &metrics, now);
+            last_status_ns = now;
         }
     }
 
-    logTotals(cycle_id, "shutdown", &committed_totals, &dedup_totals);
+    logTotals(cycle_id, "shutdown", &metrics);
 }
 
 /// Fetch + process one batch from a stream. Returns null on fetch error
@@ -375,6 +475,7 @@ fn drainBatch(
     spec: StreamSpec,
     cycle_id: i64,
     timeout_ms: u32,
+    lag: *LagBuffer,
 ) !BatchStats {
     const msgs = pull.fetch(fetch_batch, timeout_ms) catch |err| {
         std.debug.print(
@@ -389,7 +490,7 @@ fn drainBatch(
     }
     if (msgs.len == 0) return BatchStats{};
 
-    return processBatch(allocator, pool, pull, msgs, cycle_id, spec.handler) catch |err| {
+    return processBatch(allocator, pool, pull, msgs, cycle_id, spec.handler, lag) catch |err| {
         std.debug.print(
             "persistence-writer: batch err on {s}: {}\n",
             .{ spec.stream_name, err },
@@ -403,18 +504,168 @@ fn drainBatch(
 fn logTotals(
     cycle_id: i64,
     phase: []const u8,
-    committed_totals: *const [stream_specs.len]u64,
-    dedup_totals: *const [stream_specs.len]u64,
+    metrics: *const [stream_specs.len]StreamMetrics,
 ) void {
     var buf: [512]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.print("persistence-writer: {s} cycle={d}", .{ phase, cycle_id }) catch return;
     inline for (stream_specs, 0..) |spec, i| {
-        w.print(" {s}={d}/{d}", .{ spec.label, committed_totals[i], dedup_totals[i] }) catch return;
+        w.print(" {s}={d}/{d}", .{ spec.label, metrics[i].committed, metrics[i].dedup_skipped }) catch return;
     }
     w.print(" (committed/dedup)\n", .{}) catch return;
     std.debug.print("{s}", .{fbs.getWritten()});
+}
+
+/// Best-effort consumer-info request to refresh `pending`. nats-zig 0.2.2
+/// doesn't expose a `consumerInfo()` helper, but the request shape is
+/// the same one js.streamInfo uses — just the CONSUMER.INFO subject.
+/// Failure mode: log once and return; the cached `pending` value stays
+/// from the previous tick. Status emission proceeds regardless because
+/// the hibernation grace mechanic depends on the FAST-LANE inserts, not
+/// on this number.
+fn refreshPending(client: *nats.Client, stream_name: []const u8) ?u64 {
+    var subject_buf: [256]u8 = undefined;
+    const subject = std.fmt.bufPrint(
+        &subject_buf,
+        "$JS.API.CONSUMER.INFO.{s}.{s}",
+        .{ stream_name, consumer_name },
+    ) catch return null;
+
+    var msg = client.request(subject, null, 1000) catch return null;
+    defer msg.deinit();
+
+    const payload = msg.payload orelse return null;
+    // Hand-roll: search for `"num_pending":<n>`. Cheaper than a
+    // full JSON parse, and resilient to schema drift (response gains
+    // new fields all the time).
+    const key = "\"num_pending\":";
+    const k = std.mem.indexOf(u8, payload, key) orelse return null;
+    var i: usize = k + key.len;
+    while (i < payload.len and (payload[i] == ' ' or payload[i] == '\t')) : (i += 1) {}
+    const start = i;
+    while (i < payload.len and payload[i] >= '0' and payload[i] <= '9') : (i += 1) {}
+    if (i == start) return null;
+    return std.fmt.parseInt(u64, payload[start..i], 10) catch null;
+}
+
+const BreachKind = enum { lag, stalled };
+
+/// Per-stream breach detector. Two trigger conditions:
+///   - lag_p99 > sla_p99_ms sustained for ≥ breach_lag_window_ns
+///   - last_insert_ms_ago > breach_stall_window_ns AND pending > breach_stall_pending_threshold
+/// State is held in StreamMetrics.breach_since_ns: 0 = healthy,
+/// nonzero = breach-onset timestamp. Transitions emit
+/// admin.pwriter.breach for downstream alerting.
+fn detectBreach(
+    client: *nats.Client,
+    spec: StreamSpec,
+    m: *StreamMetrics,
+    now_ns: i128,
+) void {
+    const lag_p99 = m.lag.p99();
+    const stalled = m.last_insert_ns != 0 and
+        (now_ns - m.last_insert_ns) > breach_stall_window_ns and
+        m.pending >= breach_stall_pending_threshold;
+    const lagging = lag_p99 > m.sla_p99_ms;
+    const condition_now = stalled or lagging;
+
+    if (condition_now and m.breach_since_ns == 0) {
+        // Pre-breach: condition just became true. Mark the start time
+        // but don't emit yet — sustained-window check happens below.
+        m.breach_since_ns = now_ns;
+    } else if (!condition_now and m.breach_since_ns != 0) {
+        // Recovery transition. If we'd previously emitted onset, emit
+        // recovery; otherwise just clear the pre-breach mark silently.
+        const sustained = (now_ns - m.breach_since_ns) >= breach_lag_window_ns;
+        m.breach_since_ns = 0;
+        if (sustained) {
+            publishBreach(client, spec.label, .lag, "recovered");
+        }
+    } else if (condition_now and m.breach_since_ns != 0) {
+        // Sustained breach: only emit onset on the FIRST tick after
+        // crossing the lag-window threshold. Subsequent ticks while
+        // breaching are silent (avoid flooding admin.pwriter.breach).
+        const elapsed = now_ns - m.breach_since_ns;
+        const was_emitted = elapsed >= breach_lag_window_ns + status_interval_ns;
+        const just_crossed = elapsed >= breach_lag_window_ns and !was_emitted;
+        if (just_crossed) {
+            const kind: BreachKind = if (stalled) .stalled else .lag;
+            const reason = if (stalled) "stalled" else "lag_p99_over_sla";
+            publishBreach(client, spec.label, kind, reason);
+        }
+    }
+}
+
+fn publishBreach(client: *nats.Client, label: []const u8, kind: BreachKind, reason: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &buf,
+        "{{\"stream\":\"{s}\",\"kind\":\"{s}\",\"reason\":\"{s}\"}}",
+        .{ label, @tagName(kind), reason },
+    ) catch return;
+    client.publish("admin.pwriter.breach", body) catch |err| {
+        std.debug.print("persistence-writer: breach publish err: {}\n", .{err});
+    };
+    std.debug.print(
+        "persistence-writer: breach stream={s} kind={s} reason={s}\n",
+        .{ label, @tagName(kind), reason },
+    );
+}
+
+/// Build + publish the periodic status snapshot on admin.pwriter.status.
+/// Single-subject flat snapshot per the SLA design call (one consumer
+/// pulls the whole pwriter state in one message). Refreshes pending
+/// from JS consumer-info, evaluates breach state, emits JSON.
+fn publishStatus(
+    client: *nats.Client,
+    cycle_id: i64,
+    metrics: *[stream_specs.len]StreamMetrics,
+    now_ns: i128,
+) void {
+    // Refresh pending on each stream.
+    inline for (stream_specs, 0..) |spec, i| {
+        if (refreshPending(client, spec.stream_name)) |p| metrics[i].pending = p;
+    }
+
+    // Evaluate breach state per stream (may publish admin.pwriter.breach).
+    inline for (stream_specs, 0..) |spec, i| {
+        detectBreach(client, spec, &metrics[i], now_ns);
+    }
+
+    // Build + publish the status snapshot. 4 streams × ~150 bytes per
+    // entry = ~600 B; 2 KB stack buffer is plenty.
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.print("{{\"cycle\":{d},\"streams\":[", .{cycle_id}) catch return;
+    inline for (stream_specs, 0..) |spec, i| {
+        const m = metrics[i];
+        const last_ms_ago: i128 = if (m.last_insert_ns == 0) -1 else @divTrunc(now_ns - m.last_insert_ns, std.time.ns_per_ms);
+        if (i != 0) w.writeAll(",") catch return;
+        w.print(
+            "{{\"name\":\"{s}\",\"tier\":\"{s}\",\"sla_p99_ms\":{d}," ++
+                "\"committed\":{d},\"dedup_skipped\":{d},\"failed\":{d}," ++
+                "\"pending\":{d},\"lag_ms_p99\":{d}," ++
+                "\"last_insert_ms_ago\":{d},\"sla_breach\":{s}}}",
+            .{
+                spec.label,
+                @tagName(spec.tier),
+                m.sla_p99_ms,
+                m.committed,
+                m.dedup_skipped,
+                m.failed,
+                m.pending,
+                m.lag.p99(),
+                last_ms_ago,
+                if (m.breach_since_ns != 0 and (now_ns - m.breach_since_ns) >= breach_lag_window_ns) "true" else "false",
+            },
+        ) catch return;
+    }
+    w.writeAll("]}") catch return;
+    client.publish("admin.pwriter.status", fbs.getWritten()) catch |err| {
+        std.debug.print("persistence-writer: status publish err: {}\n", .{err});
+    };
 }
 
 fn probeCurrentCycle(pool: *pg.Pool) !i64 {
@@ -484,16 +735,25 @@ fn ensureConsumer(client: *nats.Client, stream_name: []const u8) !void {
 const BatchStats = struct {
     committed: u64 = 0,
     dedup_skipped: u64 = 0,
+    failed: u64 = 0,
+    /// Time of last successful insert in this batch (0 if no inserts).
+    /// Caller updates StreamMetrics.last_insert_ns from this.
+    last_insert_ns: i128 = 0,
+
+    fn nonzero(self: BatchStats) bool {
+        return self.committed + self.dedup_skipped + self.failed > 0;
+    }
 };
 
-/// Parse the JetStream-assigned stream sequence from the ACK reply_to
-/// subject. Two layouts are in the wild:
+/// Parse stream_seq + publish_time_ns from the JS ACK reply_to subject.
+/// Two layouts are in the wild:
 ///   v1 (no domain):   $JS.ACK.<stream>.<consumer>.<delivery>.<stream_seq>.<consumer_seq>.<ts>.<pending>
 ///   v2 (with domain): $JS.ACK.<domain>.<accthash>.<stream>.<consumer>.<delivery>.<stream_seq>.<consumer_seq>.<ts>.<pending>.<random>
-/// stream_seq sits at index 5 (v1, 9 tokens) or 7 (v2, 12 tokens). NATS
-/// 2.14 dev broker emits v1; production with a JS domain emits v2 — both
-/// are handled rather than betting on the deployment shape.
-fn parseStreamSeq(reply_to: ?[]const u8) ?u64 {
+/// stream_seq sits at index 5 (v1, 9 tokens) or 7 (v2, 12 tokens);
+/// timestamp at idx 7 / 9 respectively (ns since UNIX epoch). NATS
+/// 2.14 dev broker emits v1; production with a JS domain emits v2 —
+/// both are handled rather than betting on the deployment shape.
+fn parseAckMeta(reply_to: ?[]const u8) ?AckMeta {
     const r = reply_to orelse return null;
     if (!std.mem.startsWith(u8, r, "$JS.ACK.")) return null;
 
@@ -504,12 +764,14 @@ fn parseStreamSeq(reply_to: ?[]const u8) ?u64 {
         if (n >= tokens.len) return null;
         tokens[n] = t;
     }
-    const idx: usize = switch (n) {
-        9 => 5,
-        12 => 7,
+    const seq_idx: usize, const ts_idx: usize = switch (n) {
+        9 => .{ 5, 7 },
+        12 => .{ 7, 9 },
         else => return null,
     };
-    return std.fmt.parseInt(u64, tokens[idx], 10) catch null;
+    const stream_seq = std.fmt.parseInt(u64, tokens[seq_idx], 10) catch return null;
+    const publish_time_ns = std.fmt.parseInt(i128, tokens[ts_idx], 10) catch return null;
+    return .{ .stream_seq = stream_seq, .publish_time_ns = publish_time_ns };
 }
 
 /// Drain a fetched batch into PG. Each event runs as a single auto-
@@ -550,6 +812,7 @@ fn processBatch(
         []const u8,
         u64,
     ) anyerror!Outcome,
+    lag: *LagBuffer,
 ) !BatchStats {
     var conn = try pool.acquire();
     defer conn.release();
@@ -563,28 +826,29 @@ fn processBatch(
         };
         const subject = m.subject;
 
-        const stream_seq = parseStreamSeq(m.reply_to) orelse {
+        const ack_meta = parseAckMeta(m.reply_to) orelse {
             std.debug.print(
                 "persistence-writer: missing/unparseable JS reply_to on '{s}': {?s}\n",
                 .{ subject, m.reply_to },
             );
-            // No stream_seq → can't dedup → don't insert. Don't ack
+            // No metadata → can't dedup → don't insert. Don't ack
             // either; broker redelivers and the next attempt either
             // succeeds (transient) or stays stuck (producer bug worth
             // surfacing in logs).
+            stats.failed += 1;
             continue;
         };
 
-        const outcome = handler(allocator, conn, cycle_id, subject, payload, stream_seq) catch |err| {
+        const outcome = handler(allocator, conn, cycle_id, subject, payload, ack_meta.stream_seq) catch |err| {
             if (conn.err) |pg_err| {
                 std.debug.print(
                     "persistence-writer: handler err on '{s}' seq={d}: {} — pg: {s}\n",
-                    .{ subject, stream_seq, err, pg_err.message },
+                    .{ subject, ack_meta.stream_seq, err, pg_err.message },
                 );
             } else {
                 std.debug.print(
                     "persistence-writer: handler err on '{s}' seq={d}: {}\n",
-                    .{ subject, stream_seq, err },
+                    .{ subject, ack_meta.stream_seq, err },
                 );
             }
             // No ack — JetStream will redeliver after ack_wait.
@@ -593,6 +857,7 @@ fn processBatch(
             // hand back a usable connection (or reconnect if needed).
             conn.release();
             conn = try pool.acquire();
+            stats.failed += 1;
             continue;
         };
 
@@ -600,8 +865,18 @@ fn processBatch(
             std.debug.print("persistence-writer: ack err {}\n", .{err});
             continue;
         };
+        const now_ns = std.time.nanoTimestamp();
+        // Lag = time from broker publish to commit. Negative deltas can
+        // happen if the dev broker's wall clock drifts behind ours;
+        // clamp to 0 rather than wrapping a u32.
+        const lag_ns = now_ns - ack_meta.publish_time_ns;
+        const lag_ms: u32 = if (lag_ns <= 0) 0 else std.math.cast(u32, @divTrunc(lag_ns, std.time.ns_per_ms)) orelse std.math.maxInt(u32);
+        lag.record(lag_ms);
         switch (outcome) {
-            .inserted => stats.committed += 1,
+            .inserted => {
+                stats.committed += 1;
+                stats.last_insert_ns = now_ns;
+            },
             .dedup_skipped => stats.dedup_skipped += 1,
         }
     }
