@@ -89,7 +89,21 @@ const consumer_name = "pwriter";
 // events behind a dead consumer for hours. Idempotency is on stream_seq UNIQUE
 // + ON CONFLICT DO NOTHING, so redelivery is a no-op insert anyway — ack_wait
 // is just controlling redelivery cadence, not correctness.
-const ack_wait_ns: u64 = 300 * std.time.ns_per_s;
+//
+// Runtime-overridable via --ack-wait-s for smoke harnesses (the dedup
+// smoke needs ack_wait short enough that broker-side redelivery happens
+// within smoke wallclock). Treated as `var` rather than `const` so the
+// CLI flag can write through; ensureConsumer reads at consumer-create
+// time. Re-creating an existing consumer with a different ack_wait
+// requires deleting the consumer first (broker rejects mismatched
+// configs); smokes do that explicitly.
+var ack_wait_ns: u64 = 300 * std.time.ns_per_s;
+
+/// Debug flag: skip the JS ack call after a successful insert. Lets a
+/// smoke harness leave messages un-acked so ack_wait expiry triggers
+/// real broker-side redelivery — the only way to exercise dedup
+/// without racing pwriter's own ack path. NEVER set in production.
+var no_ack_mode: bool = false;
 
 const Outcome = enum { inserted, dedup_skipped };
 
@@ -230,6 +244,10 @@ const Args = struct {
     /// per-tier without recompiling.
     fast_sla_ms: ?u32 = null,
     slow_sla_ms: ?u32 = null,
+    /// Smoke-only knobs. ack_wait_s overrides the consumer's ack_wait;
+    /// no_ack disables ack publishing so messages stay outstanding.
+    ack_wait_s: ?u64 = null,
+    no_ack: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -255,6 +273,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.fast_sla_ms = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--slow-sla-ms")) {
             out.slow_sla_ms = try std.fmt.parseInt(u32, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--ack-wait-s")) {
+            out.ack_wait_s = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--no-ack")) {
+            out.no_ack = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print(
                 \\persistence-writer — sole Postgres writer.
@@ -268,6 +290,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
                 \\  --pg-db <db>          (default notatlas)
                 \\  --fast-sla-ms <ms>    override tier=fast SLA (default 200)
                 \\  --slow-sla-ms <ms>    override tier=slow SLA (default 10000)
+                \\  --ack-wait-s <s>      override consumer ack_wait (smoke-only; default 300)
+                \\  --no-ack              skip ack after insert (smoke-only; never use in prod)
                 \\
             , .{});
             std.process.exit(0);
@@ -301,6 +325,15 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);
+
+    if (args.ack_wait_s) |s| ack_wait_ns = s * std.time.ns_per_s;
+    no_ack_mode = args.no_ack;
+    if (no_ack_mode) {
+        std.debug.print(
+            "persistence-writer: --no-ack ENABLED (smoke-only — messages will not be acked)\n",
+            .{},
+        );
+    }
 
     try installSignalHandlers();
 
@@ -861,10 +894,12 @@ fn processBatch(
             continue;
         };
 
-        pull.ack(m) catch |err| {
-            std.debug.print("persistence-writer: ack err {}\n", .{err});
-            continue;
-        };
+        if (!no_ack_mode) {
+            pull.ack(m) catch |err| {
+                std.debug.print("persistence-writer: ack err {}\n", .{err});
+                continue;
+            };
+        }
         const now_ns = std.time.nanoTimestamp();
         // Lag = time from broker publish to commit. Negative deltas can
         // happen if the dev broker's wall clock drifts behind ours;
