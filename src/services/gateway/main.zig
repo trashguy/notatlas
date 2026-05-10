@@ -1,5 +1,11 @@
 //! gateway — TCP ↔ NATS relay per docs/08 §1.2.
 //!
+//! Also acts as the producer for `events.session` (login/disconnect)
+//! consumed by persistence-writer's tier-0 fast lane. See
+//! `publishSession` and the `login_emitted` flag on Conn for the
+//! lifecycle invariant: every login event pairs with exactly one
+//! disconnect event on the same account_id.
+//!
 //! Stateless client-facing service that bridges TCP-connected
 //! clients into the NATS service mesh. Per-client this means:
 //!   - **inbound** (NATS → TCP): subscribe to `gw.client.<id>.cmd`
@@ -58,6 +64,24 @@ const nats = @import("nats");
 const notatlas = @import("notatlas");
 const posix = std.posix;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// Subject the persistence-writer's tier-0 fast lane consumes from.
+/// One event per session-lifecycle transition we emit (login on
+/// successful JWT validation, disconnect on any close after that).
+/// pwriter inserts into `sessions` with sub-200ms p99 — hibernation
+/// grace timer reads (account_id, occurred_at DESC) and depends on
+/// the disconnect row being durable before it can start ticking.
+const session_subject = "events.session";
+
+/// Session-event kinds that match the CHECK constraint on
+/// sessions.kind in infra/db/init.sql.
+const SessionKind = enum {
+    login,
+    disconnect,
+    // logout is reserved for an explicit-logout protocol message that
+    // doesn't exist in v0 — every clean close currently routes through
+    // disconnect.
+};
 
 /// Per-payload header for slow-lane and fast-lane batches.
 /// Mirrors `cell_mgr/fanout.zig:PayloadHeader`. When a real
@@ -177,6 +201,12 @@ const Conn = struct {
     input_subj: []const u8 = "",
     sub_cmd: ?*nats.Subscription = null,
     sub_fire: ?*nats.Subscription = null,
+    /// Set after a successful login event has been published. Drives
+    /// disconnect emission from `Conns.close` — only conns that
+    /// actually transitioned active should emit a disconnect on close,
+    /// otherwise rejected/timed-out hellos would leak phantom sessions
+    /// into PG.
+    login_emitted: bool = false,
 
     fn deinit(self: *Conn, allocator: std.mem.Allocator, client: *nats.Client) void {
         if (self.sub_cmd) |s| client.unsubscribe(s) catch {};
@@ -203,14 +233,63 @@ const Conns = struct {
         i: usize,
         allocator: std.mem.Allocator,
         client: *nats.Client,
+        reason: []const u8,
     ) void {
         if (self.slots[i] == null) return;
-        var c = &self.slots[i].?;
+        const c = &self.slots[i].?;
+        // Disconnect is paired with login: only emit if a login event
+        // was actually published. Awaiting-hello rejections (bad JWT,
+        // hello timeout, alloc fail before subscribe) get no
+        // sessions-row footprint at all — they never authenticated.
+        if (c.login_emitted) {
+            publishSession(client, c.client_id, 0, .disconnect, reason);
+        }
         c.deinit(allocator, client);
         self.slots[i] = null;
         if (self.active_count > 0) self.active_count -= 1;
     }
 };
+
+/// Publish a single events.session message. Best-effort core publish —
+/// JetStream captures it via the events_session stream subject filter
+/// (workqueue retention), and pwriter handles dedup via stream_seq if
+/// any redelivery happens. No PubAck wait here — gateway is on a
+/// latency-sensitive path; a dropped publish surfaces as a missing
+/// sessions row, which is monitored downstream.
+///
+/// Field mapping:
+///   account_id  ← JWT.client_id (the gateway's auth-scoped identity).
+///   character_id ← 0 for v0 (gateway pre-character-select; populated
+///                  later when a character-select protocol exists).
+///   kind        ← login | disconnect.
+///   reason      ← short label for disconnects; null for login.
+fn publishSession(
+    client: *nats.Client,
+    account_id: u64,
+    character_id: u64,
+    kind: SessionKind,
+    reason: ?[]const u8,
+) void {
+    var buf: [256]u8 = undefined;
+    const body = if (reason) |r| std.fmt.bufPrint(
+        &buf,
+        \\{{"account_id":{d},"character_id":{d},"kind":"{s}","reason":"{s}"}}
+    ,
+        .{ account_id, character_id, @tagName(kind), r },
+    ) catch return else std.fmt.bufPrint(
+        &buf,
+        \\{{"account_id":{d},"character_id":{d},"kind":"{s}"}}
+    ,
+        .{ account_id, character_id, @tagName(kind) },
+    ) catch return;
+
+    client.publish(session_subject, body) catch |err| {
+        std.debug.print(
+            "gateway: events.session publish failed (kind={s} account={d}): {s}\n",
+            .{ @tagName(kind), account_id, @errorName(err) },
+        );
+    };
+}
 
 /// JWT claims — what the gateway extracts and trusts after a
 /// signature-valid token is presented. Matches the standard
@@ -353,7 +432,7 @@ pub fn main() !void {
 
     var conns: Conns = .{};
     defer for (&conns.slots, 0..) |*slot, i| {
-        if (slot.* != null) conns.close(i, allocator, client);
+        if (slot.* != null) conns.close(i, allocator, client, "shutdown");
     };
 
     var msgs_total: u64 = 0;
@@ -416,7 +495,7 @@ pub fn main() !void {
                         .{c.conn.address},
                     );
                     rejected_jwt += 1;
-                    conns.close(i, allocator, client);
+                    conns.close(i, allocator, client, "hello_timeout");
                     continue;
                 }
             }
@@ -424,7 +503,7 @@ pub fn main() !void {
             // TCP → buffer.
             const drained = drainSocket(&c.buf, c.conn.stream) catch |err| {
                 std.debug.print("gateway: conn {d} read failed ({s}); closing\n", .{ i, @errorName(err) });
-                conns.close(i, allocator, client);
+                conns.close(i, allocator, client, "read_fail");
                 continue;
             };
             bytes_tcp_in_total += drained.bytes_read;
@@ -435,45 +514,52 @@ pub fn main() !void {
                     const peek = peekFrame(&c.buf) catch |err| {
                         std.debug.print("gateway: conn {d} bad hello frame ({s}); closing\n", .{ i, @errorName(err) });
                         rejected_jwt += 1;
-                        conns.close(i, allocator, client);
+                        conns.close(i, allocator, client, "bad_hello_frame");
                         continue;
                     };
                     if (peek) |jwt_bytes| {
                         const id = verifyJwt(allocator, jwt_bytes, secret, std.time.timestamp()) catch |err| {
                             std.debug.print("gateway: conn {d} JWT rejected ({s}); closing\n", .{ i, @errorName(err) });
                             rejected_jwt += 1;
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "jwt_rejected");
                             continue;
                         };
                         c.client_id = id.client_id;
                         c.player_id = id.player_id;
                         c.cmd_subj = std.fmt.allocPrint(allocator, "gw.client.{d}.cmd", .{id.client_id}) catch |err| {
                             std.debug.print("gateway: conn {d} alloc cmd_subj failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "alloc_fail");
                             continue;
                         };
                         c.fire_subj = std.fmt.allocPrint(allocator, "gw.client.{d}.fire", .{id.client_id}) catch |err| {
                             std.debug.print("gateway: conn {d} alloc fire_subj failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "alloc_fail");
                             continue;
                         };
                         c.input_subj = std.fmt.allocPrint(allocator, "sim.entity.{d}.input", .{id.player_id}) catch |err| {
                             std.debug.print("gateway: conn {d} alloc input_subj failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "alloc_fail");
                             continue;
                         };
                         c.sub_cmd = client.subscribe(c.cmd_subj, .{}) catch |err| {
                             std.debug.print("gateway: conn {d} subscribe cmd failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "subscribe_fail");
                             continue;
                         };
                         c.sub_fire = client.subscribe(c.fire_subj, .{}) catch |err| {
                             std.debug.print("gateway: conn {d} subscribe fire failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "subscribe_fail");
                             continue;
                         };
                         c.state = .active;
                         consumeFrame(&c.buf);
+                        // Emit login AFTER the state transition + sub
+                        // creation succeeds. Set login_emitted so any
+                        // subsequent close on this slot pairs with a
+                        // disconnect event. character_id=0 for v0 (no
+                        // character-select protocol yet).
+                        publishSession(client, c.client_id, 0, .login, null);
+                        c.login_emitted = true;
                         std.debug.print(
                             "gateway: conn {d} from {f} → client_id={d} player_id={d}\n",
                             .{ i, c.conn.address, c.client_id, c.player_id },
@@ -485,13 +571,13 @@ pub fn main() !void {
                     publish_loop: while (true) {
                         const peek = peekFrame(&c.buf) catch {
                             std.debug.print("gateway: conn {d} oversized frame; closing\n", .{i});
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "oversized_frame");
                             break :publish_loop;
                         };
                         const frame = peek orelse break :publish_loop;
                         client.publish(c.input_subj, frame) catch |err| {
                             std.debug.print("gateway: conn {d} input publish failed ({s})\n", .{ i, @errorName(err) });
-                            conns.close(i, allocator, client);
+                            conns.close(i, allocator, client, "publish_fail");
                             break :publish_loop;
                         };
                         consumeFrame(&c.buf);
@@ -517,7 +603,7 @@ pub fn main() !void {
                     clusters_total += hdr.cluster_count;
                     const n = forwardFrame(slot.*.?.conn.stream, .cmd, payload) catch |err| {
                         std.debug.print("gateway: conn {d} write cmd failed ({s}); closing\n", .{ i, @errorName(err) });
-                        conns.close(i, allocator, client);
+                        conns.close(i, allocator, client, "write_fail");
                         break;
                     };
                     bytes_tcp_out_total += n;
@@ -532,7 +618,7 @@ pub fn main() !void {
                     bytes_total += payload.len;
                     const n = forwardFrame(slot.*.?.conn.stream, .fire, payload) catch |err| {
                         std.debug.print("gateway: conn {d} write fire failed ({s}); closing\n", .{ i, @errorName(err) });
-                        conns.close(i, allocator, client);
+                        conns.close(i, allocator, client, "write_fail");
                         break;
                     };
                     bytes_tcp_out_total += n;
@@ -541,7 +627,7 @@ pub fn main() !void {
 
             if (slot.* != null and drained.eof) {
                 std.debug.print("gateway: conn {d} EOF; closing\n", .{i});
-                conns.close(i, allocator, client);
+                conns.close(i, allocator, client, "client_close");
             }
         }
 
