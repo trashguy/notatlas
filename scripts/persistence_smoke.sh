@@ -164,8 +164,8 @@ check "run 1 inventories"   "$inv_count"    "1"
 check "run 1 inv version"   "$inv_version"  "$N"
 
 # Run 2: redelivered counters all zero.
-if echo "$run2_line" | grep -qE 'market=0 handoff=0 inv=0'; then
-  echo "PASS: run 2 redelivered 0 events on all 3 streams"
+if echo "$run2_line" | grep -qE 'market=0/0 handoff=0/0 inv=0/0'; then
+  echo "PASS: run 2 redelivered 0 events on all 3 streams (committed=0 dedup=0)"
 else
   echo "FAIL: run 2 redelivered events: $run2_line"
   fail=1

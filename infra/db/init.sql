@@ -152,8 +152,14 @@ CREATE TABLE market_orders (
 CREATE INDEX market_orders_lookup_idx
     ON market_orders (cycle_id, cell_x, cell_y, item_def_id, side, price);
 
+-- stream_seq is the JetStream-assigned monotonic seq on `events_market_trade`,
+-- carried in the ACK reply_to subject (`$JS.ACK.<stream>.<consumer>.<delivery>.<stream_seq>...`).
+-- pwriter writes via INSERT ... ON CONFLICT (stream_seq) DO NOTHING so any
+-- redelivery (ack_wait expiry, mid-batch crash, broker hiccup) collapses to
+-- a no-op insert. Per-table because each stream has its own sequence space.
 CREATE TABLE market_trades (
     id              BIGSERIAL PRIMARY KEY,
+    stream_seq      BIGINT NOT NULL UNIQUE,
     cycle_id        BIGINT NOT NULL REFERENCES wipe_cycles(id) ON DELETE CASCADE,
     buy_order_id    BIGINT REFERENCES market_orders(id) ON DELETE SET NULL,
     sell_order_id   BIGINT REFERENCES market_orders(id) ON DELETE SET NULL,
@@ -189,6 +195,7 @@ CREATE INDEX market_trades_item_idx ON market_trades (cycle_id, item_def_id, exe
 -- path during play.
 CREATE TABLE cell_handoffs (
     id              BIGSERIAL PRIMARY KEY,
+    stream_seq      BIGINT NOT NULL UNIQUE,
     cycle_id        BIGINT NOT NULL REFERENCES wipe_cycles(id) ON DELETE CASCADE,
     entity_id       BIGINT NOT NULL,
     from_cell_x     INTEGER NOT NULL,

@@ -49,6 +49,15 @@ const log_interval_ns: u64 = std.time.ns_per_s;
 
 const consumer_name = "pwriter";
 
+// 300s. Long enough that a slow batch (PG hiccup, lock wait) doesn't cause
+// premature redelivery, short enough that a real pwriter crash doesn't park
+// events behind a dead consumer for hours. Idempotency is on stream_seq UNIQUE
+// + ON CONFLICT DO NOTHING, so redelivery is a no-op insert anyway — ack_wait
+// is just controlling redelivery cadence, not correctness.
+const ack_wait_ns: u64 = 300 * std.time.ns_per_s;
+
+const Outcome = enum { inserted, dedup_skipped };
+
 const StreamSpec = struct {
     stream_name: []const u8,
     subject_filter: []const u8,
@@ -58,7 +67,8 @@ const StreamSpec = struct {
         cycle_id: i64,
         subject: []const u8,
         payload: []const u8,
-    ) anyerror!void,
+        stream_seq: u64,
+    ) anyerror!Outcome,
 };
 
 // Damage events are deliberately NOT in this list. The PG row would
@@ -228,7 +238,8 @@ pub fn main() !void {
         );
     }
 
-    var totals = [_]u64{0} ** stream_specs.len;
+    var committed_totals = [_]u64{0} ** stream_specs.len;
+    var dedup_totals = [_]u64{0} ** stream_specs.len;
     var last_log_ns: i128 = std.time.nanoTimestamp();
     while (!stop_flag.load(.acquire)) {
         // pull.fetch internally calls processIncoming which dispatches
@@ -268,14 +279,15 @@ pub fn main() !void {
                 allocator.free(msgs);
                 continue;
             }
-            const committed = processBatch(allocator, pool, &pulls[i], msgs, cycle_id, spec.handler) catch |err| blk: {
+            const stats = processBatch(allocator, pool, &pulls[i], msgs, cycle_id, spec.handler) catch |err| blk: {
                 std.debug.print(
                     "persistence-writer: batch err on {s}: {}\n",
                     .{ spec.stream_name, err },
                 );
-                break :blk 0;
+                break :blk BatchStats{};
             };
-            totals[i] += committed;
+            committed_totals[i] += stats.committed;
+            dedup_totals[i] += stats.dedup_skipped;
             any_processed = true;
             for (msgs) |*m| @constCast(m).deinit();
             allocator.free(msgs);
@@ -285,16 +297,25 @@ pub fn main() !void {
         const now = std.time.nanoTimestamp();
         if (now - last_log_ns >= log_interval_ns) {
             std.debug.print(
-                "persistence-writer: cycle={d} market={d} handoff={d} inv={d}\n",
-                .{ cycle_id, totals[0], totals[1], totals[2] },
+                "persistence-writer: cycle={d} market={d}/{d} handoff={d}/{d} inv={d}/{d} (committed/dedup)\n",
+                .{
+                    cycle_id,
+                    committed_totals[0], dedup_totals[0],
+                    committed_totals[1], dedup_totals[1],
+                    committed_totals[2], dedup_totals[2],
+                },
             );
             last_log_ns = now;
         }
     }
 
     std.debug.print(
-        "persistence-writer: shutting down (market={d} handoff={d} inv={d})\n",
-        .{ totals[0], totals[1], totals[2] },
+        "persistence-writer: shutting down (market={d}/{d} handoff={d}/{d} inv={d}/{d} committed/dedup)\n",
+        .{
+            committed_totals[0], dedup_totals[0],
+            committed_totals[1], dedup_totals[1],
+            committed_totals[2], dedup_totals[2],
+        },
     );
 }
 
@@ -344,9 +365,9 @@ fn ensureConsumer(client: *nats.Client, stream_name: []const u8) !void {
     var body_buf: [512]u8 = undefined;
     const body = try std.fmt.bufPrint(
         &body_buf,
-        \\{{"stream_name":"{s}","config":{{"durable_name":"{s}","ack_policy":"explicit","deliver_policy":"all","max_deliver":-1,"ack_wait":30000000000}}}}
+        \\{{"stream_name":"{s}","config":{{"durable_name":"{s}","ack_policy":"explicit","deliver_policy":"all","max_deliver":-1,"ack_wait":{d}}}}}
     ,
-        .{ stream_name, consumer_name },
+        .{ stream_name, consumer_name, ack_wait_ns },
     );
 
     var msg = try client.request(subject, body, 5000);
@@ -362,6 +383,37 @@ fn ensureConsumer(client: *nats.Client, stream_name: []const u8) !void {
     }
 }
 
+const BatchStats = struct {
+    committed: u64 = 0,
+    dedup_skipped: u64 = 0,
+};
+
+/// Parse the JetStream-assigned stream sequence from the ACK reply_to
+/// subject. Two layouts are in the wild:
+///   v1 (no domain):   $JS.ACK.<stream>.<consumer>.<delivery>.<stream_seq>.<consumer_seq>.<ts>.<pending>
+///   v2 (with domain): $JS.ACK.<domain>.<accthash>.<stream>.<consumer>.<delivery>.<stream_seq>.<consumer_seq>.<ts>.<pending>.<random>
+/// stream_seq sits at index 5 (v1, 9 tokens) or 7 (v2, 12 tokens). NATS
+/// 2.14 dev broker emits v1; production with a JS domain emits v2 — both
+/// are handled rather than betting on the deployment shape.
+fn parseStreamSeq(reply_to: ?[]const u8) ?u64 {
+    const r = reply_to orelse return null;
+    if (!std.mem.startsWith(u8, r, "$JS.ACK.")) return null;
+
+    var tokens: [16][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, r, '.');
+    while (it.next()) |t| : (n += 1) {
+        if (n >= tokens.len) return null;
+        tokens[n] = t;
+    }
+    const idx: usize = switch (n) {
+        9 => 5,
+        12 => 7,
+        else => return null,
+    };
+    return std.fmt.parseInt(u64, tokens[idx], 10) catch null;
+}
+
 /// Drain a fetched batch into PG. Each event runs as a single auto-
 /// committed statement (no explicit BEGIN/COMMIT) — pg.zig considers
 /// the connection unrecoverable after any tx-error, which kills
@@ -369,9 +421,17 @@ fn ensureConsumer(client: *nats.Client, stream_name: []const u8) !void {
 /// isolation property cheaply: a FK violation on event N doesn't
 /// affect events N±1.
 ///
+/// Idempotency: each handler INSERTs with `ON CONFLICT (stream_seq) DO
+/// NOTHING` keyed on the JetStream-assigned seq parsed from reply_to.
+/// Redelivery (ack_wait expiry, mid-batch crash, broker restart) thus
+/// collapses to a no-op insert; the message is still acked so the
+/// broker stops redelivering it. Inventory is content-idempotent via
+/// UPSERT-on-character_id and ignores stream_seq (version counter may
+/// drift on redelivery, blob is correct).
+///
 /// Ack policy:
-///   handler succeeded → ack (durable progress)
-///   handler errored   → no-ack (JetStream redelivers after ack_wait)
+///   handler returned .inserted or .dedup_skipped → ack (durable progress)
+///   handler errored                              → no-ack (JetStream redelivers)
 ///
 /// Application-level errors (FK violation on a known-bad event) will
 /// thus redeliver forever and pollute the log. The intent is that
@@ -390,12 +450,13 @@ fn processBatch(
         i64,
         []const u8,
         []const u8,
-    ) anyerror!void,
-) !u64 {
+        u64,
+    ) anyerror!Outcome,
+) !BatchStats {
     var conn = try pool.acquire();
     defer conn.release();
 
-    var acked: u64 = 0;
+    var stats: BatchStats = .{};
     for (msgs) |*m| {
         const payload = m.payload orelse {
             // Empty payload — ack and skip; nothing to write.
@@ -404,16 +465,28 @@ fn processBatch(
         };
         const subject = m.subject;
 
-        handler(allocator, conn, cycle_id, subject, payload) catch |err| {
+        const stream_seq = parseStreamSeq(m.reply_to) orelse {
+            std.debug.print(
+                "persistence-writer: missing/unparseable JS reply_to on '{s}': {?s}\n",
+                .{ subject, m.reply_to },
+            );
+            // No stream_seq → can't dedup → don't insert. Don't ack
+            // either; broker redelivers and the next attempt either
+            // succeeds (transient) or stays stuck (producer bug worth
+            // surfacing in logs).
+            continue;
+        };
+
+        const outcome = handler(allocator, conn, cycle_id, subject, payload, stream_seq) catch |err| {
             if (conn.err) |pg_err| {
                 std.debug.print(
-                    "persistence-writer: handler err on '{s}': {} — pg: {s}\n",
-                    .{ subject, err, pg_err.message },
+                    "persistence-writer: handler err on '{s}' seq={d}: {} — pg: {s}\n",
+                    .{ subject, stream_seq, err, pg_err.message },
                 );
             } else {
                 std.debug.print(
-                    "persistence-writer: handler err on '{s}': {}\n",
-                    .{ subject, err },
+                    "persistence-writer: handler err on '{s}' seq={d}: {}\n",
+                    .{ subject, stream_seq, err },
                 );
             }
             // No ack — JetStream will redeliver after ack_wait.
@@ -429,9 +502,12 @@ fn processBatch(
             std.debug.print("persistence-writer: ack err {}\n", .{err});
             continue;
         };
-        acked += 1;
+        switch (outcome) {
+            .inserted => stats.committed += 1,
+            .dedup_skipped => stats.dedup_skipped += 1,
+        }
     }
-    return acked;
+    return stats;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +521,8 @@ fn handleMarketTrade(
     cycle_id: i64,
     subject: []const u8,
     payload: []const u8,
-) !void {
+    stream_seq: u64,
+) !Outcome {
     _ = subject;
     var parsed = try wire.decodeMarketTrade(allocator, payload);
     defer parsed.deinit();
@@ -458,13 +535,15 @@ fn handleMarketTrade(
     const buyer = if (t.buyer_id == 0) null else @as(?i64, t.buyer_id);
     const seller = if (t.seller_id == 0) null else @as(?i64, t.seller_id);
 
-    _ = try conn.exec(
+    const rows = try conn.exec(
         \\INSERT INTO market_trades
-        \\  (cycle_id, buy_order_id, sell_order_id, buyer_id, seller_id,
+        \\  (stream_seq, cycle_id, buy_order_id, sell_order_id, buyer_id, seller_id,
         \\   item_def_id, quantity, price, executed_at)
-        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        \\ON CONFLICT (stream_seq) DO NOTHING
     ,
         .{
+            @as(i64, @intCast(stream_seq)),
             cycle_id,
             buy_order,
             sell_order,
@@ -475,6 +554,7 @@ fn handleMarketTrade(
             t.price,
         },
     );
+    return if ((rows orelse 0) == 0) .dedup_skipped else .inserted;
 }
 
 fn handleHandoffCell(
@@ -483,20 +563,23 @@ fn handleHandoffCell(
     cycle_id: i64,
     subject: []const u8,
     payload: []const u8,
-) !void {
+    stream_seq: u64,
+) !Outcome {
     _ = subject;
     var parsed = try wire.decodeHandoffCell(allocator, payload);
     defer parsed.deinit();
     const h = parsed.value;
 
-    _ = try conn.exec(
+    const rows = try conn.exec(
         \\INSERT INTO cell_handoffs
-        \\  (cycle_id, entity_id,
+        \\  (stream_seq, cycle_id, entity_id,
         \\   from_cell_x, from_cell_y, to_cell_x, to_cell_y,
         \\   pos_x, pos_y, pos_z, occurred_at)
-        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        \\ON CONFLICT (stream_seq) DO NOTHING
     ,
         .{
+            @as(i64, @intCast(stream_seq)),
             cycle_id,
             @as(i64, h.entity_id),
             h.from_cell_x,
@@ -508,6 +591,7 @@ fn handleHandoffCell(
             h.pos_z,
         },
     );
+    return if ((rows orelse 0) == 0) .dedup_skipped else .inserted;
 }
 
 fn handleInventoryChange(
@@ -516,9 +600,11 @@ fn handleInventoryChange(
     cycle_id: i64,
     subject: []const u8,
     payload: []const u8,
-) !void {
+    stream_seq: u64,
+) !Outcome {
     _ = allocator;
     _ = cycle_id; // inventories.character_id PK is the wipe-scope; cycle is via characters FK
+    _ = stream_seq; // upsert-on-PK is content-idempotent; redelivery bumps version, blob stays correct
     const character_id = try wire.parseCharacterIdFromInventorySubject(subject);
 
     // Upsert the entire blob. version bumps on each update so a future
@@ -533,4 +619,5 @@ fn handleInventoryChange(
     ,
         .{ character_id, payload },
     );
+    return .inserted;
 }
