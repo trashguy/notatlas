@@ -117,13 +117,22 @@ internally; quadtree later if density warrants.
 `persistence-writer` service is the sole PG writer. Consumes change
 streams from JetStream; batches PG writes; never on the hot path.
 
-**Stream shape (NATS 2.14+):** ack-once event streams (damage events,
-market trades, cross-cell handoffs) use **workqueue** retention with
-`persistence-writer` as the exactly-once consumer; audit/replay
-consumers attach via **mirror** streams (sourcing from workqueue
-streams was unblocked in 2.14, ADR-60). Producer writes once; the
-broker handles fanout. Disable redundant dedup on the audit mirror
-when the source's dedup window is authoritative.
+**Stream shape (NATS 2.14+):** event streams (sessions, market trades,
+cell handoffs, inventory changes) use **workqueue** retention with
+`persistence-writer` as the exactly-once consumer. Producer writes
+once; pwriter inserts with `ON CONFLICT (stream_seq) DO NOTHING` so
+any redelivery (ack_wait expiry, mid-batch crash) collapses to a
+no-op insert.
+
+**What's deliberately NOT in PG:**
+- *Damage events* — locked 2026-05-01 (`architecture_damage_not_in_pg.md`).
+  Volume too high (~30B rows/cycle) and the only useful queries are
+  aggregates. Live damage stays on core NATS; a future stats-sim
+  computes aggregates; optional forensic capture toggleable via
+  `data/jetstream.yaml`.
+- *Audit mirror streams* — locked 2026-05-01 (`architecture_no_audit_mirrors.md`).
+  The PG row IS the audit record. Real-time consumers use core NATS,
+  not replay mirrors. Don't add without a load-bearing reason.
 
 ### 6. Hibernation rules — mixed
 
@@ -152,8 +161,11 @@ projectile observation.
 |---|---|---|
 | `sim.entity.<id>.state` | Core NATS | High-rate lossy, latest-value |
 | `sim.entity.<id>.event.*` | JetStream | Reliable, replay |
-| `idx.spatial.cell.<x>_<y>.delta` | JetStream | Reliable, ordered |
+| `idx.spatial.cell.<x>_<y>.delta` | JetStream | Reliable, ordered (Phase 2 still core NATS in v1; JetStream migration deferred per roadmap) |
 | `env.cell.<x>_<y>.*` | JetStream KV | Latest-value durable |
+| `events.*` (sessions, handoffs, market trades, inventory changes) | JetStream workqueue | Exactly-once delivery to persistence-writer; `stream_seq` UNIQUE in PG is the idempotency key |
+| `market.order.submit`, `inv.mutate` | Core NATS | Producer-side submission, in-memory matchers/buffers do their own batching |
+| `admin.pwriter.{status,breach}` | Core NATS | Observability fanout; loss tolerable |
 | `chat.*` | Core NATS | Tolerant to loss |
 | Voice | Separate WebRTC SFU | Off the gameplay path entirely |
 
@@ -197,8 +209,19 @@ Eight services. Two existing in fallen-runes; six new for notatlas.
 | **persistence-writer** | new | seconds-scale, batched | Sole PG writer, consumes change streams |
 | **voice-sfu** | new (LiveKit) | per-client audio | Spatial-filtered voice |
 
-Future services to be added as needed: `ai-sim` (NPC crew, hostile ships,
-wildlife), `market` (trade matching), `match` (raid window scheduling).
+Phase 2 added three more services beyond the canonical 8:
+- `ai-sim` (NPC crew, hostile ships) — shipped 2026-04; decisions-only,
+  emits `sim.entity.<ai_id>.input` at 20 Hz indistinguishable from
+  gateway input (`architecture_ai_sim_decisions_only.md`).
+- `market-sim` (trade matching) — shipped 2026-05-11; in-memory order
+  books keyed by `(cell_x, cell_y, item_def_id)`, price-time priority,
+  emits `events.market.trade` on match.
+- `inventory-sim` (authoritative inventory + PG write-rate buffer) —
+  shipped 2026-05-11; batched wire + 60 s flush + PG hydration on
+  boot. The explicit rate-limiter between gameplay write rate and
+  Postgres capacity (`architecture_inventory_write_buffer.md`).
+
+Still future: `match` (raid window scheduling).
 
 ## NATS subject scheme
 
@@ -220,8 +243,21 @@ env.cell.<x>_<y>.terrain.delta     # JetStream
 idx.spatial.cell.<x>_<y>.delta     # JetStream, entity in/out events
 idx.spatial.query                  # request/reply
 
+# SLA-arc event streams (workqueue → persistence-writer → PG)
+events.session                     # JetStream workqueue, tier-0 fast (200ms p99)
+events.handoff.cell                # JetStream workqueue, tier-1 slow (10s p99)
+events.market.trade                # JetStream workqueue, tier-1 slow (10s p99)
+events.inventory.change.<char_id>  # JetStream workqueue, tier-1 slow (10s p99)
+
+# Producer-side submission subjects (core NATS, fire-and-forget)
+market.order.submit                # client/test → market-sim
+inv.mutate                         # admin/test → inventory-sim (batched)
+
 # Cross-service control
 gw.client.<connection_id>.cmd      # gateway-internal
+admin.cycle.changed                # JetStream, wipe rollover signal
+admin.pwriter.status               # core NATS, 5s status snapshots
+admin.pwriter.breach               # core NATS, SLA breach transitions
 admin.audit.<event>                # JetStream, all admin actions
 
 # Chat
