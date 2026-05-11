@@ -315,6 +315,31 @@ pub fn decodeMarketTrade(allocator: std.mem.Allocator, payload: []const u8) !std
     return std.json.parseFromSlice(MarketTradeMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `market.order.submit` payload — submitted by clients (or, in v0,
+/// test harnesses) to the market-sim service. The book is keyed by
+/// (cell_x, cell_y, item_def_id) — markets are geo-scoped (docs/02
+/// §201, init.sql §161). Side is 'B' or 'S' as ASCII; we keep the
+/// wire as a single byte for stable JSON shape across producers.
+/// Quantity and price use the same widths as `MarketTradeMsg` so a
+/// match writes back the submitted figures unchanged.
+pub const OrderMsg = struct {
+    character_id: i64,
+    side: u8,
+    item_def_id: i32,
+    quantity: i32,
+    price: i64,
+    cell_x: i32,
+    cell_y: i32,
+};
+
+pub fn encodeOrder(allocator: std.mem.Allocator, msg: OrderMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeOrder(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(OrderMsg) {
+    return std.json.parseFromSlice(OrderMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 /// `events.handoff.cell` payload — emitted when an entity transitions
 /// cells. The live oracle remains
 /// `idx.spatial.cell.<x>_<y>.delta`; this stream is the audit-trail
@@ -829,6 +854,23 @@ test "wire: market trade roundtrip" {
     const buf = try encodeMarketTrade(testing.allocator, orig);
     defer testing.allocator.free(buf);
     const parsed = try decodeMarketTrade(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: order roundtrip" {
+    const orig: OrderMsg = .{
+        .character_id = 7,
+        .side = 'B',
+        .item_def_id = 42,
+        .quantity = 5,
+        .price = 1500,
+        .cell_x = 0,
+        .cell_y = 0,
+    };
+    const buf = try encodeOrder(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeOrder(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(orig, parsed.value);
 }

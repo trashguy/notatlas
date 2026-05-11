@@ -504,6 +504,43 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_persistence_writer.addArgs(args);
     const persistence_writer_step = b.step("persistence-writer", "Run the persistence-writer service");
     persistence_writer_step.dependOn(&run_persistence_writer.step);
+
+    // ----- market-sim service (Phase 2, docs/02 §201 / init.sql §161) -----
+    //
+    // Geo-scoped order matching. v0: single process, in-memory order
+    // books per (cell_x, cell_y, item_def_id); subscribes to
+    // `market.order.submit`; publishes `events.market.trade` on match.
+    // pwriter consumes the trade stream into `market_trades` PG.
+    const market_sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/market_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    market_sim_mod.addImport("nats", nats_mod);
+    market_sim_mod.addImport("wire", wire_mod);
+    const market_sim = b.addExecutable(.{
+        .name = "market-sim",
+        .root_module = market_sim_mod,
+    });
+    b.installArtifact(market_sim);
+
+    const run_market_sim = b.addRunArtifact(market_sim);
+    if (b.args) |args| run_market_sim.addArgs(args);
+    const market_sim_step = b.step("market-sim", "Run the market-sim service");
+    market_sim_step.dependOn(&run_market_sim.step);
+
+    // Unit tests for the in-memory matcher live in main.zig (small
+    // enough; if it grows, extract to book.zig). Same import set as
+    // the binary.
+    const market_sim_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/market_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    market_sim_test_mod.addImport("nats", nats_mod);
+    market_sim_test_mod.addImport("wire", wire_mod);
+    const market_sim_tests = b.addTest(.{ .root_module = market_sim_test_mod });
+    test_step.dependOn(&b.addRunArtifact(market_sim_tests).step);
 }
 
 fn embedShader(
