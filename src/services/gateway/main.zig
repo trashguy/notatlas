@@ -196,6 +196,12 @@ const Conn = struct {
     accepted_at_unix_s: i64 = 0,
     client_id: u64 = 0,
     player_id: u32 = 0,
+    /// Character id pre-bound to this session by the JWT issuer. 0 =
+    /// lobby (no character selected). Threads from JWT claims →
+    /// publishSession at both login and disconnect, so a clean
+    /// disconnect lands paired with the correct character for the
+    /// hibernation grace timer to scope by `(character_id, occurred_at)`.
+    character_id: i64 = 0,
     cmd_subj: []const u8 = "",
     fire_subj: []const u8 = "",
     input_subj: []const u8 = "",
@@ -242,7 +248,7 @@ const Conns = struct {
         // hello timeout, alloc fail before subscribe) get no
         // sessions-row footprint at all — they never authenticated.
         if (c.login_emitted) {
-            publishSession(client, c.client_id, 0, .disconnect, reason);
+            publishSession(client, c.client_id, c.character_id, .disconnect, reason);
         }
         c.deinit(allocator, client);
         self.slots[i] = null;
@@ -258,15 +264,19 @@ const Conns = struct {
 /// sessions row, which is monitored downstream.
 ///
 /// Field mapping:
-///   account_id  ← JWT.client_id (the gateway's auth-scoped identity).
-///   character_id ← 0 for v0 (gateway pre-character-select; populated
-///                  later when a character-select protocol exists).
-///   kind        ← login | disconnect.
-///   reason      ← short label for disconnects; null for login.
+///   account_id   ← JWT.client_id (auth-scoped identity).
+///   character_id ← JWT.character_id, defaulting to 0 (lobby
+///                  sentinel) for JWTs minted without the claim. The
+///                  JWT issuer is the character-select authority per
+///                  Path A (architecture_gateway_session_producer.md);
+///                  gateway threads the value through transparently.
+///                  pwriter maps 0 → NULL via handleSession.
+///   kind         ← login | disconnect.
+///   reason       ← short label for disconnects; null for login.
 fn publishSession(
     client: *nats.Client,
     account_id: u64,
-    character_id: u64,
+    character_id: i64,
     kind: SessionKind,
     reason: ?[]const u8,
 ) void {
@@ -292,18 +302,23 @@ fn publishSession(
 }
 
 /// JWT claims — what the gateway extracts and trusts after a
-/// signature-valid token is presented. Matches the standard
-/// `client_id` / `player_id` / `exp` triple a python-side helper
-/// emits.
+/// signature-valid token is presented. `character_id` is optional
+/// (defaulted to 0 on absence) per the Path A character-select
+/// model: the JWT issuer binds character to session, so tokens
+/// minted before character-select know about the field, while
+/// pre-existing lobby tokens omit it entirely. character_id=0 is
+/// the lobby sentinel; pwriter's handleSession maps it to NULL.
 const Claims = struct {
     client_id: u64,
     player_id: u32,
+    character_id: i64 = 0,
     exp: i64,
 };
 
 const Identity = struct {
     client_id: u64,
     player_id: u32,
+    character_id: i64,
 };
 
 const JwtError = error{
@@ -383,7 +398,11 @@ fn verifyJwt(
     defer parsed.deinit();
 
     if (parsed.value.exp <= now_unix_s) return error.Expired;
-    return .{ .client_id = parsed.value.client_id, .player_id = parsed.value.player_id };
+    return .{
+        .client_id = parsed.value.client_id,
+        .player_id = parsed.value.player_id,
+        .character_id = parsed.value.character_id,
+    };
 }
 
 /// Resolve the JWT signing secret. Env `NOTATLAS_JWT_SECRET` if
@@ -526,6 +545,7 @@ pub fn main() !void {
                         };
                         c.client_id = id.client_id;
                         c.player_id = id.player_id;
+                        c.character_id = id.character_id;
                         c.cmd_subj = std.fmt.allocPrint(allocator, "gw.client.{d}.cmd", .{id.client_id}) catch |err| {
                             std.debug.print("gateway: conn {d} alloc cmd_subj failed ({s})\n", .{ i, @errorName(err) });
                             conns.close(i, allocator, client, "alloc_fail");
@@ -556,13 +576,15 @@ pub fn main() !void {
                         // Emit login AFTER the state transition + sub
                         // creation succeeds. Set login_emitted so any
                         // subsequent close on this slot pairs with a
-                        // disconnect event. character_id=0 for v0 (no
-                        // character-select protocol yet).
-                        publishSession(client, c.client_id, 0, .login, null);
+                        // disconnect event. character_id comes from
+                        // JWT claims (0 = lobby / pre-select; the JWT
+                        // issuer binds character to session per Path A
+                        // in architecture_gateway_session_producer.md).
+                        publishSession(client, c.client_id, c.character_id, .login, null);
                         c.login_emitted = true;
                         std.debug.print(
-                            "gateway: conn {d} from {f} → client_id={d} player_id={d}\n",
-                            .{ i, c.conn.address, c.client_id, c.player_id },
+                            "gateway: conn {d} from {f} → client_id={d} player_id={d} character_id={d}\n",
+                            .{ i, c.conn.address, c.client_id, c.player_id, c.character_id },
                         );
                     }
                 },
@@ -826,6 +848,16 @@ test "verifyJwt: valid token" {
     const id = try verifyJwt(std.testing.allocator, tok, "test-secret", 1_000_000);
     try std.testing.expectEqual(@as(u64, 256), id.client_id);
     try std.testing.expectEqual(@as(u32, 7), id.player_id);
+    // No character_id in claims → defaults to 0 (lobby).
+    try std.testing.expectEqual(@as(i64, 0), id.character_id);
+}
+
+test "verifyJwt: character_id claim is threaded" {
+    var buf: [512]u8 = undefined;
+    const claims = "{\"client_id\":256,\"player_id\":7,\"character_id\":42,\"exp\":99999999999}";
+    const tok = try mintTestJwt(&buf, "test-secret", claims);
+    const id = try verifyJwt(std.testing.allocator, tok, "test-secret", 1_000_000);
+    try std.testing.expectEqual(@as(i64, 42), id.character_id);
 }
 
 test "verifyJwt: bad signature" {
