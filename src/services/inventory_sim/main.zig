@@ -1,43 +1,89 @@
 //! inventory-sim — authoritative in-memory inventory per character.
-//! v0 of the last SLA-arc producer (events.session ✅,
+//! Closes the SLA arc as the 4th real producer (events.session ✅,
 //! events.handoff.cell ✅, events.market.trade ✅, events.inventory.change
 //! now ✅).
 //!
-//! v0 scope:
-//!   - Single process, `HashMap<character_id, blob>` in memory; no
-//!     restart-recovery (deferred — would read PG at boot).
-//!   - Inbound subject `inv.mutate` carries `wire.InventoryMutateMsg`
-//!     — one message can batch N mutations for a single character.
-//!     Survival-sandbox transfers move 1000s of items at once, so
-//!     batching at the wire keeps NATS+pwriter pressure linear in
-//!     transfers, not in slots.
-//!   - On mutation, mark the character dirty. A 100 ms flush tick
-//!     publishes one `events.inventory.change.<character_id>` per
-//!     dirty character with the full updated `{slots:[...]}` blob.
-//!     Caps PG writes at 10/sec/character even under chatty
-//!     single-mutation callers.
-//!   - pwriter's `handleInventoryChange` takes the published payload
-//!     verbatim as JSONB; this service is its only producer.
+//! The service exists specifically as the rate-limit / batching
+//! layer between the gameplay write rate and Postgres' capacity.
+//! Survival sandboxes hand the player 1000s-of-slots operations
+//! (hold consolidation, structure stocking, transfer); writing each
+//! one straight to PG would knock the datastore over. inventory-sim
+//! holds the authoritative blob in memory and flushes on a long
+//! tick.
 //!
-//! Out of scope for v0:
+//! ## Durability model
+//!
+//! Two protections at the wire AND at the service:
+//!
+//!   - **Batching at the wire**: `inv.mutate` carries
+//!     `wire.InventoryMutateMsg` — one message, one character, N
+//!     mutations. A 1000-slot transfer becomes ONE NATS msg + ONE
+//!     PG write.
+//!   - **Coalescing at the service**: a long flush tick (60 s
+//!     default, `--flush-interval-ms`) emits ONE
+//!     `events.inventory.change.<character_id>` per dirty character
+//!     with the full updated `{slots:[...]}` blob. Caps PG writes
+//!     at ~1/min/character regardless of producer rate.
+//!
+//! End-to-end mutation→PG SLA: flush_interval + pwriter slow-tier
+//! p99 (10 s) = ~70 s worst-case at the default. Acceptable for
+//! inventory: short-window rollback on service crash is preferable
+//! to bombing pwriter.
+//!
+//! ## Rollback semantics (lossy-on-crash, by design)
+//!
+//! Between flushes, the authoritative inventory state lives ONLY in
+//! the service's memory. If the service dies mid-window, every
+//! mutation since the last successful flush is gone. The gameplay
+//! model accepts this: PG holds the last good blob, and a
+//! post-restart player sees their inventory as it was at the last
+//! flush.
+//!
+//! ## PG hydration on boot (REQUIRED for safety)
+//!
+//! Without hydration, a service restart starts with empty state.
+//! The first new mutation builds a 1-slot blob from scratch and
+//! publishes — pwriter UPSERTs over the full PG blob. That's worse
+//! than rollback; it's data destruction.
+//!
+//! So at startup the service reads `SELECT character_id, blob FROM
+//! inventories JOIN characters ON characters.id =
+//! inventories.character_id WHERE characters.cycle_id = $1` (current
+//! cycle from `wipe_cycles.ends_at IS NULL`) and rehydrates state.
+//! A subsequent mutation merges into the hydrated blob and re-emits
+//! a faithful full blob.
+//!
+//! ## Out of scope for v0
+//!
 //!   - Cross-character atomicity (player A → player B transfer is
-//!     two separate mutate messages; needs a transfer-record event
-//!     stream and a 2-phase shape — Phase 2/3 design work).
-//!   - Slot caps / weight / volume / quality tiers. Slots are
-//!     unbounded i32 ids; content design hasn't locked.
-//!   - Per-character rate limiting beyond the flush cap. Future
-//!     defensive ceiling if needed.
-//!   - Restart-recovery from PG.
+//!     two separate mutate messages; needs a transfer-record stream
+//!     and a 2-phase shape — Phase 2/3).
+//!   - Slot caps / weight / volume / quality tiers.
+//!   - Per-character rate limiting beyond the flush cap.
+//!   - `admin.cycle.changed` handling — on wipe, the service should
+//!     drop its in-memory state because the FK'd characters
+//!     disappear. Currently you'd restart the service. Wire up
+//!     when wipe rollover lands in production.
 
 const std = @import("std");
 const nats = @import("nats");
+const pg = @import("pg");
 const wire = @import("wire");
 
-const flush_period_ns: u64 = 100 * std.time.ns_per_ms; // 10 Hz max per character
+const default_flush_interval_ms: u64 = 60_000; // 60 s — minute-class SLA
 const log_interval_ns: u64 = std.time.ns_per_s;
 
 const Args = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
+    pg_host: []const u8 = "127.0.0.1",
+    pg_port: u16 = 5432,
+    pg_user: []const u8 = "notatlas",
+    pg_pass: []const u8 = "notatlas",
+    pg_db: []const u8 = "notatlas",
+    /// Flush tick in ms. Default 60 s (minute-class SLA). Smoke
+    /// harnesses set this to a sub-second value so assertions don't
+    /// take a minute.
+    flush_interval_ms: u64 = default_flush_interval_ms,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -46,20 +92,63 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     _ = args.next();
 
     var out: Args = .{};
-    var have_nats = false;
-    errdefer if (have_nats) allocator.free(out.nats_url);
+    var owned_nats = false;
+    var owned_pg_host = false;
+    var owned_pg_user = false;
+    var owned_pg_pass = false;
+    var owned_pg_db = false;
+    errdefer {
+        if (owned_nats) allocator.free(out.nats_url);
+        if (owned_pg_host) allocator.free(out.pg_host);
+        if (owned_pg_user) allocator.free(out.pg_user);
+        if (owned_pg_pass) allocator.free(out.pg_pass);
+        if (owned_pg_db) allocator.free(out.pg_db);
+    }
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--nats")) {
             const v = args.next() orelse return error.MissingArg;
             out.nats_url = try allocator.dupe(u8, v);
-            have_nats = true;
+            owned_nats = true;
+        } else if (std.mem.eql(u8, a, "--pg-host")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.pg_host = try allocator.dupe(u8, v);
+            owned_pg_host = true;
+        } else if (std.mem.eql(u8, a, "--pg-port")) {
+            out.pg_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--pg-user")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.pg_user = try allocator.dupe(u8, v);
+            owned_pg_user = true;
+        } else if (std.mem.eql(u8, a, "--pg-pass")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.pg_pass = try allocator.dupe(u8, v);
+            owned_pg_pass = true;
+        } else if (std.mem.eql(u8, a, "--pg-db")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.pg_db = try allocator.dupe(u8, v);
+            owned_pg_db = true;
+        } else if (std.mem.eql(u8, a, "--flush-interval-ms")) {
+            out.flush_interval_ms = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArg, 10);
+            if (out.flush_interval_ms == 0) return error.BadArg;
         } else {
             std.debug.print("inventory-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
         }
     }
-    if (!have_nats) out.nats_url = try allocator.dupe(u8, out.nats_url);
+    if (!owned_nats)    out.nats_url = try allocator.dupe(u8, out.nats_url);
+    if (!owned_pg_host) out.pg_host  = try allocator.dupe(u8, out.pg_host);
+    if (!owned_pg_user) out.pg_user  = try allocator.dupe(u8, out.pg_user);
+    if (!owned_pg_pass) out.pg_pass  = try allocator.dupe(u8, out.pg_pass);
+    if (!owned_pg_db)   out.pg_db    = try allocator.dupe(u8, out.pg_db);
     return out;
+}
+
+fn freeArgs(allocator: std.mem.Allocator, a: *Args) void {
+    allocator.free(a.nats_url);
+    allocator.free(a.pg_host);
+    allocator.free(a.pg_user);
+    allocator.free(a.pg_pass);
+    allocator.free(a.pg_db);
 }
 
 var g_running: std.atomic.Value(bool) = .init(true);
@@ -251,16 +340,104 @@ const NatsSinkCtx = struct {
     }
 };
 
+/// Find the current wipe cycle. Mirrors pwriter's probeCurrentCycle
+/// so both services land on the same id.
+fn probeCurrentCycle(pool: *pg.Pool) !i64 {
+    var row_opt = try pool.row(
+        "SELECT id FROM wipe_cycles WHERE ends_at IS NULL ORDER BY id DESC LIMIT 1",
+        .{},
+    );
+    if (row_opt) |*row| {
+        defer row.deinit() catch {};
+        return try row.get(i64, 0);
+    }
+    return error.NoCurrentCycle;
+}
+
+/// Walk `inventories JOIN characters` for the current cycle and
+/// populate `state` with the persisted blobs. Without this, a
+/// post-crash restart starts empty and the next mutation overwrites
+/// the full PG blob with a partial one. Returns rows loaded.
+fn hydrateFromPg(state: *State, pool: *pg.Pool, cycle_id: i64) !u32 {
+    var result = try pool.query(
+        \\SELECT inventories.character_id, inventories.blob::text
+        \\FROM inventories
+        \\JOIN characters ON characters.id = inventories.character_id
+        \\WHERE characters.cycle_id = $1
+    , .{cycle_id});
+    defer result.deinit();
+
+    var loaded: u32 = 0;
+    while (try result.next()) |row| {
+        const character_id = try row.get(i64, 0);
+        const blob_text = try row.get([]const u8, 1);
+
+        const parsed = std.json.parseFromSlice(Blob, state.allocator, blob_text, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.debug.print("inventory-sim: hydrate skip char={d} bad JSON ({s}): {s}\n", .{ character_id, @errorName(err), blob_text });
+            continue;
+        };
+        defer parsed.deinit();
+
+        const inv = try state.inventoryPtr(character_id);
+        // The blob is already sorted on the write path (encodeBlob
+        // walks slots.items in stored order, which insertSortedSlot
+        // keeps sorted by .slot). Append wholesale; don't bother
+        // re-sorting.
+        try inv.slots.appendSlice(state.allocator, parsed.value.slots);
+        // Hydrated state matches PG → no pending flush.
+        inv.dirty = false;
+        loaded += 1;
+    }
+    return loaded;
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try parseArgs(allocator);
-    defer allocator.free(args.nats_url);
+    var args = try parseArgs(allocator);
+    defer freeArgs(allocator, &args);
     try installSignalHandlers();
 
-    std.debug.print("inventory-sim: connecting to {s}\n", .{args.nats_url});
+    const flush_period_ns: u64 = args.flush_interval_ms * std.time.ns_per_ms;
+
+    std.debug.print(
+        "inventory-sim: nats={s} pg={s}@{s}:{d}/{s} flush_interval={d} ms\n",
+        .{ args.nats_url, args.pg_user, args.pg_host, args.pg_port, args.pg_db, args.flush_interval_ms },
+    );
+
+    // PG first — fail fast if hydration prerequisite isn't reachable,
+    // before opening a NATS sub and accepting mutations we'd lose.
+    var pool = pg.Pool.init(allocator, .{
+        .size = 1,
+        .connect = .{ .host = args.pg_host, .port = args.pg_port },
+        .auth = .{
+            .username = args.pg_user,
+            .password = args.pg_pass,
+            .database = args.pg_db,
+            .timeout = 10_000,
+        },
+    }) catch |err| {
+        std.debug.print("inventory-sim: pg connect failed: {}\n", .{err});
+        return err;
+    };
+    defer pool.deinit();
+
+    const cycle_id = probeCurrentCycle(pool) catch |err| {
+        std.debug.print("inventory-sim: cycle probe failed: {}\n", .{err});
+        return err;
+    };
+    std.debug.print("inventory-sim: current cycle id={d}\n", .{cycle_id});
+
+    var state = State.init(allocator);
+    defer state.deinit();
+
+    const hydrated = hydrateFromPg(&state, pool, cycle_id) catch |err| {
+        std.debug.print("inventory-sim: hydration failed: {}\n", .{err});
+        return err;
+    };
+    std.debug.print("inventory-sim: hydrated {d} characters from PG\n", .{hydrated});
 
     var client = try nats.Client.connect(allocator, .{
         .servers = &.{args.nats_url},
@@ -270,9 +447,6 @@ pub fn main() !void {
 
     const sub = try client.subscribe("inv.mutate", .{});
     std.debug.print("inventory-sim: subscribed to inv.mutate\n", .{});
-
-    var state = State.init(allocator);
-    defer state.deinit();
 
     var sink_ctx: NatsSinkCtx = .{ .client = client };
     const sink: PublishSink = .{ .ctx = &sink_ctx, .publishFn = NatsSinkCtx.publish };

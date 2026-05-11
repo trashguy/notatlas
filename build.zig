@@ -554,6 +554,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     inventory_sim_mod.addImport("nats", nats_mod);
+    inventory_sim_mod.addImport("pg", pg_mod);
     inventory_sim_mod.addImport("wire", wire_mod);
     const inventory_sim = b.addExecutable(.{
         .name = "inventory-sim",
@@ -572,6 +573,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     inventory_sim_test_mod.addImport("nats", nats_mod);
+    inventory_sim_test_mod.addImport("pg", pg_mod);
     inventory_sim_test_mod.addImport("wire", wire_mod);
     const inventory_sim_tests = b.addTest(.{ .root_module = inventory_sim_test_mod });
     test_step.dependOn(&b.addRunArtifact(inventory_sim_tests).step);
