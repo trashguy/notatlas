@@ -21,7 +21,11 @@ pub const Kind = enum(u8) {
     ship = 0x01,
     player = 0x02,
     projectile = 0x03,
-    // 0x04+ reserved: corpses, deployables, mounts, structures,
+    /// Storm cells from env-sim (`design_storms_as_cover.md`).
+    /// Addressable entity per the design memo: consumers reference
+    /// storms by id rather than treating them as an opaque field.
+    storm = 0x04,
+    // 0x05+ reserved: corpses, deployables, mounts, structures,
     // npcs, sea_creatures, env_hazards. Add as needed.
     _,
 };

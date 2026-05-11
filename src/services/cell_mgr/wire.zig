@@ -539,6 +539,49 @@ pub fn decodeTimeOfDay(allocator: std.mem.Allocator, payload: []const u8) !std.j
     return std.json.parseFromSlice(TimeOfDayMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `env.storms` payload — published by env-sim at 1 Hz with all
+/// active storms as a single JSON array. Each entry is an
+/// addressable entity (per `design_storms_as_cover.md`): consumers
+/// reference storms by `storm_id` for cover / visibility / stealth /
+/// audio coupling, rather than treating the storm field as opaque.
+///
+/// `storm_id` carries the `Kind.storm` (0x04) top-byte tag from
+/// `notatlas.entity_kind`, so `kindOf(id) == .storm` discriminates
+/// from ships/players/projectiles at the receiver without an
+/// out-of-band table.
+///
+/// Position is the current world-space center (toroidal wrap applied
+/// by env-sim via `wind_query.stormCenter`); consumers can shortcut
+/// "am I inside the storm?" with a distance check against
+/// `pos` and `radius_m`. Drift velocity isn't in the wire — clients
+/// that want it can either subscribe at a higher rate or recompute
+/// from successive positions. v0 drift speed is low (~6 m/s) so 1 Hz
+/// snapshots are fine for cover gameplay.
+///
+/// Single broadcast subject (not per-storm) keeps the wire shape
+/// stable as storms spawn/decay. Per-storm `sim.entity.<id>.event.*`
+/// can lift here later if event volume justifies it.
+pub const StormMsg = struct {
+    storm_id: u32,
+    pos_x: f32,
+    pos_z: f32,
+    radius_m: f32,
+    strength_mps: f32,
+    vortex_mix: f32,
+};
+
+pub const StormListMsg = struct {
+    storms: []const StormMsg,
+};
+
+pub fn encodeStormList(allocator: std.mem.Allocator, msg: StormListMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeStormList(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(StormListMsg) {
+    return std.json.parseFromSlice(StormListMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 /// Extract the cell coordinates from an `env.cell.<x>_<z>.waves`
 /// subject. Same shape as parseCellFromWindSubject but the suffix
 /// differs. Kept separate to avoid making a generic parser that
@@ -1007,6 +1050,30 @@ test "wire: time-of-day roundtrip" {
     defer parsed.deinit();
     try testing.expectEqual(orig.day_fraction, parsed.value.day_fraction);
     try testing.expectApproxEqAbs(orig.world_time_s, parsed.value.world_time_s, 1e-9);
+}
+
+test "wire: storm list roundtrip" {
+    const storms = [_]StormMsg{
+        .{ .storm_id = 0x04000000, .pos_x = 1024.0,  .pos_z = -512.5, .radius_m = 300.0, .strength_mps = 10.0, .vortex_mix = 0.2 },
+        .{ .storm_id = 0x04000001, .pos_x = -250.0,  .pos_z = 1234.5, .radius_m = 250.0, .strength_mps = 8.0,  .vortex_mix = 0.15 },
+        .{ .storm_id = 0x04000002, .pos_x = 0.0,     .pos_z = 0.0,    .radius_m = 400.0, .strength_mps = 12.0, .vortex_mix = 0.3 },
+    };
+    const orig: StormListMsg = .{ .storms = &storms };
+    const buf = try encodeStormList(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeStormList(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig.storms.len, parsed.value.storms.len);
+    for (orig.storms, parsed.value.storms) |a, b| try testing.expectEqual(a, b);
+}
+
+test "wire: storm list empty roundtrip" {
+    const orig: StormListMsg = .{ .storms = &[_]StormMsg{} };
+    const buf = try encodeStormList(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeStormList(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.storms.len);
 }
 
 test "wire: parseVictimIdFromDamageSubject" {

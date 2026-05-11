@@ -204,8 +204,14 @@ pub fn main() !void {
     const wave_payload = try wire.encodeWave(allocator, wave_msg);
     defer allocator.free(wave_payload);
 
+    // Scratch slice for the storm broadcast — sized once at boot,
+    // reused every ToD tick. Storm count is fixed by the YAML so the
+    // slice never grows.
+    const storm_scratch = try allocator.alloc(wire.StormMsg, wind_params.storms.len);
+    defer allocator.free(storm_scratch);
+
     std.debug.print(
-        "env-sim: connecting to {s}; cell_side={d:.0} m; publishing wind+waves for {d} cell(s); wind base_speed={d:.1} m/s base_dir={d:.2} rad; wave preset='{s}' seed={d} amp={d:.2}m\n",
+        "env-sim: connecting to {s}; cell_side={d:.0} m; publishing wind+waves for {d} cell(s); wind base_speed={d:.1} m/s base_dir={d:.2} rad; wave preset='{s}' seed={d} amp={d:.2}m; {d} storms; day_length={d:.0}s\n",
         .{
             args.nats_url,
             args.cell_side_m,
@@ -215,6 +221,8 @@ pub fn main() !void {
             args.wave_preset,
             wave_msg.seed,
             wave_msg.amplitude_m,
+            wind_params.storms.len,
+            args.day_length_s,
         },
     );
 
@@ -258,6 +266,7 @@ pub fn main() !void {
 
         if (now_ns -% last_tod_ns >= tod_tick_period_ns) {
             try publishTimeOfDay(allocator, client, world_time_s, args.day_length_s);
+            try publishStorms(allocator, client, wind_params, world_time_s, storm_scratch);
             tod_pubs_in_window += 1;
             last_tod_ns +%= tod_tick_period_ns;
         }
@@ -292,6 +301,39 @@ fn publishTimeOfDay(
     const buf = try wire.encodeTimeOfDay(allocator, msg);
     defer allocator.free(buf);
     try client.publish("env.time", buf);
+}
+
+/// Publish `env.storms` — all storms with their current world
+/// positions computed via `wind_query.stormCenter`. Storm ids carry
+/// the `Kind.storm` (0x04) top-byte tag; per-storm seq = index in
+/// `wind_params.storms`. v0 storms are static-count (defined by the
+/// YAML), so the storm_id sequence is stable across publishes —
+/// consumers can build a `HashMap<storm_id, last_pos>` and update in
+/// place each receipt.
+fn publishStorms(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    params: notatlas.wind_query.WindParams,
+    world_time_s: f64,
+    out_buf: []wire.StormMsg,
+) !void {
+    const t: f32 = @floatCast(world_time_s);
+    std.debug.assert(out_buf.len >= params.storms.len);
+    for (params.storms, 0..) |s, i| {
+        const center = notatlas.wind_query.stormCenter(params, i, t);
+        out_buf[i] = .{
+            .storm_id = notatlas.entity_kind.pack(.storm, @intCast(i)),
+            .pos_x = center[0],
+            .pos_z = center[1],
+            .radius_m = s.radius_m,
+            .strength_mps = s.strength_mps,
+            .vortex_mix = s.vortex_mix,
+        };
+    }
+    const msg: wire.StormListMsg = .{ .storms = out_buf[0..params.storms.len] };
+    const payload = try wire.encodeStormList(allocator, msg);
+    defer allocator.free(payload);
+    try client.publish("env.storms", payload);
 }
 
 fn publishTick(
