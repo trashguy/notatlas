@@ -541,6 +541,40 @@ pub fn build(b: *std.Build) void {
     market_sim_test_mod.addImport("wire", wire_mod);
     const market_sim_tests = b.addTest(.{ .root_module = market_sim_test_mod });
     test_step.dependOn(&b.addRunArtifact(market_sim_tests).step);
+
+    // ----- inventory-sim service (Phase 2, init.sql §108) -----
+    //
+    // Authoritative in-memory inventory blob per character. v0: NATS
+    // sub `inv.mutate` (batched), 100 ms flush tick emits one
+    // `events.inventory.change.<char>` per dirty character with the
+    // full `{slots:[...]}` blob. Closes the 4th SLA-arc producer.
+    const inventory_sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/inventory_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inventory_sim_mod.addImport("nats", nats_mod);
+    inventory_sim_mod.addImport("wire", wire_mod);
+    const inventory_sim = b.addExecutable(.{
+        .name = "inventory-sim",
+        .root_module = inventory_sim_mod,
+    });
+    b.installArtifact(inventory_sim);
+
+    const run_inventory_sim = b.addRunArtifact(inventory_sim);
+    if (b.args) |args| run_inventory_sim.addArgs(args);
+    const inventory_sim_step = b.step("inventory-sim", "Run the inventory-sim service");
+    inventory_sim_step.dependOn(&run_inventory_sim.step);
+
+    const inventory_sim_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/services/inventory_sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inventory_sim_test_mod.addImport("nats", nats_mod);
+    inventory_sim_test_mod.addImport("wire", wire_mod);
+    const inventory_sim_tests = b.addTest(.{ .root_module = inventory_sim_test_mod });
+    test_step.dependOn(&b.addRunArtifact(inventory_sim_tests).step);
 }
 
 fn embedShader(

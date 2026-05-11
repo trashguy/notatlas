@@ -340,6 +340,52 @@ pub fn decodeOrder(allocator: std.mem.Allocator, payload: []const u8) !std.json.
     return std.json.parseFromSlice(OrderMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `inv.mutate` payload — drives the inventory-sim service. v0 is
+/// admin/test-shaped: pickup / drop / structure-deposit gameplay
+/// doesn't exist yet, so this subject is the only inventory mutation
+/// source.
+///
+/// Batched at the wire because survival-sandbox transfers routinely
+/// move 1000s of items at once (whole hold → structure crate, ship
+/// hold consolidation). One mutation-per-message would burn one
+/// inventory.change emit + one PG write per item; the batch form
+/// collapses to one of each. Atomicity is per-batch within a single
+/// character; cross-character atomicity (player→player transfer)
+/// needs a separate transfer-record stream and is out of scope for
+/// v0.
+///
+/// Even with batching, chatty single-mutation callers are protected
+/// by a 100 ms coalescing tick in the service: at most 10
+/// inventory.change emits/sec per character, regardless of mutation
+/// rate.
+///
+/// Ops (ASCII, single byte for stable JSON):
+///   'A' — add `quantity` of `item_def_id` to (character, slot);
+///         creates the slot if missing.
+///   'R' — remove `quantity` from (character, slot); drops the slot
+///         when qty hits 0. Underflow is clamped to 0.
+///   'S' — set (character, slot) to exactly (item_def_id, quantity);
+///         qty=0 deletes the slot. Useful for bulk init / overwrites.
+pub const InventoryMutation = struct {
+    op: u8,
+    slot: i32,
+    item_def_id: i32,
+    quantity: i32,
+};
+
+pub const InventoryMutateMsg = struct {
+    character_id: i64,
+    mutations: []const InventoryMutation,
+};
+
+pub fn encodeInventoryMutate(allocator: std.mem.Allocator, msg: InventoryMutateMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeInventoryMutate(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(InventoryMutateMsg) {
+    return std.json.parseFromSlice(InventoryMutateMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 /// `events.handoff.cell` payload — emitted when an entity transitions
 /// cells. The live oracle remains
 /// `idx.spatial.cell.<x>_<y>.delta`; this stream is the audit-trail
@@ -873,6 +919,44 @@ test "wire: order roundtrip" {
     const parsed = try decodeOrder(testing.allocator, buf);
     defer parsed.deinit();
     try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: inventory mutate roundtrip" {
+    const mutations = [_]InventoryMutation{
+        .{ .op = 'A', .slot = 0, .item_def_id = 42, .quantity = 5 },
+        .{ .op = 'A', .slot = 1, .item_def_id = 7, .quantity = 100 },
+        .{ .op = 'R', .slot = 0, .item_def_id = 42, .quantity = 2 },
+    };
+    const orig: InventoryMutateMsg = .{
+        .character_id = 101,
+        .mutations = &mutations,
+    };
+    const buf = try encodeInventoryMutate(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeInventoryMutate(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig.character_id, parsed.value.character_id);
+    try testing.expectEqual(orig.mutations.len, parsed.value.mutations.len);
+    for (orig.mutations, parsed.value.mutations) |a, b| try testing.expectEqual(a, b);
+}
+
+test "wire: inventory mutate batch of 1000 decodes" {
+    // Survival-sandbox transfer guardrail: a single bulk-move can be
+    // 1000s of slots. JSON parse + round-trip should hold up.
+    const muts = try testing.allocator.alloc(InventoryMutation, 1000);
+    defer testing.allocator.free(muts);
+    for (muts, 0..) |*m, i| m.* = .{
+        .op = 'S',
+        .slot = @intCast(i),
+        .item_def_id = @intCast(i % 16),
+        .quantity = @intCast((i % 99) + 1),
+    };
+    const orig: InventoryMutateMsg = .{ .character_id = 7, .mutations = muts };
+    const buf = try encodeInventoryMutate(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeInventoryMutate(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1000), parsed.value.mutations.len);
 }
 
 test "wire: handoff cell roundtrip" {
