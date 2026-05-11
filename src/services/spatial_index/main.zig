@@ -158,6 +158,7 @@ pub fn main() !void {
     defer state.deinit();
 
     var deltas_total: u64 = 0;
+    var handoffs_total: u64 = 0;
     var msgs_total: u64 = 0;
     var attach_msgs_total: u64 = 0;
     var queries_total: u64 = 0;
@@ -200,6 +201,7 @@ pub fn main() !void {
         };
         msgs_total += observed.msgs;
         deltas_total += observed.deltas;
+        handoffs_total += observed.handoffs;
 
         const attach_drained = drainAttachSub(allocator, sub_attach, &state, client, election.isLeader()) catch |err| blk: {
             std.debug.print("spatial-index: attach drain error ({s})\n", .{@errorName(err)});
@@ -217,13 +219,14 @@ pub fn main() !void {
         if (now_ns -% last_log_ns >= log_interval_ns) {
             const role_tag: []const u8 = if (election.isLeader()) "LEADER" else "standby";
             std.debug.print(
-                "[spatial-index {s} {s}] {d} entities; {d} state, {d} attach, {d} queries, {d} deltas / 1 s\n",
-                .{ args.node_id, role_tag, state.entityCount(), msgs_total, attach_msgs_total, queries_total, deltas_total },
+                "[spatial-index {s} {s}] {d} entities; {d} state, {d} attach, {d} queries, {d} deltas, {d} handoffs / 1 s\n",
+                .{ args.node_id, role_tag, state.entityCount(), msgs_total, attach_msgs_total, queries_total, deltas_total, handoffs_total },
             );
             msgs_total = 0;
             attach_msgs_total = 0;
             queries_total = 0;
             deltas_total = 0;
+            handoffs_total = 0;
             last_log_ns = now_ns;
         }
     }
@@ -234,6 +237,7 @@ pub fn main() !void {
 const DrainStats = struct {
     msgs: u32 = 0,
     deltas: u32 = 0,
+    handoffs: u32 = 0,
 };
 
 fn drainStateSub(
@@ -278,6 +282,18 @@ fn drainStateSub(
                 .heading_rad = parsed.value.heading_rad,
             });
             stats.deltas += 1;
+            // Cross-cell transitions (old_cell != null) are also the
+            // events.handoff.cell trigger — this is the only point in
+            // the mesh where both halves of the transition are known.
+            try publishHandoffCell(
+                allocator,
+                client,
+                ent_id,
+                old,
+                transition.new_cell,
+                .{ parsed.value.x, pos_y, parsed.value.z },
+            );
+            stats.handoffs += 1;
         }
         try publishDelta(allocator, client, transition.new_cell, .{
             .op = .enter,
@@ -308,6 +324,38 @@ fn publishDelta(
     const buf = try wire.encodeDelta(allocator, msg);
     defer allocator.free(buf);
     try client.publish(subj, buf);
+}
+
+/// Publish `events.handoff.cell` — the durable cross-cell audit
+/// record. Fires once per real entity transition (i.e. when
+/// `transition.old_cell != null`); first-sighting enters do NOT
+/// produce a handoff because there's no from-cell. Pwriter
+/// consumes via the events_handoff_cell workqueue stream and
+/// inserts into the `cell_handoffs` PG table (init.sql §211).
+/// This is the only point in the service mesh where both halves
+/// of a cell transition are simultaneously known — cell-mgr only
+/// sees its own half, so the producer has to live here.
+fn publishHandoffCell(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    entity_id: u32,
+    from_cell: idx_state.CellId,
+    to_cell: idx_state.CellId,
+    pos: [3]f32,
+) !void {
+    const msg: wire.HandoffCellMsg = .{
+        .entity_id = entity_id,
+        .from_cell_x = from_cell.x,
+        .from_cell_y = from_cell.z,
+        .to_cell_x = to_cell.x,
+        .to_cell_y = to_cell.z,
+        .pos_x = pos[0],
+        .pos_y = pos[1],
+        .pos_z = pos[2],
+    };
+    const buf = try wire.encodeHandoffCell(allocator, msg);
+    defer allocator.free(buf);
+    try client.publish("events.handoff.cell", buf);
 }
 
 /// Drain `idx.spatial.attach.*` and synthesize cell deltas for the
