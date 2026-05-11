@@ -442,7 +442,12 @@ pub fn main() !void {
         if (c.cooldown_s > salvo_cooldown_max) salvo_cooldown_max = c.cooldown_s;
     }
     const salvo_cooldown_s: f64 = @floatCast(salvo_cooldown_max);
-    const wave_params = try loadWaves(allocator, wave_config_path);
+    // Boot fallback. env-sim is the authoritative source via
+    // `env.cell.*.waves` publishes; drainWavesSub updates this each
+    // tick. If env-sim isn't running (smoke / minimal local setup),
+    // the boot preset takes effect and never changes. Same
+    // graceful-degradation pattern as the wind fallback (CLI args).
+    var wave_params = try loadWaves(allocator, wave_config_path);
     const ammo = try loadAmmo(allocator, ammo_config_path);
     std.debug.print(
         "ship-sim [{s}]: hull half_extents=({d:.2},{d:.2},{d:.2}) mass={d} kg, hp_max={d:.0}, {d} buoyancy samples, {d} cannons; wave seed={d} amp={d:.2} m; cannonball muzzle_v={d:.0} m/s splash={d:.1} m; wind dir={d:.2} rad speed={d:.1} m/s\n",
@@ -492,8 +497,14 @@ pub fn main() !void {
     // CLI args (--wind-dir, --wind-speed). Same graceful-degradation
     // pattern as the existing services.
     const sub_wind = try client.subscribe("env.cell.*.wind", .{});
+    // env.cell.*.waves carries the active wave preset from env-sim;
+    // every receipt overwrites wave_params wholesale (env-sim is
+    // single-source-of-truth). v0 broadcasts the same preset to all
+    // cells, so any-cell wins; per-cell wave variation lands when
+    // content needs it.
+    const sub_waves = try client.subscribe("env.cell.*.waves", .{});
     std.debug.print(
-        "ship-sim [{s}]: connected; tick rate 60 Hz; subscribed to sim.entity.*.input, env.cell.*.wind\n",
+        "ship-sim [{s}]: connected; tick rate 60 Hz; subscribed to sim.entity.*.input, env.cell.*.wind, env.cell.*.waves\n",
         .{args.shard},
     );
 
@@ -660,6 +671,11 @@ pub fn main() !void {
         // Drain env-sim wind updates into the per-cell cache. Best-
         // effort: malformed payloads dropped silently.
         drainWindSub(allocator, sub_wind, &wind_cache);
+        // Drain env-sim wave updates. Each receipt overwrites
+        // wave_params (env-sim is single-source-of-truth for the
+        // preset). Determinism invariant: ship-sim and clients land
+        // on the same seed at the same tick.
+        drainWavesSub(allocator, sub_waves, &wave_params);
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
@@ -913,6 +929,37 @@ fn drainWindSub(
         const parsed = wire.decodeWind(allocator, payload) catch continue;
         defer parsed.deinit();
         cache.put(allocator, .{ cell.x, cell.z }, .{ parsed.value.vx, parsed.value.vz }) catch {};
+    }
+}
+
+/// Drain `env.cell.*.waves` and overwrite `wave_params` with the
+/// most recent receipt. v0 broadcasts the same preset globally so
+/// the cell coordinate is informational only; per-cell wave
+/// variation lands when content needs it. Malformed payloads
+/// dropped silently; buoyancy keeps using the previous value.
+fn drainWavesSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    wave_params: *notatlas.wave_query.WaveParams,
+) void {
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const parsed = wire.decodeWave(allocator, payload) catch continue;
+        defer parsed.deinit();
+        const w = parsed.value;
+        wave_params.* = .{
+            .seed = w.seed,
+            .iterations = w.iterations,
+            .drag_multiplier = w.drag_multiplier,
+            .amplitude_m = w.amplitude_m,
+            .wave_scale_m = w.wave_scale_m,
+            .frequency_mult = w.frequency_mult,
+            .base_time_mult = w.base_time_mult,
+            .time_mult = w.time_mult,
+            .weight_decay = w.weight_decay,
+        };
     }
 }
 

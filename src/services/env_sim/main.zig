@@ -41,6 +41,11 @@ const log_interval_ns: u64 = std.time.ns_per_s;
 const default_cell_side_m: f32 = 200.0;
 
 const wind_config_path = "data/wind.yaml";
+const waves_dir = "data/waves/";
+
+/// Default wave preset. `data/waves/<preset>.yaml` must exist; ymlz
+/// will error at boot if not.
+const default_wave_preset: []const u8 = "storm";
 
 const CellCoord = struct { x: i32, z: i32 };
 
@@ -50,6 +55,10 @@ const Args = struct {
     /// Set of (cell_x, cell_z) coordinates to publish wind for.
     /// Empty → defaults to a 3×3 block centered on (0, 0).
     cells: []const CellCoord = &.{},
+    /// Wave preset name. Resolves to `data/waves/<name>.yaml`. v0
+    /// publishes the same preset to every cell; per-cell variation
+    /// (coastal calm, deep-water storm) lands when content needs it.
+    wave_preset: []const u8 = default_wave_preset,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -59,8 +68,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
     var out: Args = .{};
     var have_nats = false;
+    var owned_wave_preset = false;
     var cells: std.ArrayListUnmanaged(CellCoord) = .{};
     errdefer cells.deinit(allocator);
+    errdefer if (owned_wave_preset) allocator.free(out.wave_preset);
 
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--nats")) {
@@ -79,12 +90,17 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             const x = try std.fmt.parseInt(i32, v[0..sep], 10);
             const z = try std.fmt.parseInt(i32, v[sep + 1 ..], 10);
             try cells.append(allocator, .{ .x = x, .z = z });
+        } else if (std.mem.eql(u8, a, "--wave-preset")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.wave_preset = try allocator.dupe(u8, v);
+            owned_wave_preset = true;
         } else {
             std.debug.print("env-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
         }
     }
     if (!have_nats) out.nats_url = try allocator.dupe(u8, out.nats_url);
+    if (!owned_wave_preset) out.wave_preset = try allocator.dupe(u8, out.wave_preset);
 
     if (cells.items.len == 0) {
         // Default: 3×3 around origin.
@@ -103,6 +119,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 fn freeArgs(allocator: std.mem.Allocator, a: *Args) void {
     allocator.free(a.nats_url);
     allocator.free(a.cells);
+    allocator.free(a.wave_preset);
 }
 
 var g_running: std.atomic.Value(bool) = .init(true);
@@ -127,6 +144,28 @@ fn loadWind(gpa: std.mem.Allocator, rel_path: []const u8) !notatlas.wind_query.W
     return notatlas.yaml_loader.loadWindFromFile(gpa, abs);
 }
 
+fn loadWavePreset(gpa: std.mem.Allocator, preset: []const u8) !notatlas.wave_query.WaveParams {
+    const rel = try std.fmt.allocPrint(gpa, "{s}{s}.yaml", .{ waves_dir, preset });
+    defer gpa.free(rel);
+    const abs = try std.fs.cwd().realpathAlloc(gpa, rel);
+    defer gpa.free(abs);
+    return notatlas.yaml_loader.loadFromFile(gpa, abs);
+}
+
+fn waveMsgFromParams(p: notatlas.wave_query.WaveParams) wire.WaveMsg {
+    return .{
+        .seed = p.seed,
+        .iterations = p.iterations,
+        .drag_multiplier = p.drag_multiplier,
+        .amplitude_m = p.amplitude_m,
+        .wave_scale_m = p.wave_scale_m,
+        .frequency_mult = p.frequency_mult,
+        .base_time_mult = p.base_time_mult,
+        .time_mult = p.time_mult,
+        .weight_decay = p.weight_decay,
+    };
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -139,14 +178,30 @@ pub fn main() !void {
     const wind_params = try loadWind(allocator, wind_config_path);
     defer wind_params.deinit(allocator);
 
+    const wave_params = loadWavePreset(allocator, args.wave_preset) catch |err| {
+        std.debug.print("env-sim: failed to load wave preset '{s}' ({s})\n", .{ args.wave_preset, @errorName(err) });
+        return err;
+    };
+    const wave_msg = waveMsgFromParams(wave_params);
+
+    // Pre-encode the WaveMsg once at boot — preset doesn't change at
+    // runtime in v0, so re-stringifying every tick would burn the
+    // allocator for nothing. When admin-driven preset changes ship,
+    // re-encode in response to the admin signal.
+    const wave_payload = try wire.encodeWave(allocator, wave_msg);
+    defer allocator.free(wave_payload);
+
     std.debug.print(
-        "env-sim: connecting to {s}; cell_side={d:.0} m; publishing wind for {d} cell(s); base_speed={d:.1} m/s base_dir={d:.2} rad\n",
+        "env-sim: connecting to {s}; cell_side={d:.0} m; publishing wind+waves for {d} cell(s); wind base_speed={d:.1} m/s base_dir={d:.2} rad; wave preset='{s}' seed={d} amp={d:.2}m\n",
         .{
             args.nats_url,
             args.cell_side_m,
             args.cells.len,
             wind_params.base_speed_mps,
             wind_params.base_direction_rad,
+            args.wave_preset,
+            wave_msg.seed,
+            wave_msg.amplitude_m,
         },
     );
 
@@ -178,7 +233,7 @@ pub fn main() !void {
             // catch-up making things worse.
             var ticks_due: u32 = 0;
             while (now_ns -% last_tick_ns >= tick_period_ns and ticks_due < 5) : (ticks_due += 1) {
-                pubs_in_window += try publishTick(allocator, client, wind_params, args.cells, args.cell_side_m, world_time_s);
+                pubs_in_window += try publishTick(allocator, client, wind_params, wave_payload, args.cells, args.cell_side_m, world_time_s);
                 tick_n += 1;
                 world_time_s += 1.0 / 5.0;
                 last_tick_ns +%= tick_period_ns;
@@ -186,9 +241,12 @@ pub fn main() !void {
         }
 
         if (now_ns -% last_log_ns >= log_interval_ns) {
+            // Each tick publishes 2 subjects per cell (wind + waves),
+            // so the expected pubs/s rate is 2 × cells × 5 Hz.
+            const expected = args.cells.len * 5 * 2;
             std.debug.print(
-                "[env-sim] {d} ticks last 1 s (target 5); {d} cells × 5 Hz = {d} pubs/s expected, {d} actual\n",
-                .{ tick_n -% (tick_n -| 5), args.cells.len, args.cells.len * 5, pubs_in_window },
+                "[env-sim] {d} ticks last 1 s (target 5); {d} cells × 5 Hz × 2 = {d} pubs/s expected, {d} actual\n",
+                .{ tick_n -% (tick_n -| 5), args.cells.len, expected, pubs_in_window },
             );
             pubs_in_window = 0;
             last_log_ns = now_ns;
@@ -202,6 +260,10 @@ fn publishTick(
     allocator: std.mem.Allocator,
     client: *nats.Client,
     params: notatlas.wind_query.WindParams,
+    /// Pre-encoded wave payload — same for every cell at v0, so we
+    /// stringify once at boot and re-publish the same bytes per
+    /// cell. Saves an allocator round-trip per cell per tick.
+    wave_payload: []const u8,
     cells: []const CellCoord,
     cell_side_m: f32,
     world_time_s: f64,
@@ -220,6 +282,10 @@ fn publishTick(
         const buf = try wire.encodeWind(allocator, msg);
         defer allocator.free(buf);
         try client.publish(subj, buf);
+        count += 1;
+
+        const wave_subj = try std.fmt.bufPrint(&subj_buf, "env.cell.{d}_{d}.waves", .{ c.x, c.z });
+        try client.publish(wave_subj, wave_payload);
         count += 1;
     }
     return count;

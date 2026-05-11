@@ -477,6 +477,61 @@ pub fn decodeWind(allocator: std.mem.Allocator, payload: []const u8) !std.json.P
     return std.json.parseFromSlice(WindMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `env.cell.<x>_<z>.waves` payload — published by env-sim per cell
+/// at 5 Hz. Mirrors `wave_query.WaveParams` (the kernel tunables for
+/// the Gerstner sum), minus the `_pad0` std140-alignment slot. The
+/// fields match `RawWaveParams` in `yaml_loader.zig` field-for-field
+/// so a wave preset YAML and a wire publish carry the same shape.
+///
+/// **Determinism invariant:** every consumer that samples the wave
+/// surface (ship-sim buoyancy, future client renderer) MUST use the
+/// SAME WaveMsg.seed at the same world time, or buoyancy and visuals
+/// disagree. env-sim is the single source of truth; ship-sim and
+/// clients update their local copies on each receipt. Producer-side
+/// coalescing is not needed at v0 cadence (5 Hz = 200 ms; preset
+/// changes are operator events, not high-rate).
+pub const WaveMsg = struct {
+    seed: u64,
+    iterations: u32,
+    drag_multiplier: f32,
+    amplitude_m: f32,
+    wave_scale_m: f32,
+    frequency_mult: f32,
+    base_time_mult: f32,
+    time_mult: f32,
+    weight_decay: f32,
+};
+
+pub fn encodeWave(allocator: std.mem.Allocator, msg: WaveMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeWave(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(WaveMsg) {
+    return std.json.parseFromSlice(WaveMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
+/// Extract the cell coordinates from an `env.cell.<x>_<z>.waves`
+/// subject. Same shape as parseCellFromWindSubject but the suffix
+/// differs. Kept separate to avoid making a generic parser that
+/// has to handle both — the suffix is the load-bearing
+/// discriminator at the subscribe site.
+pub fn parseCellFromWaveSubject(subject: []const u8) !struct { x: i32, z: i32 } {
+    const prefix = "env.cell.";
+    const suffix = ".waves";
+    if (subject.len <= prefix.len + suffix.len) return error.BadSubject;
+    if (!std.mem.startsWith(u8, subject, prefix)) return error.BadSubject;
+    if (!std.mem.endsWith(u8, subject, suffix)) return error.BadSubject;
+    const mid = subject[prefix.len .. subject.len - suffix.len];
+    const sep = std.mem.indexOfScalar(u8, mid, '_') orelse return error.BadSubject;
+    const x_str = mid[0..sep];
+    const z_str = mid[sep + 1 ..];
+    if (x_str.len == 0 or z_str.len == 0) return error.BadSubject;
+    return .{
+        .x = try std.fmt.parseInt(i32, x_str, 10),
+        .z = try std.fmt.parseInt(i32, z_str, 10),
+    };
+}
+
 /// Extract the cell coordinates from an `env.cell.<x>_<z>.wind`
 /// subject. Returns `(cell_x, cell_z)` as `i32`; negative coords
 /// land via the signed-int parse path. Errors on malformed
@@ -879,6 +934,40 @@ test "wire: parseCellFromWindSubject" {
     try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell.0.wind"));
     try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell.0_0.delta"));
     try testing.expectError(error.BadSubject, parseCellFromWindSubject("env.cell._5.wind"));
+}
+
+test "wire: wave roundtrip" {
+    // Values mirror data/waves/calm.yaml so the roundtrip doubles
+    // as a check that the wire shape matches the YAML loader's shape.
+    const orig: WaveMsg = .{
+        .seed = 1001,
+        .iterations = 24,
+        .drag_multiplier = 0.20,
+        .amplitude_m = 0.5,
+        .wave_scale_m = 30.0,
+        .frequency_mult = 1.18,
+        .base_time_mult = 1.5,
+        .time_mult = 1.07,
+        .weight_decay = 0.8,
+    };
+    const buf = try encodeWave(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeWave(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig, parsed.value);
+}
+
+test "wire: parseCellFromWaveSubject" {
+    const a = try parseCellFromWaveSubject("env.cell.0_0.waves");
+    try testing.expectEqual(@as(i32, 0), a.x);
+    try testing.expectEqual(@as(i32, 0), a.z);
+
+    const b = try parseCellFromWaveSubject("env.cell.-3_5.waves");
+    try testing.expectEqual(@as(i32, -3), b.x);
+    try testing.expectEqual(@as(i32, 5), b.z);
+
+    try testing.expectError(error.BadSubject, parseCellFromWaveSubject("env.cell.0.waves"));
+    try testing.expectError(error.BadSubject, parseCellFromWaveSubject("env.cell.0_0.wind"));
 }
 
 test "wire: parseVictimIdFromDamageSubject" {
