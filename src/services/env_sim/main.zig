@@ -31,8 +31,16 @@ const nats = @import("nats");
 const notatlas = @import("notatlas");
 const wire = @import("wire");
 
-const tick_period_ns: u64 = std.time.ns_per_s / 5; // 5 Hz
+const tick_period_ns: u64 = std.time.ns_per_s / 5; // 5 Hz (wind + waves)
+const tod_tick_period_ns: u64 = std.time.ns_per_s; // 1 Hz (time-of-day)
 const log_interval_ns: u64 = std.time.ns_per_s;
+
+/// Default day length (s). 20 minutes is short enough that one
+/// dev-session covers a full dawn→dusk cycle for visual / sky-shader
+/// iteration; production wipes-per-cycle settle on a much longer
+/// real-time-locked schedule (TODO: data/time.yaml when raid windows
+/// land).
+const default_day_length_s: f64 = 1200.0;
 
 /// Default cell side (m). Must match the value spatial-index runs
 /// with — the cell-center coordinate the wind is sampled at uses
@@ -59,6 +67,8 @@ const Args = struct {
     /// publishes the same preset to every cell; per-cell variation
     /// (coastal calm, deep-water storm) lands when content needs it.
     wave_preset: []const u8 = default_wave_preset,
+    /// Day length in seconds. Drives day_fraction in the ToD broadcast.
+    day_length_s: f64 = default_day_length_s,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -94,6 +104,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             const v = args.next() orelse return error.MissingArg;
             out.wave_preset = try allocator.dupe(u8, v);
             owned_wave_preset = true;
+        } else if (std.mem.eql(u8, a, "--day-length-s")) {
+            out.day_length_s = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingArg);
+            if (out.day_length_s <= 0) return error.BadArg;
         } else {
             std.debug.print("env-sim: unknown arg '{s}'\n", .{a});
             return error.BadArg;
@@ -213,13 +226,16 @@ pub fn main() !void {
 
     const start_ns: u64 = @intCast(std.time.nanoTimestamp());
     var last_tick_ns: u64 = start_ns;
+    var last_tod_ns: u64 = start_ns -% tod_tick_period_ns; // fire ToD immediately on first loop
     var last_log_ns: u64 = start_ns;
     var pubs_in_window: u64 = 0;
+    var tod_pubs_in_window: u64 = 0;
     var tick_n: u64 = 0;
 
     // World clock in seconds since boot — drives the slow shift in
     // base direction (windAt is a function of (x, z, t) not a
-    // monotonic counter). f64 because the wipe cycle is ~10 weeks.
+    // monotonic counter) AND the day_fraction in the ToD broadcast.
+    // f64 because the wipe cycle is ~10 weeks.
     var world_time_s: f64 = 0;
 
     while (g_running.load(.acquire)) {
@@ -240,20 +256,42 @@ pub fn main() !void {
             }
         }
 
+        if (now_ns -% last_tod_ns >= tod_tick_period_ns) {
+            try publishTimeOfDay(allocator, client, world_time_s, args.day_length_s);
+            tod_pubs_in_window += 1;
+            last_tod_ns +%= tod_tick_period_ns;
+        }
+
         if (now_ns -% last_log_ns >= log_interval_ns) {
-            // Each tick publishes 2 subjects per cell (wind + waves),
-            // so the expected pubs/s rate is 2 × cells × 5 Hz.
+            // Each wind+wave tick publishes 2 subjects per cell, so
+            // the expected env-cell pubs/s rate is 2 × cells × 5 Hz.
+            // ToD adds one global publish per second.
             const expected = args.cells.len * 5 * 2;
             std.debug.print(
-                "[env-sim] {d} ticks last 1 s (target 5); {d} cells × 5 Hz × 2 = {d} pubs/s expected, {d} actual\n",
-                .{ tick_n -% (tick_n -| 5), args.cells.len, expected, pubs_in_window },
+                "[env-sim] {d} ticks last 1 s (target 5); {d} cells × 5 Hz × 2 = {d} pubs/s expected, {d} actual; {d} ToD pubs\n",
+                .{ tick_n -% (tick_n -| 5), args.cells.len, expected, pubs_in_window, tod_pubs_in_window },
             );
             pubs_in_window = 0;
+            tod_pubs_in_window = 0;
             last_log_ns = now_ns;
         }
     }
 
     std.debug.print("env-sim: shutting down at tick {d}\n", .{tick_n});
+}
+
+fn publishTimeOfDay(
+    allocator: std.mem.Allocator,
+    client: *nats.Client,
+    world_time_s: f64,
+    day_length_s: f64,
+) !void {
+    const phase = @mod(world_time_s, day_length_s);
+    const fraction: f32 = @floatCast(phase / day_length_s);
+    const msg: wire.TimeOfDayMsg = .{ .world_time_s = world_time_s, .day_fraction = fraction };
+    const buf = try wire.encodeTimeOfDay(allocator, msg);
+    defer allocator.free(buf);
+    try client.publish("env.time", buf);
 }
 
 fn publishTick(

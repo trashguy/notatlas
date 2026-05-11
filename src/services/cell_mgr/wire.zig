@@ -510,6 +510,35 @@ pub fn decodeWave(allocator: std.mem.Allocator, payload: []const u8) !std.json.P
     return std.json.parseFromSlice(WaveMsg, allocator, payload, .{ .ignore_unknown_fields = true });
 }
 
+/// `env.time` payload — published by env-sim at 1 Hz. NOT cell-keyed
+/// (ToD is global). Two views of the same clock:
+///   - `world_time_s` is env-sim's monotonic world clock since boot
+///     (f64 because a 10-week wipe cycle exceeds f32 precision at
+///     millisecond resolution). This is the SAME `t` consumers feed
+///     to wave_query.waveHeight / wind_query.windAt — the
+///     environment-clock determinism invariant.
+///   - `day_fraction` is `(world_time_s mod day_length_s) /
+///     day_length_s` in [0, 1). 0 = midnight (start of day), 0.5 =
+///     noon. Plain convenience for sky shaders / raid-window
+///     scheduling so consumers don't recompute the mod.
+///
+/// Future raid-window scheduler subscribes here for the day-fraction
+/// crossing into a defined raid interval; sky shader subscribes for
+/// the dawn/dusk gradient. v0 has no live consumer; the broadcast
+/// itself is the deliverable.
+pub const TimeOfDayMsg = struct {
+    world_time_s: f64,
+    day_fraction: f32,
+};
+
+pub fn encodeTimeOfDay(allocator: std.mem.Allocator, msg: TimeOfDayMsg) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, msg, .{});
+}
+
+pub fn decodeTimeOfDay(allocator: std.mem.Allocator, payload: []const u8) !std.json.Parsed(TimeOfDayMsg) {
+    return std.json.parseFromSlice(TimeOfDayMsg, allocator, payload, .{ .ignore_unknown_fields = true });
+}
+
 /// Extract the cell coordinates from an `env.cell.<x>_<z>.waves`
 /// subject. Same shape as parseCellFromWindSubject but the suffix
 /// differs. Kept separate to avoid making a generic parser that
@@ -968,6 +997,16 @@ test "wire: parseCellFromWaveSubject" {
 
     try testing.expectError(error.BadSubject, parseCellFromWaveSubject("env.cell.0.waves"));
     try testing.expectError(error.BadSubject, parseCellFromWaveSubject("env.cell.0_0.wind"));
+}
+
+test "wire: time-of-day roundtrip" {
+    const orig: TimeOfDayMsg = .{ .world_time_s = 12345.6789, .day_fraction = 0.3125 };
+    const buf = try encodeTimeOfDay(testing.allocator, orig);
+    defer testing.allocator.free(buf);
+    const parsed = try decodeTimeOfDay(testing.allocator, buf);
+    defer parsed.deinit();
+    try testing.expectEqual(orig.day_fraction, parsed.value.day_fraction);
+    try testing.expectApproxEqAbs(orig.world_time_s, parsed.value.world_time_s, 1e-9);
 }
 
 test "wire: parseVictimIdFromDamageSubject" {
