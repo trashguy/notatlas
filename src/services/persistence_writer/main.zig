@@ -159,6 +159,19 @@ const StreamMetrics = struct {
     sla_p99_ms: u32 = 0,
     /// Breach-onset timestamp (ns since UNIX epoch). 0 = not breaching.
     breach_since_ns: i128 = 0,
+    /// Last time a per-batch debug-trace line was emitted for this
+    /// stream (ns, monotonic). Used to throttle the trace to ~1 Hz —
+    /// the line fires on every drainBatch otherwise (hundreds per sec).
+    /// Enabled by --trace-batches CLI flag; otherwise dormant.
+    last_trace_ns: i128 = 0,
+    /// Largest batch size + slowest elapsed (ms) observed in the
+    /// current 1-second trace window. Reset when the line is emitted.
+    /// Window-max rather than per-batch-instant so we capture the
+    /// worst-case behaviour even when 1 Hz throttling collapses many
+    /// fast batches into one log line.
+    max_batch: u32 = 0,
+    max_elapsed_ms: u64 = 0,
+    max_fetch_ms: u64 = 0,
 };
 
 /// Drain priority. fast streams are drained to completion (timeout=0
@@ -248,7 +261,16 @@ const Args = struct {
     /// no_ack disables ack publishing so messages stay outstanding.
     ack_wait_s: ?u64 = null,
     no_ack: bool = false,
+    /// Per-batch trace logging — emits a line for each drainBatch call
+    /// with the returned batch size, the fetch wait, and the
+    /// PG-processing time, throttled to ~1 Hz per stream. Off by
+    /// default (chatty); set by stress harnesses that need to see
+    /// where pwriter spends its time. Reads as a global flag so we
+    /// don't have to thread it through drainBatch's hot path.
+    trace_batches: bool = false,
 };
+
+var trace_batches: bool = false;
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args = try std.process.argsWithAllocator(allocator);
@@ -277,6 +299,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             out.ack_wait_s = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--no-ack")) {
             out.no_ack = true;
+        } else if (std.mem.eql(u8, a, "--trace-batches")) {
+            out.trace_batches = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print(
                 \\persistence-writer — sole Postgres writer.
@@ -292,6 +316,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
                 \\  --slow-sla-ms <ms>    override tier=slow SLA (default 10000)
                 \\  --ack-wait-s <s>      override consumer ack_wait (smoke-only; default 300)
                 \\  --no-ack              skip ack after insert (smoke-only; never use in prod)
+                \\  --trace-batches       per-batch fetch+process timing log (1 Hz/stream)
                 \\
             , .{});
             std.process.exit(0);
@@ -331,6 +356,13 @@ pub fn main() !void {
     if (no_ack_mode) {
         std.debug.print(
             "persistence-writer: --no-ack ENABLED (smoke-only — messages will not be acked)\n",
+            .{},
+        );
+    }
+    trace_batches = args.trace_batches;
+    if (trace_batches) {
+        std.debug.print(
+            "persistence-writer: --trace-batches ENABLED (per-stream 1 Hz fetch/process timing)\n",
             .{},
         );
     }
@@ -455,7 +487,7 @@ pub fn main() !void {
             fast_quiet = true;
             for (stream_specs, 0..) |spec, i| {
                 if (spec.tier != .fast) continue;
-                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms, &metrics[i].lag)) |stats| {
+                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms, &metrics[i])) |stats| {
                     if (stats.nonzero()) {
                         if (stats.committed + stats.dedup_skipped > 0) fast_quiet = false;
                         any_processed = true;
@@ -473,7 +505,7 @@ pub fn main() !void {
         // slow-tier SLAs are seconds, not milliseconds.
         for (stream_specs, 0..) |spec, i| {
             if (spec.tier != .slow) continue;
-            if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms, &metrics[i].lag)) |stats| {
+            if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms, &metrics[i])) |stats| {
                 if (stats.nonzero()) {
                     any_processed = true;
                     metrics[i].committed += stats.committed;
@@ -501,6 +533,11 @@ pub fn main() !void {
 
 /// Fetch + process one batch from a stream. Returns null on fetch error
 /// (already logged); empty batches return zero-stat. Caller summates.
+///
+/// When --trace-batches is enabled, tracks per-stream window-max
+/// fetch_ms / process_ms / batch_size on the StreamMetrics struct and
+/// flushes a log line at ~1 Hz per stream. Off-flag this is one
+/// branch + one timestamp call per fetch — negligible.
 fn drainBatch(
     allocator: std.mem.Allocator,
     pool: *pg.Pool,
@@ -508,8 +545,9 @@ fn drainBatch(
     spec: StreamSpec,
     cycle_id: i64,
     timeout_ms: u32,
-    lag: *LagBuffer,
+    m: *StreamMetrics,
 ) !BatchStats {
+    const fetch_start_ns: i128 = if (trace_batches) std.time.nanoTimestamp() else 0;
     const msgs = pull.fetch(fetch_batch, timeout_ms) catch |err| {
         std.debug.print(
             "persistence-writer: fetch err on {s}: {}\n",
@@ -518,18 +556,60 @@ fn drainBatch(
         return err;
     };
     defer {
-        for (msgs) |*m| @constCast(m).deinit();
+        for (msgs) |*m_msg| @constCast(m_msg).deinit();
         allocator.free(msgs);
     }
-    if (msgs.len == 0) return BatchStats{};
+    const fetch_end_ns: i128 = if (trace_batches) std.time.nanoTimestamp() else 0;
+    if (msgs.len == 0) {
+        if (trace_batches) maybeFlushTrace(spec.label, m, fetch_end_ns, 0, nsToMs(fetch_end_ns - fetch_start_ns), 0);
+        return BatchStats{};
+    }
 
-    return processBatch(allocator, pool, pull, msgs, cycle_id, spec.handler, lag) catch |err| {
+    const proc_start_ns: i128 = if (trace_batches) fetch_end_ns else 0;
+    const stats = processBatch(allocator, pool, pull, msgs, cycle_id, spec.handler, &m.lag) catch |err| {
         std.debug.print(
             "persistence-writer: batch err on {s}: {}\n",
             .{ spec.stream_name, err },
         );
         return BatchStats{};
     };
+    if (trace_batches) {
+        const proc_end_ns = std.time.nanoTimestamp();
+        const fetch_ms = nsToMs(fetch_end_ns - fetch_start_ns);
+        const proc_ms = nsToMs(proc_end_ns - proc_start_ns);
+        maybeFlushTrace(spec.label, m, proc_end_ns, @intCast(msgs.len), fetch_ms, proc_ms);
+    }
+    return stats;
+}
+
+fn nsToMs(delta_ns: i128) u64 {
+    if (delta_ns <= 0) return 0;
+    const ms = @divTrunc(delta_ns, std.time.ns_per_ms);
+    return std.math.cast(u64, ms) orelse std.math.maxInt(u64);
+}
+
+/// Aggregate worst-case observed per-1-second window, then flush.
+/// max_* are zeroed by the flush so each window starts fresh.
+fn maybeFlushTrace(
+    label: []const u8,
+    m: *StreamMetrics,
+    now_ns: i128,
+    batch_size: u32,
+    fetch_ms: u64,
+    proc_ms: u64,
+) void {
+    if (batch_size > m.max_batch) m.max_batch = batch_size;
+    if (fetch_ms > m.max_fetch_ms) m.max_fetch_ms = fetch_ms;
+    if (proc_ms > m.max_elapsed_ms) m.max_elapsed_ms = proc_ms;
+    if (now_ns - m.last_trace_ns < std.time.ns_per_s) return;
+    std.debug.print(
+        "persistence-writer: trace stream={s} max_batch={d} max_fetch_ms={d} max_proc_ms={d}\n",
+        .{ label, m.max_batch, m.max_fetch_ms, m.max_elapsed_ms },
+    );
+    m.last_trace_ns = now_ns;
+    m.max_batch = 0;
+    m.max_fetch_ms = 0;
+    m.max_elapsed_ms = 0;
 }
 
 /// Format committed/dedup totals dynamically over stream_specs so adding
