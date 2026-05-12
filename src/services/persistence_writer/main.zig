@@ -62,7 +62,14 @@ const fetch_timeout_slow_ms: u32 = 25;
 // local-broker round-trip and small enough that an idle fast lane only
 // burns 5 ms per outer iteration; an active lane returns as soon as the
 // batch arrives and the drain-loop continues immediately.
-const fetch_timeout_fast_ms: u32 = 5;
+// 1 ms is intentional, not a typo. nats-zig 0.2.2's PullSubscription
+// .fetch() with timeout=5 routinely returns ~100 ms on an idle stream
+// — the server-side max_wait floor sits somewhere between 1 ms and
+// 5 ms and a 5 ms request gets clamped up to that floor. With timeout=1
+// the same idle fetch returns in 3-5 ms, which is what the design
+// originally assumed. See docs/research/sla_arc_stress.md; revisit
+// when nats-zig 0.3 ships.
+const fetch_timeout_fast_ms: u32 = 1;
 const idle_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const log_interval_ns: u64 = std.time.ns_per_s;
 
@@ -477,32 +484,20 @@ pub fn main() !void {
 
         var any_processed = false;
 
-        // Pass 1: drain fast streams to completion. Loop until every
-        // fast stream returns empty in a single sweep. timeout=0 keeps
-        // each fetch non-blocking so this is a tight inner loop only
-        // while there's actual fast-tier work; an idle fast lane costs
-        // ~one round-trip per outer iteration.
-        var fast_quiet = false;
-        while (!fast_quiet) {
-            fast_quiet = true;
-            for (stream_specs, 0..) |spec, i| {
-                if (spec.tier != .fast) continue;
-                if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms, &metrics[i])) |stats| {
-                    if (stats.nonzero()) {
-                        if (stats.committed + stats.dedup_skipped > 0) fast_quiet = false;
-                        any_processed = true;
-                        metrics[i].committed += stats.committed;
-                        metrics[i].dedup_skipped += stats.dedup_skipped;
-                        metrics[i].failed += stats.failed;
-                        if (stats.last_insert_ns != 0) metrics[i].last_insert_ns = stats.last_insert_ns;
-                    }
-                } else |_| {}
-            }
-        }
+        // Pass 1: top-of-iter fast-lane drain. Catches up any backlog
+        // accumulated during the previous slow round before doing more
+        // slow work.
+        if (drainFastLaneToQuiet(allocator, pool, &pulls, &metrics, cycle_id)) any_processed = true;
 
-        // Pass 2: round-robin slow streams once. Hot slow streams get
-        // amortized over fast-lane drain cycles; this is fine because
-        // slow-tier SLAs are seconds, not milliseconds.
+        // Pass 2: round-robin slow streams. After each slow stream's
+        // batch, do a single fast-lane pass — without this, a hot slow
+        // stream (inv at peak crafting load) holds the fast lane off
+        // for the full slow batch (~100 ms at 1000 inv/s), which
+        // breaches the session 200 ms SLA. Single-pass (not
+        // drain-to-quiet) is deliberate: at sustained fast arrival
+        // rates a drain-to-quiet loop never exits, starving slow.
+        // Top-of-iter handles backlog catch-up, this handles
+        // head-of-line freedom.
         for (stream_specs, 0..) |spec, i| {
             if (spec.tier != .slow) continue;
             if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_slow_ms, &metrics[i])) |stats| {
@@ -514,6 +509,7 @@ pub fn main() !void {
                     if (stats.last_insert_ns != 0) metrics[i].last_insert_ns = stats.last_insert_ns;
                 }
             } else |_| {}
+            if (drainFastLaneOnce(allocator, pool, &pulls, &metrics, cycle_id)) any_processed = true;
         }
         if (!any_processed) std.Thread.sleep(idle_sleep_ns);
 
@@ -529,6 +525,56 @@ pub fn main() !void {
     }
 
     logTotals(cycle_id, "shutdown", &metrics);
+}
+
+/// One pass through every fast-tier stream. Each fast stream pulls
+/// up to fetch_batch messages with the fast-tier timeout; the call
+/// returns whether anything was drained.
+///
+/// The drain-to-completion variant `drainFastLaneToQuiet` wraps this
+/// in a loop and is used at the TOP of the outer iteration to catch
+/// up any backlog. Between slow batches we only call this once: the
+/// outer iter's next top-of-loop drain handles any residual events,
+/// and a tight drain-to-quiet loop between slow batches starves the
+/// slow lane at sustained fast-tier arrival rates (every pull returns
+/// fresh events, the loop never exits).
+fn drainFastLaneOnce(
+    allocator: std.mem.Allocator,
+    pool: *pg.Pool,
+    pulls: *[stream_specs.len]nats.JetStream.PullSubscription,
+    metrics: *[stream_specs.len]StreamMetrics,
+    cycle_id: i64,
+) bool {
+    var any_processed = false;
+    for (stream_specs, 0..) |spec, i| {
+        if (spec.tier != .fast) continue;
+        if (drainBatch(allocator, pool, &pulls[i], spec, cycle_id, fetch_timeout_fast_ms, &metrics[i])) |stats| {
+            if (stats.nonzero()) {
+                any_processed = true;
+                metrics[i].committed += stats.committed;
+                metrics[i].dedup_skipped += stats.dedup_skipped;
+                metrics[i].failed += stats.failed;
+                if (stats.last_insert_ns != 0) metrics[i].last_insert_ns = stats.last_insert_ns;
+            }
+        } else |_| {}
+    }
+    return any_processed;
+}
+
+/// Loop drainFastLaneOnce until a pass returns empty. Top-of-iter
+/// pattern: catch up any fast backlog before doing slow-tier work.
+fn drainFastLaneToQuiet(
+    allocator: std.mem.Allocator,
+    pool: *pg.Pool,
+    pulls: *[stream_specs.len]nats.JetStream.PullSubscription,
+    metrics: *[stream_specs.len]StreamMetrics,
+    cycle_id: i64,
+) bool {
+    var any_processed = false;
+    while (drainFastLaneOnce(allocator, pool, pulls, metrics, cycle_id)) {
+        any_processed = true;
+    }
+    return any_processed;
 }
 
 /// Fetch + process one batch from a stream. Returns null on fetch error
