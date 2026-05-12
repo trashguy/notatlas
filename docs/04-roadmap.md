@@ -89,27 +89,91 @@ spatial-index, env, persistence-writer services.
 3×3 grid; sail seamlessly across; smooth 200-character harbor scene.
 The thing Grapeshot couldn't do.
 
+## Phase 2.5 — Content pipeline & tooling (~3-6 months — sized for worst case)
+
+The bridge between "engine algorithms proven at synthetic scale"
+(Phase 2) and "engine survives real production content" (Phase 3).
+Built around the FiveM-RP team workflow per memory
+`project_asset_pipeline_fivem_team.md`: Blender / Photoshop /
+Aseprite → drop file → small YAML manifest → hot-reload. The
+TypeScriptToLua authoring layer per
+`project_typescript_dev_frontend.md` lands here too — designers
+write .ts, runtime executes Lua.
+
+Closing this phase requires both the pipeline lift AND a re-gate of
+the Phase 2 synthetic milestones against real assets — per
+`feedback_synthetic_baseline_then_diff.md`, the diff isolates
+content-shape regressions from algorithm bugs.
+
+**Schedule note — plan for the worst:** the Houdini-Engine arc
+(M22-M26) is sized for the worst-case scope (full SDK integration
+with runtime cooking, parameter exposure, async cook worker,
+point-instance procedural placement). Actual depth depends on the
+dev team's workflow once they're onboard — if they prefer Blender
++ lighter procedural tools, the Houdini arc compresses to an
+"HDA → glTF bake" workflow docs entry and the active milestone
+count drops to M13-M20 + M27. The roadmap absorbs the worst case
+so a late upshift doesn't re-open it.
+
+### Base asset pipeline
+
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ▢ | M13: glTF static mesh loader | Lift fallen-runes' `gltf_loader.zig`; load + render a Blender-exported building piece in place of the procedural cube; hot-reload on file save |
+| ▢ | M14: KTX2 texture + material v1 | Texture sampling pipeline; basic PBR (albedo + normal + roughness); material YAML manifest |
+| ▢ | M15: Per-asset YAML manifest + hot-reload | `data/props/*.yaml`, `data/ships/*.yaml` — one file per unit; mesh + texture + material references; hot-reload extended to meshes / textures / materials |
+| ▢ | M16: Skeletal anim format + skinning shader | Bone palette + per-vertex weights + animation clip format; GPU skinning shader; unlocks M12 re-gate against real rigs |
+| ▢ | M17: Sprite + particle systems | 2D UI / decal / billboard pipeline (banners, signs); particle emitter system (M1.6's 100-emitter target lives here) |
+| ▢ | M18: Map / scene editor | In-engine placement tool for anchorages, props, biomes; saves to YAML; matches FiveM in-game-editor convention |
+| ▢ | M19: TypeScriptToLua content scripting | Designer-facing .ts authoring → Lua runtime per locked architecture; comparable to FiveM's resource manifest pattern |
+| ▢ | M20: Onboarding doc + worked examples | "How to add a building piece" / "sail texture" / "animated NPC" — written for someone who's installed Zig once |
+
+### Houdini Engine arc (worst-case scope; may compress per dev-team workflow)
+
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ▢ | M22: Houdini Engine SDK vendor + thin C bindings | Per `feedback_thin_c_bindings.md`: bind against SideFX's C API directly. Session lifecycle, headless cook smoke (cook a stock HDA, log mesh output; no engine integration yet) |
+| ▢ | M23: HDA-as-asset in the manifest system | `.hda` recognized as an asset type in M15's manifest; cook → ingest into the M13/M14 mesh+material path; hot-reload on HDA save → re-cook |
+| ▢ | M24: Parameter exposure → YAML + editor UI | HDA parameter interface read at load; YAML pins parameter values; M18 editor renders parameter widgets so designers iterate without leaving the engine |
+| ▢ | M25: Async cook worker | Same pattern as M11.3 cluster-merge worker — long cooks (seconds) run off-thread; editor stays responsive; cook results applied with double-buffered swap |
+| ▢ | M26: Point instances + procedural placement | Ingest HDA point output into the M10 GPU-instancing path; "designer authors a procedural anchorage in Houdini, drops the HDA, gets 500 placed pieces ready for M11 merge" |
+
+### Re-gate (synthetic → real-asset baseline diff)
+
+| Status | Milestone | Deliverable |
+|---|---|---|
+| ▢ | M27: Re-gate M10 / M11 / M12 / M1.6 with real assets | Each synthetic gate re-run with production glTF + KTX2 + rigs (+ HDA-cooked content if the Houdini arc shipped); per-gate diff doc against the synthetic baseline; content-shape regressions tracked per `feedback_synthetic_baseline_then_diff.md` |
+
+**Practical notes (Houdini):**
+- Houdini Engine is free to integrate into a host app per SideFX
+  terms; users authoring HDAs need their own Houdini license
+  (Indie / FX). The asset-authoring-license dependency is the cost
+  of admission for the worst-case path.
+- Default session model is **out-of-process** (Houdini crashes
+  don't kill the engine); revisit if cook latency dominates.
+- Library lookup goes through a `HOUDINI_PATH` env var, not
+  vendoring — users have Houdini installed elsewhere on disk.
+
+**Shipping model note (carried from prior preamble):** The shipping
+model can differ from FiveM's (we likely want pre-baked deterministic
+client builds with content versioning, not on-demand client
+downloads), but the **authoring** workflow should feel familiar.
+
+**Phase gate:** the FiveM-RP team onboards with the worked-example
+doc only — no architect intervention — and produces a new building
+piece, sail texture, and animated NPC end-to-end. The re-gate diffs
+against synthetic baselines are published; any regression attributed
+to content shape (not algorithm) gets a tracked follow-up.
+
+**End-of-phase deliverable:** the engine is a *real* game engine
+ready for content. Phase 3's "land the actual game" work no longer
+gated on tooling.
+
 ## Phase 3 — Survival, crafting, progression (solo or +1-2 devs, ~4-6 months)
 
-The actual game. With architecture proven and bottlenecks understood,
-content can land safely.
-
-**Content pipeline prerequisite (lands during Phase 2):** the team
-includes devs from a GTA 5 / FiveM RP modding background. Their
-content workflow — author in Blender → drop file → small manifest →
-hot-reload — sets the bar for the asset onboarding UX. By the time
-Phase 3 content scaling starts, the engine needs:
-
-- glTF mesh + KTX2 texture loaders (lift fallen-runes' `gltf_loader.zig` per the reference rules)
-- Hot-reload extended to meshes / textures (already established for shaders + YAML)
-- Per-content-unit YAML manifests (`data/ships/*.yaml`, `data/props/*.yaml` — one file per unit, no monolithic registries)
-- A worked-example onboarding doc — "how to add a new sail texture" — written for someone who's installed Zig once
-
-The shipping model can differ from FiveM's (we likely want pre-baked
-deterministic client builds with content versioning, not on-demand
-client downloads), but the **authoring** workflow should feel
-familiar. See memory `project_asset_pipeline_fivem_team.md` for the
-full set of tensions to manage.
+The actual game. With architecture proven (Phase 2 synthetic) AND
+real-asset performance confirmed (Phase 2.5 re-gate), content lands
+on a known-good substrate.
 
 | System | Notes |
 |---|---|
@@ -247,7 +311,8 @@ Driven by playtest data and player demand. Possible additions:
 | ✓ verified 2026-05-12 (`5bf5712`) | M10 gpu-instancing gate | Phase 2 | 5045 instances × 20 piece types @ RX 9070 XT, MAILBOX, 10 s: avg 0.83 ms / p99 1.85 / fps 1200. ~20× headroom on 16.67 ms budget. M10.3 compute cull shipped + verified A/B against `--no-cull`. `scripts/m10_gate_smoke.sh`. |
 | ✓ verified 2026-05-12 | M11 structure-lod-merge gate | Phase 2 | 500-piece anchorage × 20 piece types × 50 m radius @ RX 9070 XT, MAILBOX, 10 s, `--force-far`: max merge 2.33 ms (gate ≤100 ms, ~40× headroom — sync path; worker path used for invalidates), far-LOD draws=1 per anchorage (one `vkCmdDrawIndexed`), avg+p99 frametime under 60 fps budget. Mid-soak auto-invalidate exercises the M11.3 off-thread worker round-trip. `scripts/m11_gate_smoke.sh`. |
 | ▢ | Single spatial-index throughput ceiling | Phase 4 prep | Stress with 1000s of synthetic entities publishing 60 Hz position firehose; measure delta-emit latency and query response time. Result determines whether regional sharding is needed before Phase 4 playtest or post-launch. |
-| ▢ | Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
+| ▢ | Milestone 1.6 (synthetic harbor stress) | Phase 2 → 2.5 | Renderer holds 60 fps in dense synthetic scene. Closes the Phase 2 synthetic arc. |
+| ▢ | M27 (M10/M11/M12/M1.6 re-gate with real assets) | Phase 2.5 → 3 | Re-run the Phase 2 synthetic gates against production glTF + KTX2 + rigs (+ HDAs if Houdini arc shipped). Per-gate diff vs synthetic baseline. Confirms the engine survives real artist content, not just placeholder geometry. |
 | ▢ | Closed playtest | Phase 4 | The loop is actually fun |
 
 If any gate fails, **stop and fix before adding content**. This is the
