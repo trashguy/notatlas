@@ -244,7 +244,7 @@ Driven by playtest data and player demand. Possible additions:
 | ✓ verified 2026-04-29 (`6ce6a33`) | M6 phase gate (synthetic + BW) | Phase 1 | 100×50 fanout correct + ≤1 Mbps slow-lane budget held |
 | ✓ verified 2026-05-01 | Milestone 1.5 (live load) | Phase 1 → 2 | 50 conns × 30 ships × actual gateway/NATS path → multi-gateway 32.1%, single-gateway+JWT 17.3% of 1 Mbps/client budget |
 | ✓ verified 2026-05-12 | SLA-arc multi-stream stress | Phase 2 | All 4 producers concurrent @ 1000 inv/s sustained, session SLA holds. Fast-lane interleave fix + nats-zig 1 ms timeout. Comfortable ceiling identified; bursty ceiling at 1500 inv/s. |
-| ✓ verified 2026-05-12 (`0e717aa`) | M10 gpu-instancing gate | Phase 2 | 5045 instances × 20 piece types @ RX 9070 XT, MAILBOX, 10 s: avg 1.93 ms / p99 2.95 / max 4.43 / 518 fps. 8.6× headroom on 16.67 ms budget. `scripts/m10_gate_smoke.sh`. |
+| ✓ verified 2026-05-12 (`5bf5712`) | M10 gpu-instancing gate | Phase 2 | 5045 instances × 20 piece types @ RX 9070 XT, MAILBOX, 10 s: avg 0.83 ms / p99 1.85 / fps 1200. ~20× headroom on 16.67 ms budget. M10.3 compute cull shipped + verified A/B against `--no-cull`. `scripts/m10_gate_smoke.sh`. |
 | ▢ | Single spatial-index throughput ceiling | Phase 4 prep | Stress with 1000s of synthetic entities publishing 60 Hz position firehose; measure delta-emit latency and query response time. Result determines whether regional sharding is needed before Phase 4 playtest or post-launch. |
 | ▢ | Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
 | ▢ | Closed playtest | Phase 4 | The loop is actually fun |
