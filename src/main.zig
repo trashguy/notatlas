@@ -40,6 +40,15 @@ const merged_frag_shader_path = "assets/shaders/merged.frag";
 const npc_pax_count: u32 = 3;
 const pax_total_count: u32 = 1 + npc_pax_count;
 
+/// M1.6: particles per emitter for the disposable particle stub.
+/// 100 emitters × 20 = 2000 additional Instanced slots / transform
+/// writes per frame. This is a CPU-bound stand-in for the real
+/// particle system (M17), which will be GPU-compute spawn — perf
+/// shape is intentionally different. Numbers from this stub are a
+/// **directional headroom signal only**, not a particle-perf
+/// measurement. See `docs/research/m1_6_*` findings doc.
+const m1_6_particles_per_emitter: u32 = 20;
+
 const Scene = struct {
     ocean: *render.Ocean,
     /// M10.1: GPU-driven instancing path. Ship + passengers all live as
@@ -137,7 +146,7 @@ pub fn main() !void {
         frame.render_pass,
         ocean.camera_ubo.handle,
         &palette,
-        pax_total_count + grid_slot_count + cli.anchorage_pieces + cli.m12_chars,
+        pax_total_count + grid_slot_count + cli.anchorage_pieces + cli.m12_chars + cli.m1_6_ships + cli.m1_6_emitters * m1_6_particles_per_emitter,
     );
     defer instanced.deinit();
     instanced.setCullEnabled(!cli.no_cull);
@@ -545,6 +554,116 @@ pub fn main() !void {
         );
     }
 
+    // M1.6: spawn N static ship-scaled box instances across a wide
+    // harbor patch. Deterministic placement keeps the diff-against-
+    // M27 reproducible. Hull dims chosen to roughly match the
+    // Sloop/Schooner v0 silhouettes (~15 × 3 × 5 m) — the gate
+    // measures Instanced renderer load at design-cap scene density,
+    // NOT visual fidelity. Boxes are static; ship physics has its
+    // own gate at M1.5 and runs in ship-sim, not here.
+    if (cli.m1_6_ships > 0) {
+        var prng_ships = std.Random.DefaultPrng.init(0x5111_5111);
+        const rng_ships = prng_ships.random();
+        // Ships ring at radius 180-280 m, well outside the anchorage
+        // (centered ~120 m down +X with r=50 m) and outside the
+        // M12 char far band (~120-200 m). No visual overlap.
+        const ship_r_min: f32 = 180.0;
+        const ship_r_max: f32 = 280.0;
+        const hull_x: f32 = 15.0;
+        const hull_y: f32 = 3.0;
+        const hull_z: f32 = 5.0;
+        var s: u32 = 0;
+        while (s < cli.m1_6_ships) : (s += 1) {
+            const r: f32 = ship_r_min + (ship_r_max - ship_r_min) * rng_ships.float(f32);
+            const theta: f32 = rng_ships.float(f32) * std.math.tau;
+            const px: f32 = r * @cos(theta);
+            const pz: f32 = r * @sin(theta);
+            const py: f32 = 0.0; // waterline
+            // Yaw the ship roughly along the tangent of its ring
+            // so the fleet looks like it's drifting around the
+            // harbor, not all bow-aligned to +X.
+            const yaw: f32 = theta + std.math.pi * 0.5;
+            const cy: f32 = @cos(yaw);
+            const sy: f32 = @sin(yaw);
+            // Column-major TRS = T · R_y · S(hull_x, hull_y, hull_z)
+            const model: [16]f32 = .{
+                cy * hull_x,  0,       -sy * hull_x, 0,
+                0,            hull_y,  0,            0,
+                sy * hull_z,  0,       cy * hull_z,  0,
+                px,           py,      pz,           1,
+            };
+            const albedo: [4]f32 = .{
+                0.30 + 0.15 * rng_ships.float(f32), // weathered hull
+                0.20 + 0.10 * rng_ships.float(f32),
+                0.15 + 0.10 * rng_ships.float(f32),
+                1.0,
+            };
+            _ = try instanced.addInstance(0, model, albedo);
+        }
+        std.log.info(
+            "M1.6 ships: {d} static box-ships at r∈[{d:.0}, {d:.0}] m (hull {d:.1}×{d:.1}×{d:.1} m)",
+            .{ cli.m1_6_ships, ship_r_min, ship_r_max, hull_x, hull_y, hull_z },
+        );
+    }
+
+    // M1.6: disposable particle billboard stub. Each emitter has K
+    // particles cycling on deterministic ballistic-ish paths;
+    // CPU writes a fresh transform to every particle every frame
+    // (~2000 transform writes/frame at the design cap). Loops every
+    // emitter_lifetime seconds so the scene is stationary on
+    // average. **DELETE WHEN M17 LANDS** — real particles will
+    // be GPU-compute spawn, not CPU-bound transform writes.
+    const M16Emitter = struct {
+        origin: [3]f32,
+        // Per-emitter base seed mixed with particle index to keep
+        // velocity directions deterministic + varied.
+        seed: u32,
+        // First instance slot owned by this emitter (K consecutive).
+        base_slot: u32,
+    };
+    var m1_6_emitters: []M16Emitter = &.{};
+    defer gpa.free(m1_6_emitters);
+    const m1_6_particle_lifetime: f32 = 1.5; // seconds
+    if (cli.m1_6_emitters > 0) {
+        m1_6_emitters = try gpa.alloc(M16Emitter, cli.m1_6_emitters);
+        var prng_em = std.Random.DefaultPrng.init(0xE211_7711);
+        const rng_em = prng_em.random();
+        // Emitters scattered across a 300 × 300 m harbor patch
+        // centered on the ship spawn. Y = ~3 m so particles arc
+        // upward visibly above the deck plane.
+        const patch_half: f32 = 150.0;
+        var e: u32 = 0;
+        while (e < cli.m1_6_emitters) : (e += 1) {
+            const ex: f32 = (rng_em.float(f32) * 2.0 - 1.0) * patch_half;
+            const ez: f32 = (rng_em.float(f32) * 2.0 - 1.0) * patch_half;
+            const ey: f32 = 3.0;
+            const base_slot: u32 = instanced.activeCount();
+            // Pre-allocate K instance slots at neutral transforms;
+            // the per-frame update overwrites them.
+            const small: f32 = 0.15;
+            const albedo: [4]f32 = .{ 1.0, 0.8, 0.3, 1.0 }; // ember-ish
+            var k: u32 = 0;
+            while (k < m1_6_particles_per_emitter) : (k += 1) {
+                const m: [16]f32 = .{
+                    small, 0, 0, 0,
+                    0, small, 0, 0,
+                    0, 0, small, 0,
+                    ex, ey, ez, 1,
+                };
+                _ = try instanced.addInstance(0, m, albedo);
+            }
+            m1_6_emitters[e] = .{
+                .origin = .{ ex, ey, ez },
+                .seed = rng_em.int(u32),
+                .base_slot = base_slot,
+            };
+        }
+        std.log.info(
+            "M1.6 emitters: {d} × {d} particles = {d} CPU-bound slots (DISPOSABLE STUB — delete at M17)",
+            .{ cli.m1_6_emitters, m1_6_particles_per_emitter, cli.m1_6_emitters * m1_6_particles_per_emitter },
+        );
+    }
+
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -562,6 +681,7 @@ pub fn main() !void {
     var pax_soak: PaxSoakStats = .{};
     var frame_soak: FrameSoakStats = .{};
     var m12_soak: M12SoakStats = .{};
+    var m1_6_soak: M16SoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -900,6 +1020,45 @@ pub fn main() !void {
             if (cli.soak_seconds > 0) m12_soak.observe(&sys.last);
         }
 
+        // M1.6: particle billboard stub update. CPU-bound transform
+        // writes for every particle every frame. Timed separately so
+        // the M1.6 gate can isolate this subsystem's cost against the
+        // per-component 2 ms budget. **DISPOSABLE — delete at M17.**
+        if (m1_6_emitters.len > 0) {
+            const m1_6_t0 = std.time.nanoTimestamp();
+            for (m1_6_emitters) |em| {
+                var k: u32 = 0;
+                while (k < m1_6_particles_per_emitter) : (k += 1) {
+                    // Per-particle phase derived from emitter seed +
+                    // particle index — deterministic, varied.
+                    const seed_k: u32 = em.seed +% (k *% 0x9E37_79B1);
+                    const phase: f32 = @as(f32, @floatFromInt(seed_k & 0xFFFF)) * (std.math.tau / 65536.0);
+                    // Cycle the particle's age through the lifetime.
+                    const age_raw: f32 = @mod(t + phase, m1_6_particle_lifetime);
+                    // Initial velocity direction (deterministic per particle).
+                    const dir_a: f32 = @as(f32, @floatFromInt((seed_k >> 16) & 0xFFFF)) * (std.math.tau / 65536.0);
+                    const speed: f32 = 1.5;
+                    const vx: f32 = @cos(dir_a) * speed;
+                    const vz: f32 = @sin(dir_a) * speed;
+                    const vy: f32 = 3.0; // launch upward
+                    const g: f32 = 4.0; // gentle gravity
+                    const px: f32 = em.origin[0] + vx * age_raw;
+                    const pz: f32 = em.origin[2] + vz * age_raw;
+                    const py: f32 = em.origin[1] + vy * age_raw - 0.5 * g * age_raw * age_raw;
+                    const small: f32 = 0.15;
+                    const m: [16]f32 = .{
+                        small, 0, 0, 0,
+                        0, small, 0, 0,
+                        0, 0, small, 0,
+                        px, py, pz, 1,
+                    };
+                    instanced.updateTransform(em.base_slot + k, m);
+                }
+            }
+            const m1_6_ns: u64 = @intCast(std.time.nanoTimestamp() - m1_6_t0);
+            if (cli.soak_seconds > 0) m1_6_soak.observe(m1_6_ns);
+        }
+
         // M10.3: CPU bucket/scatter/upload runs BEFORE `frame.draw` so the
         // indirect + instance buffers are visible to the compute culler
         // (which dispatches in `prePass` outside the render pass).
@@ -958,6 +1117,15 @@ pub fn main() !void {
             cli,
             frame_soak.avgMs(),
             frame_soak.percentileMs(99.0),
+        );
+        // M1.6 synthetic-harbor gate. Composes the M10/M11/M12 gates
+        // into one report + adds the particle stub's CPU cost.
+        m1_6_soak.report(
+            cli,
+            frame_soak.avgMs(),
+            frame_soak.percentileMs(99.0),
+            m12_soak.avgMs(),
+            m12_soak.percentileMs(99.0),
         );
     }
 }
@@ -1267,6 +1435,19 @@ const Cli = struct {
     /// rig stand-in). §12 calls for "reduced rig" without naming a
     /// count; 8 is a reasonable v0 placeholder.
     m12_mid_bones: u32 = 8,
+    /// M1.6: spawn N static ship-scaled Instanced boxes across a
+    /// wide harbor patch. 0 = disabled. Hull dims ~15 × 3 × 5 m.
+    /// No physics, no buoyancy — pure renderer load. The 30-ship
+    /// M1.6 design cap matches the `docs/04-roadmap.md` Phase 2
+    /// stress-test description.
+    m1_6_ships: u32 = 0,
+    /// M1.6: spawn N CPU-billboard "particle emitter" stubs. 0 =
+    /// disabled. Each emitter writes a small fixed billboard quad
+    /// set per frame. **This is a disposable stub** — real
+    /// particle system is M17 (Phase 2.5). The stub gives a
+    /// directional headroom signal only; treat as such in the
+    /// findings doc.
+    m1_6_emitters: u32 = 0,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1327,6 +1508,12 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--m12-mid-bones")) {
             const v = args.next() orelse return error.MissingM12MidBonesValue;
             cli.m12_mid_bones = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--m1_6-ships")) {
+            const v = args.next() orelse return error.MissingM16ShipsValue;
+            cli.m1_6_ships = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--m1_6-emitters")) {
+            const v = args.next() orelse return error.MissingM16EmittersValue;
+            cli.m1_6_emitters = try std.fmt.parseInt(u32, v, 10);
         }
     }
     return cli;
@@ -1878,6 +2065,119 @@ const M12SoakStats = struct {
             if (gate_avg) "PASS" else "FAIL",
             if (gate_p99) "PASS" else "FAIL",
         });
+        if (!cli.uncap) {
+            std.log.warn("  ^ FIFO mode: rerun with --uncap for honest frametime gate", .{});
+        }
+    }
+};
+
+/// M1.6 synthetic-harbor-stress soak. Tracks the per-frame CPU cost
+/// of the particle stub + composes the per-subsystem 2 ms gate
+/// from the existing M10/M11/M12 soak stats. **DISPOSABLE alongside
+/// the particle stub — delete at M17 once the real particle system
+/// has its own gate.**
+const M16SoakStats = struct {
+    const bin_count: usize = 500;
+    const bin_width_us: f64 = 10.0;
+
+    bins: [bin_count]u32 = .{0} ** bin_count,
+    samples: u64 = 0,
+    sum_ns: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn observe(self: *M16SoakStats, ns: u64) void {
+        self.samples += 1;
+        self.sum_ns += ns;
+        if (ns > self.max_ns) self.max_ns = ns;
+        const us: f64 = @as(f64, @floatFromInt(ns)) / 1.0e3;
+        var bin: usize = @intFromFloat(@floor(us / bin_width_us));
+        if (bin >= bin_count) bin = bin_count - 1;
+        self.bins[bin] +%= 1;
+    }
+
+    fn avgMs(self: *const M16SoakStats) f64 {
+        if (self.samples == 0) return 0;
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        return (@as(f64, @floatFromInt(self.sum_ns)) / @as(f64, @floatFromInt(self.samples))) * ns_to_ms;
+    }
+
+    fn percentileMs(self: *const M16SoakStats, p: f64) f64 {
+        if (self.samples == 0) return 0;
+        const target = @as(f64, @floatFromInt(self.samples)) * (p / 100.0);
+        var cumulative: f64 = 0;
+        var i: usize = 0;
+        while (i < bin_count) : (i += 1) {
+            cumulative += @as(f64, @floatFromInt(self.bins[i]));
+            if (cumulative >= target) {
+                return ((@as(f64, @floatFromInt(i)) + 0.5) * bin_width_us) / 1000.0;
+            }
+        }
+        return (@as(f64, bin_count) * bin_width_us) / 1000.0;
+    }
+
+    fn report(
+        self: *const M16SoakStats,
+        cli: Cli,
+        frame_avg_ms: f64,
+        frame_p99_ms: f64,
+        m12_avg_ms: f64,
+        m12_p99_ms: f64,
+    ) void {
+        std.log.info("==== M1.6 synthetic-harbor gate harness ====", .{});
+        const has_structures = cli.anchorage_pieces > 0;
+        const has_ships = cli.m1_6_ships > 0;
+        const has_chars = cli.m12_chars > 0;
+        const has_emitters = cli.m1_6_emitters > 0;
+        std.log.info(
+            "  scene: {d} structures + {d} ships + {d} chars + {d} emitters × {d} particles = {d} instanced slots",
+            .{
+                cli.anchorage_pieces,
+                cli.m1_6_ships,
+                cli.m12_chars,
+                cli.m1_6_emitters,
+                m1_6_particles_per_emitter,
+                cli.anchorage_pieces + cli.m1_6_ships + cli.m12_chars + cli.m1_6_emitters * m1_6_particles_per_emitter,
+            },
+        );
+
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        const particle_avg_ms = self.avgMs();
+        const particle_p99_ms = self.percentileMs(99.0);
+        const particle_max_ms = @as(f64, @floatFromInt(self.max_ns)) * ns_to_ms;
+        if (has_emitters) {
+            std.log.info(
+                "  particle stub (DISPOSABLE): avg {d:.3} ms  p99 {d:.3} ms  max {d:.3} ms  ({d} ticks)",
+                .{ particle_avg_ms, particle_p99_ms, particle_max_ms, self.samples },
+            );
+        }
+
+        // Per-subsystem 2 ms gate (the spec line: "any subsystem
+        // >2 ms gets fixed before content"). M10/M11 measured via
+        // frame budget; M12 has its own soak; particle stub here.
+        const gate_frame_avg = frame_avg_ms <= 16.67;
+        const gate_frame_p99 = frame_p99_ms <= 16.67;
+        const gate_m12 = m12_avg_ms <= 2.0 and m12_p99_ms <= 2.0;
+        const gate_particle = (!has_emitters) or (particle_avg_ms <= 2.0 and particle_p99_ms <= 2.0);
+        // Composition completeness — the M1.6 scene must include
+        // all four spec components (modulo emitters being a stub).
+        const gate_composition = has_structures and has_ships and has_chars;
+
+        std.log.info(
+            "  gate: composition {s} | frame-avg≤16.67ms {s} | frame-p99≤16.67ms {s} | m12-cpu≤2ms {s} | particle-stub≤2ms {s}",
+            .{
+                if (gate_composition) "PASS" else "FAIL (missing component — set --anchorage-pieces / --m1_6-ships / --m12-chars)",
+                if (gate_frame_avg) "PASS" else "FAIL",
+                if (gate_frame_p99) "PASS" else "FAIL",
+                if (gate_m12) "PASS" else "FAIL",
+                if (gate_particle) "PASS" else "FAIL",
+            },
+        );
+        if (has_emitters) {
+            std.log.warn(
+                "  ^ particle subsystem is a DISPOSABLE CPU-bound stub. Real particles (M17) will be GPU-compute; perf shape differs. Numbers here are directional headroom only.",
+                .{},
+            );
+        }
         if (!cli.uncap) {
             std.log.warn("  ^ FIFO mode: rerun with --uncap for honest frametime gate", .{});
         }
