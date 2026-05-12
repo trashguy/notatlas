@@ -25,6 +25,7 @@ const gpu_mod = @import("gpu.zig");
 const buffer_mod = @import("buffer.zig");
 const shader_mod = @import("shader.zig");
 const palette_mod = @import("mesh_palette.zig");
+const instanced_mod = @import("instanced.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -708,6 +709,209 @@ fn normalize3(v: [3]f32) [3]f32 {
     return .{ v[0] * inv, v[1] * inv, v[2] * inv };
 }
 
+// --- M11.2 Anchorage + LOD switch ---
+
+/// One piece's contribution to an anchorage cluster, cached so the
+/// near-LOD path can re-instantiate the pieces after a far→near
+/// transition without re-deriving transforms.
+pub const PieceRef = struct {
+    piece_id: u32,
+    model: [16]f32,
+    albedo: [4]f32,
+};
+
+pub const LodTier = enum { near, far };
+
+/// The result of a LOD evaluation. Caller acts on transitions to
+/// instance/destroy pieces in the `Instanced` renderer; otherwise the
+/// per-frame render path just reads `shouldDrawMerged()`.
+pub const LodTransition = enum { unchanged, became_near, became_far };
+
+/// One anchorage cluster — a fixed list of static pieces with a baked
+/// MergedMesh + per-frame LOD selection.
+///
+/// State machine:
+///   far  ⇄  near
+///         (hysteresis: enter near when dist < threshold*(1-h);
+///          enter far when dist > threshold*(1+h); h=0.1)
+///
+/// Hysteresis prevents thrashing at the boundary when the camera
+/// drifts across the threshold from frame to frame. `force_far`
+/// overrides distance entirely — useful for the M11.4 gate harness
+/// which needs to measure the merged-path frametime regardless of
+/// where the camera sits.
+///
+/// Lifecycle ownership:
+///   - `pieces` slice is OWNED (allocated by init, freed by deinit).
+///   - `merged` is OWNED (deinit'd by deinit).
+///   - `instance_ids` list is OWNED; the InstanceIds inside refer to
+///     slots in the externally-owned `Instanced` renderer.
+///
+/// Starts in `.far` with no instances. Caller drives `selectLod()`
+/// each frame; the returned transition tells the caller to either
+/// re-spawn instances (became_near) or destroy them (became_far).
+pub const Anchorage = struct {
+    gpa: std.mem.Allocator,
+    id: u64,
+    pieces: []PieceRef,
+    merged: MergedMesh,
+    instance_ids: std.ArrayList(instanced_mod.InstanceId),
+    tier: LodTier = .far,
+    force_far: bool = false,
+
+    /// Hysteresis fraction. dist > threshold*(1+h) → far; dist <
+    /// threshold*(1-h) → near. 10% is wide enough to swallow camera
+    /// jitter at the boundary; tighter narrows the dead band.
+    pub const lod_hysteresis: f32 = 0.10;
+
+    /// Build the merged mesh + cache the piece refs. Anchorage starts
+    /// in `.far` tier (no instances spawned); caller must call
+    /// `selectLod` on the first frame to settle it. Albedos are
+    /// [4]f32 (with unused .w) so the same array shape passes to
+    /// `Instanced.addInstance`.
+    pub fn init(
+        gpa: std.mem.Allocator,
+        gpu: *const gpu_mod.GpuContext,
+        id: u64,
+        pieces_meshes: []const palette_mod.PieceMesh,
+        refs: []const PieceRef,
+    ) MergeError!Anchorage {
+        std.debug.assert(refs.len == pieces_meshes.len);
+
+        // Build parallel transform + albedo slices so mergeCluster
+        // sees the same memory shape it expects.
+        const transforms = try gpa.alloc(Mat4, refs.len);
+        defer gpa.free(transforms);
+        const albedos = try gpa.alloc([4]f32, refs.len);
+        defer gpa.free(albedos);
+        for (refs, 0..) |ref, i| {
+            transforms[i] = .{ .data = ref.model };
+            albedos[i] = ref.albedo;
+        }
+
+        var merged = try MergedMesh.initFromJob(gpu, gpa, .{
+            .pieces = pieces_meshes,
+            .transforms = transforms,
+            .albedos = albedos,
+        });
+        errdefer merged.deinit();
+
+        const owned_pieces = try gpa.alloc(PieceRef, refs.len);
+        errdefer gpa.free(owned_pieces);
+        @memcpy(owned_pieces, refs);
+
+        return .{
+            .gpa = gpa,
+            .id = id,
+            .pieces = owned_pieces,
+            .merged = merged,
+            .instance_ids = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Anchorage) void {
+        self.instance_ids.deinit(self.gpa);
+        self.merged.deinit();
+        self.gpa.free(self.pieces);
+    }
+
+    pub fn setForceFar(self: *Anchorage, on: bool) void {
+        self.force_far = on;
+    }
+
+    /// Distance from camera to the cluster's nearest visible point
+    /// (centroid distance minus the bounding sphere radius — negative
+    /// when camera is inside the bounding sphere, in which case we
+    /// definitely want near-LOD). Cheaper than a per-piece test and
+    /// safe for the hysteresis band (the radius adds a constant
+    /// offset; the *transitions* still happen at the configured
+    /// threshold in real distance terms).
+    pub fn distanceToCamera(self: *const Anchorage, camera_eye: Vec3) f32 {
+        const dx = self.merged.centroid.x - camera_eye.x;
+        const dy = self.merged.centroid.y - camera_eye.y;
+        const dz = self.merged.centroid.z - camera_eye.z;
+        const d = @sqrt(dx * dx + dy * dy + dz * dz);
+        return d - self.merged.radius;
+    }
+
+    /// Evaluate which tier the anchorage should be in this frame and
+    /// commit the transition (if any) on the internal state. Returns
+    /// the transition so the caller can spawn/destroy instances.
+    /// `threshold` is the distance (m) at which LOD swaps from near
+    /// to far; the hysteresis band sits ±10% around it.
+    pub fn selectLod(self: *Anchorage, camera_eye: Vec3, threshold: f32) LodTransition {
+        if (self.force_far) {
+            if (self.tier == .near) {
+                self.tier = .far;
+                return .became_far;
+            }
+            return .unchanged;
+        }
+
+        const dist = self.distanceToCamera(camera_eye);
+        const enter_near: f32 = threshold * (1.0 - lod_hysteresis);
+        const enter_far: f32 = threshold * (1.0 + lod_hysteresis);
+
+        switch (self.tier) {
+            .far => if (dist < enter_near) {
+                self.tier = .near;
+                return .became_near;
+            },
+            .near => if (dist > enter_far) {
+                self.tier = .far;
+                return .became_far;
+            },
+        }
+        return .unchanged;
+    }
+
+    /// True iff the anchorage should render via the merged-mesh draw
+    /// this frame. Mirror image of "are instances present" — when
+    /// instance_ids is empty the merged path is the only thing that
+    /// covers the pieces.
+    pub fn shouldDrawMerged(self: *const Anchorage) bool {
+        return self.tier == .far;
+    }
+
+    /// Spawn one `Instanced` slot per cached piece. Caller must invoke
+    /// this immediately after `selectLod` returns `.became_near`.
+    /// Errors are propagated; partial spawns are OK to leave in place
+    /// (free-list will reclaim on next destroy). Logs are caller's
+    /// concern.
+    pub fn spawnInstances(
+        self: *Anchorage,
+        instanced: *instanced_mod.Instanced,
+    ) instanced_mod.InstancedError!void {
+        std.debug.assert(self.instance_ids.items.len == 0);
+        try self.instance_ids.ensureTotalCapacity(self.gpa, self.pieces.len);
+        for (self.pieces) |ref| {
+            const id = try instanced.addInstance(ref.piece_id, ref.model, ref.albedo);
+            self.instance_ids.appendAssumeCapacity(id);
+        }
+    }
+
+    /// Drop all cached `Instanced` slots back to the free list. Caller
+    /// invokes after `selectLod` returns `.became_far`. Safe to call
+    /// on an empty list (no-op).
+    pub fn destroyInstances(
+        self: *Anchorage,
+        instanced: *instanced_mod.Instanced,
+    ) void {
+        for (self.instance_ids.items) |id| {
+            instanced.destroy(id) catch |err| {
+                // The only failure here is a tombstoned id, which
+                // means somebody else already destroyed our slot —
+                // shouldn't happen, but we'd rather log than crash.
+                std.log.warn(
+                    "anchorage[{d}]: destroy id={d} failed: {s}",
+                    .{ self.id, id, @errorName(err) },
+                );
+            };
+        }
+        self.instance_ids.clearRetainingCapacity();
+    }
+};
+
 // --- tests ---
 
 test "mergeCluster bakes positions and rebases indices" {
@@ -806,6 +1010,89 @@ test "mergeCluster computes centroid + radius bounding sphere" {
 
     try t.expectApproxEqAbs(@as(f32, 0), stats.centroid.x, 1e-5);
     try t.expectApproxEqAbs(@as(f32, 10), stats.radius, 1e-5);
+}
+
+test "Anchorage hysteresis prevents thrashing near the threshold" {
+    const t = std.testing;
+    // Synthetic Anchorage — bypass the GPU-bound init() by hand-rolling
+    // an instance with a dummy MergedMesh that has known centroid/radius
+    // (the LOD math reads only those two fields plus tier+force_far).
+    // We can't ALLOCATE a MergedMesh in a test (it'd need a Vulkan
+    // device), so we test the state-machine arithmetic on a synthetic
+    // pair of (centroid, radius) embedded in a zero-init struct.
+    var anchorage: Anchorage = .{
+        .gpa = std.testing.allocator,
+        .id = 0,
+        .pieces = &.{},
+        .merged = .{
+            .vertex_buffer = undefined,
+            .index_buffer = undefined,
+            .vertex_count = 0,
+            .index_count = 0,
+            .centroid = Vec3.init(0, 0, 0),
+            .radius = 0,
+        },
+        .instance_ids = .empty,
+        .tier = .far,
+    };
+
+    const threshold: f32 = 100.0;
+    // Approach from far away — at 200 m we're solidly past
+    // 1.1*threshold (110 m); stays in `.far`.
+    try t.expectEqual(LodTransition.unchanged, anchorage.selectLod(Vec3.init(200, 0, 0), threshold));
+    try t.expectEqual(LodTier.far, anchorage.tier);
+
+    // Crossing inward — at 95 m (still > 90 m = 0.9·threshold) we
+    // remain in `.far` because we haven't crossed the inner hysteresis
+    // edge.
+    try t.expectEqual(LodTransition.unchanged, anchorage.selectLod(Vec3.init(95, 0, 0), threshold));
+    try t.expectEqual(LodTier.far, anchorage.tier);
+
+    // Below 90 m — became_near transition.
+    try t.expectEqual(LodTransition.became_near, anchorage.selectLod(Vec3.init(80, 0, 0), threshold));
+    try t.expectEqual(LodTier.near, anchorage.tier);
+
+    // Drifting outward to 105 m (within dead band: 90 < 105 < 110) —
+    // stays in `.near`.
+    try t.expectEqual(LodTransition.unchanged, anchorage.selectLod(Vec3.init(105, 0, 0), threshold));
+    try t.expectEqual(LodTier.near, anchorage.tier);
+
+    // Past 110 m — became_far.
+    try t.expectEqual(LodTransition.became_far, anchorage.selectLod(Vec3.init(120, 0, 0), threshold));
+    try t.expectEqual(LodTier.far, anchorage.tier);
+
+    // force_far overrides: even at 0 m we stay far.
+    anchorage.setForceFar(true);
+    try t.expectEqual(LodTransition.unchanged, anchorage.selectLod(Vec3.init(0, 0, 0), threshold));
+    try t.expectEqual(LodTier.far, anchorage.tier);
+
+    // Sneak into near manually then verify force_far yanks us out.
+    anchorage.tier = .near;
+    try t.expectEqual(LodTransition.became_far, anchorage.selectLod(Vec3.init(0, 0, 0), threshold));
+    try t.expectEqual(LodTier.far, anchorage.tier);
+}
+
+test "Anchorage distanceToCamera subtracts bounding radius" {
+    const t = std.testing;
+    var anchorage: Anchorage = .{
+        .gpa = std.testing.allocator,
+        .id = 0,
+        .pieces = &.{},
+        .merged = .{
+            .vertex_buffer = undefined,
+            .index_buffer = undefined,
+            .vertex_count = 0,
+            .index_count = 0,
+            .centroid = Vec3.init(100, 0, 0),
+            .radius = 20,
+        },
+        .instance_ids = .empty,
+        .tier = .far,
+    };
+    // Camera at origin: centroid dist 100, minus 20 m radius → 80.
+    try t.expectApproxEqAbs(@as(f32, 80.0), anchorage.distanceToCamera(Vec3.init(0, 0, 0)), 1e-4);
+    // Camera inside bounding sphere: dist 5, minus 20 → -15.
+    try t.expectApproxEqAbs(@as(f32, -15.0), anchorage.distanceToCamera(Vec3.init(95, 0, 0)), 1e-4);
 }
 
 test "measureCluster errors on slice mismatch" {

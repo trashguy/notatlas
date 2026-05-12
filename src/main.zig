@@ -49,12 +49,12 @@ const Scene = struct {
     instanced: *render.Instanced,
     arrows: *render.WindArrows,
     /// M11.1: merged-mesh renderer for far-LOD anchorages. Always init'd;
-    /// per-frame only records draws if `anchorage_mesh` is set.
+    /// per-frame only records draws if an anchorage is in far-LOD.
     merged_renderer: *render.MergedMeshRenderer,
-    /// M11.1: optional anchorage merged-mesh. null when `--anchorage-pieces`
-    /// is 0; set at startup to a single pre-baked cluster otherwise. LOD
-    /// switching (M11.2) lands later; for now if set, it renders.
-    anchorage_mesh: ?*render.MergedMesh = null,
+    /// M11.2: optional anchorage. null when `--anchorage-pieces` is 0.
+    /// Per-frame `selectLod()` toggles between instanced (near) and
+    /// merged (far) rendering paths.
+    anchorage: ?*render.cluster_merge.Anchorage = null,
     /// M10.3: per-frame view-projection used by the GPU cull pass.
     /// Populated in the main loop right after `ocean.updateCamera`; read
     /// by prePass to upload frustum planes for the compute dispatch.
@@ -125,9 +125,11 @@ pub fn main() !void {
     var palette = try render.MeshPalette.init(gpa, &gpu, palette_pieces);
     defer palette.deinit();
 
-    // Reserve slots for ship + passengers + the optional NxN stress grid.
-    // Grid slots only allocated if --instance-grid > 0; the SSBO sizes for
-    // the high-water mark either way.
+    // Reserve slots for ship + passengers + the optional NxN stress grid
+    // + the optional M11.2 anchorage (which only consumes Instanced slots
+    // when in near-LOD; reserved up-front to avoid allocator churn on
+    // every LOD transition). The SSBO sizes for the high-water mark
+    // either way.
     const grid_slot_count: u32 = cli.instance_grid * cli.instance_grid;
     var instanced = try render.Instanced.init(
         gpa,
@@ -135,7 +137,7 @@ pub fn main() !void {
         frame.render_pass,
         ocean.camera_ubo.handle,
         &palette,
-        pax_total_count + grid_slot_count,
+        pax_total_count + grid_slot_count + cli.anchorage_pieces,
     );
     defer instanced.deinit();
     instanced.setCullEnabled(!cli.no_cull);
@@ -329,13 +331,15 @@ pub fn main() !void {
         );
     }
 
-    // M11.1 anchorage cluster. When --anchorage-pieces N > 0, generate
-    // a deterministic cluster of N pieces inside a `--anchorage-radius`
-    // disc centered ~120 m down +X from spawn, bake into one merged mesh,
-    // and render via the far-LOD path. No instanced-path slot is consumed
-    // for these pieces in M11.1 — LOD switching (M11.2) lands next.
-    var anchorage_mesh: ?render.MergedMesh = null;
-    defer if (anchorage_mesh) |*m| m.deinit();
+    // M11.1/M11.2 anchorage cluster. When --anchorage-pieces N > 0,
+    // build a deterministic cluster of N pieces inside a
+    // `--anchorage-radius` disc centered ~120 m down +X from spawn.
+    // M11.1 baked once and always rendered via merged path; M11.2 wraps
+    // it in an Anchorage state machine that toggles between the
+    // instanced (near) and merged (far) paths each frame based on
+    // camera distance + a 10% hysteresis band.
+    var anchorage: ?render.cluster_merge.Anchorage = null;
+    defer if (anchorage) |*a| a.deinit();
     if (cli.anchorage_pieces > 0) {
         if (cli.anchorage_piece_types > cli.piece_types) {
             std.log.warn(
@@ -350,10 +354,8 @@ pub fn main() !void {
         var rng = std.Random.DefaultPrng.init(0xA10C0A8E);
         const r = rng.random();
 
-        const transforms = try gpa.alloc(notatlas.math.Mat4, n);
-        defer gpa.free(transforms);
-        const albedos = try gpa.alloc([4]f32, n);
-        defer gpa.free(albedos);
+        const refs = try gpa.alloc(render.cluster_merge.PieceRef, n);
+        defer gpa.free(refs);
         const pieces_for_merge = try gpa.alloc(render.mesh_palette.PieceMesh, n);
         defer gpa.free(pieces_for_merge);
 
@@ -380,7 +382,7 @@ pub fn main() !void {
             );
             const s_half = @sin(yaw * 0.5);
             const c_half = @cos(yaw * 0.5);
-            transforms[k] = notatlas.math.Mat4.trs(
+            const m = notatlas.math.Mat4.trs(
                 pos,
                 .{ 0, s_half, 0, c_half },
                 notatlas.math.Vec3.init(scale_xz, scale_y, scale_xz),
@@ -389,43 +391,45 @@ pub fn main() !void {
             // Albedo: warm dockside palette banded by piece type.
             const tier: f32 = @as(f32, @floatFromInt(k % types_used)) /
                 @as(f32, @floatFromInt(types_used));
-            albedos[k] = .{
+            const albedo: [4]f32 = .{
                 0.55 + 0.30 * tier,
                 0.40 + 0.20 * (1.0 - tier),
                 0.30 + 0.40 * r.float(f32),
                 0,
             };
 
+            const piece_id: u32 = k % types_used;
+            refs[k] = .{ .piece_id = piece_id, .model = m.data, .albedo = albedo };
             // Round-robin across piece types — same pattern as the M10
             // instance-grid case so each piece-type bucket gets used.
-            pieces_for_merge[k] = palette_pieces[k % types_used];
+            pieces_for_merge[k] = palette_pieces[piece_id];
         }
 
         var merge_timer = try std.time.Timer.start();
-        anchorage_mesh = try render.cluster_merge.MergedMesh.initFromJob(
-            &gpu,
+        anchorage = try render.cluster_merge.Anchorage.init(
             gpa,
-            .{
-                .pieces = pieces_for_merge,
-                .transforms = transforms,
-                .albedos = albedos,
-            },
+            &gpu,
+            0xA10C0A8E,
+            pieces_for_merge,
+            refs,
         );
         const merge_ns = merge_timer.read();
-        const m = &anchorage_mesh.?;
+        const a = &anchorage.?;
+        a.setForceFar(cli.force_far);
         std.log.info(
-            "M11 anchorage: {d} pieces × {d} types in r={d:.1} m → {d} verts / {d} idx; merge {d:.2} ms (bounding r={d:.1} m)",
+            "M11 anchorage: {d} pieces × {d} types in r={d:.1} m → {d} verts / {d} idx; merge {d:.2} ms (bounding r={d:.1} m){s}",
             .{
                 n,
                 types_used,
                 radius,
-                m.vertex_count,
-                m.index_count,
+                a.merged.vertex_count,
+                a.merged.index_count,
                 @as(f64, @floatFromInt(merge_ns)) / 1.0e6,
-                m.radius,
+                a.merged.radius,
+                if (cli.force_far) " [force-far]" else "",
             },
         );
-        scene.anchorage_mesh = m;
+        scene.anchorage = a;
     }
 
     var last_cursor: ?[2]f64 = null;
@@ -449,6 +453,10 @@ pub fn main() !void {
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
     // first frame because it bundles loop-preamble + Vulkan warm-up.
     var perf: PerfWindow = .{};
+
+    // M11.2 L-key edge detection for the force-far override toggle.
+    // Held key = no repeat; release-then-press is one transition.
+    var last_l_state: zglfw.Action = .release;
 
     // RenderDoc capture: warm up for `capture_warmup_frames` to let pipeline
     // caches settle, then capture exactly one frame and exit. Frame 30 puts
@@ -659,6 +667,42 @@ pub fn main() !void {
         // matrices the ocean UBO got — guarantees cull frustum matches
         // what the camera actually shows.
         scene.view_proj = notatlas.math.Mat4.mul(camera.projection(), camera.view());
+
+        // M11.2: per-frame LOD selection for the anchorage. L toggles a
+        // force-far override useful for visual A/B inspection of the
+        // merged path. Transitions spawn/destroy instances in the
+        // `Instanced` renderer so the same scene round-trips both
+        // paths without leaking slots.
+        if (anchorage) |*a| {
+            const l_state = window.handle.getKey(.l);
+            if (l_state == .press and last_l_state == .release) {
+                const new_force = !a.force_far;
+                a.setForceFar(new_force);
+                std.log.info("anchorage[{d}]: force-far {s}", .{
+                    a.id, if (new_force) "ON" else "OFF",
+                });
+            }
+            last_l_state = l_state;
+
+            const transition = a.selectLod(world_eye, cli.anchorage_lod_distance);
+            switch (transition) {
+                .became_near => {
+                    a.spawnInstances(&instanced) catch |err| {
+                        std.log.err("anchorage[{d}] spawnInstances: {s}", .{ a.id, @errorName(err) });
+                    };
+                    std.log.info("anchorage[{d}]: became_near (dist={d:.1} m, {d} instances)", .{
+                        a.id, a.distanceToCamera(world_eye), a.instance_ids.items.len,
+                    });
+                },
+                .became_far => {
+                    a.destroyInstances(&instanced);
+                    std.log.info("anchorage[{d}]: became_far (dist={d:.1} m)", .{
+                        a.id, a.distanceToCamera(world_eye),
+                    });
+                },
+                .unchanged => {},
+            }
+        }
 
         // M10.3: CPU bucket/scatter/upload runs BEFORE `frame.draw` so the
         // indirect + instance buffers are visible to the compute culler
@@ -871,12 +915,14 @@ fn recordScene(
     // one drawIndexed per piece type (currently 1). Return is the draw-call
     // count; we discard it here — the M10.4 gate harness will sample it.
     _ = scene.instanced.record(cb, extent);
-    // M11.1: far-LOD merged anchorage(s) render as one drawIndexed each.
-    // No anchorage → no work. LOD selection (M11.2) decides when this
-    // path fires vs the instanced path; M11.1 always uses merged when
-    // anchorage_mesh is set.
-    if (scene.anchorage_mesh) |mesh| {
-        _ = scene.merged_renderer.record(cb, extent, mesh);
+    // M11.2: far-LOD merged anchorage renders as one drawIndexed.
+    // shouldDrawMerged() is true only when the anchorage is in `.far`;
+    // in `.near` the pieces ride the instanced path above and the
+    // merged buffer goes untouched this frame.
+    if (scene.anchorage) |a| {
+        if (a.shouldDrawMerged()) {
+            _ = scene.merged_renderer.record(cb, extent, &a.merged);
+        }
     }
     scene.arrows.record(cb, extent);
 }
@@ -972,6 +1018,15 @@ const Cli = struct {
     /// which piece transforms are randomized). Default 50 m matches
     /// the design cap for a single anchorage footprint.
     anchorage_radius: f32 = 50.0,
+    /// M11.2: LOD distance threshold in metres. Camera nearer than
+    /// (threshold * 0.9) of the cluster's bounding sphere → near-LOD
+    /// (per-piece instanced draws). Past (threshold * 1.1) → far-LOD
+    /// (one merged drawIndexed). 10% hysteresis around the threshold.
+    anchorage_lod_distance: f32 = 200.0,
+    /// M11.2 / M11.4: latch the anchorage into far-LOD regardless of
+    /// camera distance. The gate harness sets this so frametime
+    /// measurements reflect the merged path.
+    force_far: bool = false,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1006,6 +1061,11 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--anchorage-radius")) {
             const v = args.next() orelse return error.MissingAnchorageRadiusValue;
             cli.anchorage_radius = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--anchorage-lod-distance")) {
+            const v = args.next() orelse return error.MissingAnchorageLodDistanceValue;
+            cli.anchorage_lod_distance = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--force-far")) {
+            cli.force_far = true;
         }
     }
     return cli;
