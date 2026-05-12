@@ -328,6 +328,7 @@ pub fn build(b: *std.Build) void {
     });
     gateway_mod.addImport("notatlas", notatlas_mod);
     gateway_mod.addImport("nats", nats_mod);
+    gateway_mod.addImport("wire", wire_mod);
     const gateway = b.addExecutable(.{
         .name = "gateway",
         .root_module = gateway_mod,

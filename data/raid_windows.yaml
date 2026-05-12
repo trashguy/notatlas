@@ -1,0 +1,13 @@
+# Raid window schedule — intervals in day_fraction space [0, 1).
+# Gateway rejects logins whose current day_fraction falls outside ALL
+# listed windows (reject reason: raid_window_closed). The default
+# below is a single window covering the entire day, i.e. always-open;
+# tighten in production once the raid cadence is balanced.
+# Empty `windows:` list → gate disabled (always-open). Same effect
+# as a [0.0, 1.0] window but explicit-no-schedule.
+# Wrap-around windows are NOT supported in v0 (end must be >= start);
+# express a wrap as two windows.
+# ymlz: no blank lines.
+windows:
+  - start: 0.0
+    end: 1.0

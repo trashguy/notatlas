@@ -228,6 +228,45 @@ pub fn loadTierThresholdsFromFile(
 }
 
 // ------------------------------------------------------------
+// data/raid_windows.yaml
+// ------------------------------------------------------------
+
+/// Inclusive raid-window interval in day_fraction space [0, 1).
+/// Gateway gates logins by membership in any configured window;
+/// scheduler-side semantics live in src/services/gateway/main.zig.
+pub const RaidWindow = struct {
+    start: f32,
+    end: f32,
+};
+
+const RawRaidWindow = struct {
+    start: f32,
+    end: f32,
+};
+
+const RawRaidWindows = struct {
+    windows: []RawRaidWindow,
+};
+
+/// Caller owns the returned slice (allocated via `gpa`); free with
+/// `gpa.free(...)`. Validates each window: `0 <= start <= end <= 1`.
+/// Wrap-around (end < start) is rejected — express wraps as two
+/// windows.
+pub fn loadRaidWindowsFromFile(gpa: Allocator, abs_path: []const u8) ![]RaidWindow {
+    var parser = try ymlz.Ymlz(RawRaidWindows).init(gpa);
+    const raw = try parser.loadFile(abs_path);
+    defer parser.deinit(raw);
+
+    const out = try gpa.alloc(RaidWindow, raw.windows.len);
+    errdefer gpa.free(out);
+    for (raw.windows, 0..) |w, i| {
+        if (w.start < 0.0 or w.end > 1.0 or w.end < w.start) return error.InvalidRaidWindow;
+        out[i] = .{ .start = w.start, .end = w.end };
+    }
+    return out;
+}
+
+// ------------------------------------------------------------
 // data/ammo/<type>.yaml
 // ------------------------------------------------------------
 

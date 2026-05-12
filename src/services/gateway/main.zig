@@ -62,6 +62,7 @@
 const std = @import("std");
 const nats = @import("nats");
 const notatlas = @import("notatlas");
+const wire = @import("wire");
 const posix = std.posix;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -105,11 +106,17 @@ const max_conns: usize = 64;
 /// holding slots indefinitely; production might tune lower (~2 s).
 const hello_timeout_s: i64 = 10;
 
+const default_raid_windows_path = "data/raid_windows.yaml";
+
 const Args = struct {
     /// TCP listen port. Bound to 127.0.0.1 only — gateway is
     /// loopback-only until it's deployment-ready.
     listen_port: u16 = default_listen_port,
     nats_url: []const u8 = "nats://127.0.0.1:4222",
+    /// Path to raid-window schedule. Loaded at boot; absent file or
+    /// empty `windows:` list disables the gate (always-open). See
+    /// data/raid_windows.yaml for the format.
+    raid_windows_path: []const u8 = default_raid_windows_path,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -119,7 +126,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
     var out: Args = .{};
     var have_nats_url = false;
+    var have_raid_path = false;
     errdefer if (have_nats_url) allocator.free(out.nats_url);
+    errdefer if (have_raid_path) allocator.free(out.raid_windows_path);
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--nats")) {
             const v = args.next() orelse return error.MissingArg;
@@ -127,12 +136,17 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             have_nats_url = true;
         } else if (std.mem.eql(u8, a, "--listen-port")) {
             out.listen_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--raid-windows")) {
+            const v = args.next() orelse return error.MissingArg;
+            out.raid_windows_path = try allocator.dupe(u8, v);
+            have_raid_path = true;
         } else {
             std.debug.print("gateway: unknown arg '{s}'\n", .{a});
             return error.BadArg;
         }
     }
     if (!have_nats_url) out.nats_url = try allocator.dupe(u8, out.nats_url);
+    if (!have_raid_path) out.raid_windows_path = try allocator.dupe(u8, out.raid_windows_path);
     return out;
 }
 
@@ -405,6 +419,42 @@ fn verifyJwt(
     };
 }
 
+/// Raid-window login gate. Holds the loaded schedule plus the last
+/// `day_fraction` heard on `env.time`. Fail-open until env-sim is
+/// observed (per `feedback_graceful_degradation.md`) so a dev that
+/// boots only the gateway still gets logins through; a smoke harness
+/// that wants strict gating must boot env-sim alongside.
+const RaidWindowGate = struct {
+    windows: []const notatlas.yaml_loader.RaidWindow,
+    day_fraction: f32 = 0.0,
+    env_time_received: bool = false,
+
+    /// Returns true if logins should be allowed right now.
+    /// - empty `windows` slice → always-open (no schedule configured)
+    /// - env.time not yet received → always-open (fail-open)
+    /// - otherwise: day_fraction must lie in any [start, end] window
+    fn isOpen(self: RaidWindowGate) bool {
+        if (self.windows.len == 0) return true;
+        if (!self.env_time_received) return true;
+        for (self.windows) |w| {
+            if (self.day_fraction >= w.start and self.day_fraction <= w.end) return true;
+        }
+        return false;
+    }
+};
+
+fn drainEnvTimeSub(sub: anytype, allocator: std.mem.Allocator, gate: *RaidWindowGate) void {
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const parsed = wire.decodeTimeOfDay(allocator, payload) catch continue;
+        defer parsed.deinit();
+        gate.day_fraction = parsed.value.day_fraction;
+        gate.env_time_received = true;
+    }
+}
+
 /// Resolve the JWT signing secret. Env `NOTATLAS_JWT_SECRET` if
 /// set; otherwise a dev-default with a loud warning (the warning
 /// is the load-bearing part — production deployments should fail
@@ -428,10 +478,30 @@ pub fn main() !void {
 
     const args = try parseArgs(allocator);
     defer allocator.free(args.nats_url);
+    defer allocator.free(args.raid_windows_path);
     try installSignalHandlers();
 
     const secret = try resolveSecret(allocator);
     defer allocator.free(secret);
+
+    // Raid-window schedule. Loaded relative to CWD; consistent with
+    // other YAML loaders (env-sim's wind.yaml, ship-sim's hulls).
+    const raid_windows_abs = std.fs.cwd().realpathAlloc(allocator, args.raid_windows_path) catch |err| {
+        std.debug.print("gateway: cannot resolve raid_windows path '{s}' ({s})\n", .{ args.raid_windows_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(raid_windows_abs);
+    const raid_windows = try notatlas.yaml_loader.loadRaidWindowsFromFile(allocator, raid_windows_abs);
+    defer allocator.free(raid_windows);
+    var gate: RaidWindowGate = .{ .windows = raid_windows };
+    std.debug.print(
+        "gateway: raid-window schedule '{s}': {d} window(s) {s}\n",
+        .{
+            args.raid_windows_path,
+            raid_windows.len,
+            if (raid_windows.len == 0) "(always-open)" else "(gate fail-open until first env.time)",
+        },
+    );
 
     const listen_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, args.listen_port);
     var server = try listen_addr.listen(.{
@@ -449,6 +519,8 @@ pub fn main() !void {
     defer client.close();
     std.debug.print("gateway: connected\n", .{});
 
+    const sub_env_time = try client.subscribe("env.time", .{});
+
     var conns: Conns = .{};
     defer for (&conns.slots, 0..) |*slot, i| {
         if (slot.* != null) conns.close(i, allocator, client, "shutdown");
@@ -465,11 +537,17 @@ pub fn main() !void {
     var accepts_total: u64 = 0;
     var rejected_jwt: u64 = 0;
     var rejected_full: u64 = 0;
+    var rejected_raid_window: u64 = 0;
     var last_log_ns: u64 = @intCast(std.time.nanoTimestamp());
 
     while (g_running.load(.acquire)) {
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
+
+        // env-sim ToD update — populates the raid-window gate's
+        // day_fraction. Drained every loop iteration; the gate fail-
+        // closes only after at least one publish has been observed.
+        drainEnvTimeSub(sub_env_time, allocator, &gate);
 
         // Accept as many pending conns as we have free slots for.
         accept_loop: while (true) {
@@ -543,6 +621,19 @@ pub fn main() !void {
                             conns.close(i, allocator, client, "jwt_rejected");
                             continue;
                         };
+                        // Raid-window gate. Fails open until env-sim
+                        // is heard from (see RaidWindowGate.isOpen).
+                        // Reject is silent at the wire (same shape as
+                        // jwt_rejected) — no error frame, just close.
+                        if (!gate.isOpen()) {
+                            std.debug.print(
+                                "gateway: conn {d} rejected — raid window closed (day_fraction={d:.3})\n",
+                                .{ i, gate.day_fraction },
+                            );
+                            rejected_raid_window += 1;
+                            conns.close(i, allocator, client, "raid_window_closed");
+                            continue;
+                        }
                         c.client_id = id.client_id;
                         c.player_id = id.player_id;
                         c.character_id = id.character_id;
@@ -656,9 +747,10 @@ pub fn main() !void {
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         if (now_ns -% last_log_ns >= std.time.ns_per_s) {
             std.debug.print(
-                "[gateway] {d} active conns / {d} accepts ({d} jwt-reject, {d} full-reject) | NATS in: {d} msgs / {d} ents / {d} clusters / {d} fires / {d} B | TCP in: {d} frames ({d} B) | TCP out: {d} B (last 1 s)\n",
+                "[gateway] {d} active conns / {d} accepts ({d} jwt-reject, {d} full-reject, {d} raid-window-reject) | gate {s} day_fraction={d:.3} | NATS in: {d} msgs / {d} ents / {d} clusters / {d} fires / {d} B | TCP in: {d} frames ({d} B) | TCP out: {d} B (last 1 s)\n",
                 .{
-                    conns.active_count, accepts_total,    rejected_jwt, rejected_full,
+                    conns.active_count, accepts_total,    rejected_jwt, rejected_full, rejected_raid_window,
+                    if (gate.isOpen()) "OPEN" else "CLOSED", gate.day_fraction,
                     msgs_total,         ents_total,       clusters_total, fires_fwd_total,
                     bytes_total,        frames_in_total, bytes_tcp_in_total,
                     bytes_tcp_out_total,
@@ -675,6 +767,7 @@ pub fn main() !void {
             accepts_total = 0;
             rejected_jwt = 0;
             rejected_full = 0;
+            rejected_raid_window = 0;
             last_log_ns = now_ns;
         }
     }
