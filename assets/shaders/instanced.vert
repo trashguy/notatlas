@@ -22,21 +22,32 @@ layout(set = 0, binding = 0) uniform Camera {
 } cam;
 
 struct Instance {
-    mat4 model;    // column-major, rigid (no scale) — same as box.vert.push.model
+    mat4 model;    // column-major, rigid-ish; cull reads max-axis scale
     vec4 albedo;   // xyz = sRGB-ish color, w = unused (std430 padding)
-    vec4 bounds;   // xyz = world-space center, w = radius — for M10.3 cull
+    vec4 bounds;   // xyz = piece-local center, w = radius (cull transforms by model)
+    uvec4 meta;    // x = piece_id (cull reads); yzw reserved
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer Instances {
     Instance data[];
 } instances;
 
+// M10.3: visible-indices indirection. Compute culler writes the slot
+// indices of visible instances into per-piece sub-ranges; the vertex
+// shader looks up its bucket-base + ordinal here to get the original
+// instance slot. Pre-M10.3 (or with `--no-cull` later) the CPU writes
+// an identity mapping so the indirection is a no-op.
+layout(set = 0, binding = 2, std430) readonly buffer VisibleIndices {
+    uint data[];
+} visible;
+
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_world_normal;
 layout(location = 2) out vec3 v_albedo;
 
 void main() {
-    Instance inst = instances.data[gl_InstanceIndex];
+    uint orig = visible.data[gl_InstanceIndex];
+    Instance inst = instances.data[orig];
 
     vec4 wp = inst.model * vec4(i_pos, 1.0);
     v_world_pos = wp.xyz;

@@ -1,0 +1,87 @@
+#version 450
+
+// M10.3 GPU frustum culling. One thread per active instance:
+//   - Transform piece-local sphere bounds by the instance's model matrix
+//     to get world-space center + radius.
+//   - Test sphere against 6 frustum planes (Gribb/Hartmann form).
+//   - If visible, atomically claim a slot in this piece's indirect-cmd
+//     instance_count and write the original instance index into the
+//     visible-indices array at that slot.
+//
+// Push constants (≤128 B per Vulkan min-spec): 6 frustum planes packed
+// xyz=normal, w=d (plane equation n·p + d ≥ 0 inside), plus the
+// total_active count so threads beyond it early-out. 6×16 + 4 = 100 B.
+//
+// Bindings match the graphics pipeline's shared descriptor set:
+//   1 = instances SSBO (readonly here)
+//   2 = visible-indices SSBO (writeonly here)
+//   3 = indirect-cmd SSBO (RW for atomicAdd into instance_count)
+//
+// Sync requirement (issued from the host by `dispatchCull` after this
+// dispatch): COMPUTE_SHADER stage → DRAW_INDIRECT + VERTEX_SHADER stages
+// pipeline barrier so the graphics pass reads the post-compute state.
+
+layout(local_size_x = 64) in;
+
+struct Instance {
+    mat4 model;
+    vec4 albedo;
+    vec4 bounds; // xyz = piece-local center, w = piece-local radius
+    uvec4 meta;  // x = piece_id
+};
+layout(set = 0, binding = 1, std430) readonly buffer Instances {
+    Instance data[];
+} instances;
+
+layout(set = 0, binding = 2, std430) writeonly buffer VisibleIndices {
+    uint data[];
+} visible;
+
+struct DrawCmd {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+layout(set = 0, binding = 3, std430) buffer Indirect {
+    DrawCmd cmds[];
+} indirect;
+
+layout(push_constant) uniform Cull {
+    vec4 planes[6]; // xyz = normal, w = d
+    uint total_active;
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.total_active) return;
+
+    Instance inst = instances.data[id];
+
+    // World-space sphere: transform piece-local center by model, then
+    // scale radius by the max axis-scale of the model (handles non-
+    // uniform scale on ships: 4×2.8×4 hull → radius * 4).
+    vec3 world_center = (inst.model * vec4(inst.bounds.xyz, 1.0)).xyz;
+    float sx = length(inst.model[0].xyz);
+    float sy = length(inst.model[1].xyz);
+    float sz = length(inst.model[2].xyz);
+    float world_radius = inst.bounds.w * max(sx, max(sy, sz));
+
+    bool is_visible = true;
+    for (int i = 0; i < 6; ++i) {
+        // Signed distance to plane. Inside the frustum: dist ≥ 0.
+        // A sphere is fully outside one plane iff dist < -radius.
+        if (dot(pc.planes[i], vec4(world_center, 1.0)) < -world_radius) {
+            is_visible = false;
+            break;
+        }
+    }
+
+    if (is_visible) {
+        uint piece_id = inst.meta.x;
+        uint slot = atomicAdd(indirect.cmds[piece_id].instance_count, 1);
+        uint base = indirect.cmds[piece_id].first_instance;
+        visible.data[base + slot] = id;
+    }
+}

@@ -46,6 +46,10 @@ const Scene = struct {
     /// from the interpolated ship pose; albedos are written once at init.
     instanced: *render.Instanced,
     arrows: *render.WindArrows,
+    /// M10.3: per-frame view-projection used by the GPU cull pass.
+    /// Populated in the main loop right after `ocean.updateCamera`; read
+    /// by prePass to upload frustum planes for the compute dispatch.
+    view_proj: notatlas.math.Mat4 = notatlas.math.Mat4.identity,
 };
 
 pub fn main() !void {
@@ -125,6 +129,8 @@ pub fn main() !void {
         pax_total_count + grid_slot_count,
     );
     defer instanced.deinit();
+    instanced.setCullEnabled(!cli.no_cull);
+    std.log.info("M10.3 GPU cull: {s}", .{if (cli.no_cull) "OFF (--no-cull)" else "ON"});
 
     var arrows = try render.WindArrows.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, arrow_count);
     defer arrows.deinit();
@@ -532,6 +538,15 @@ pub fn main() !void {
         };
         ocean.updateCamera(camera);
         ocean.updateTime(t);
+        // M10.3: stash view-proj for the prePass cull dispatch. Same
+        // matrices the ocean UBO got — guarantees cull frustum matches
+        // what the camera actually shows.
+        scene.view_proj = notatlas.math.Mat4.mul(camera.projection(), camera.view());
+
+        // M10.3: CPU bucket/scatter/upload runs BEFORE `frame.draw` so the
+        // indirect + instance buffers are visible to the compute culler
+        // (which dispatches in `prePass` outside the render pass).
+        instanced.prepareFrame();
 
         // Sample the wind on the debug grid and push to the arrows
         // instance buffer. 256 windAt() calls / frame; cheap (~0.1 ms).
@@ -542,7 +557,7 @@ pub fn main() !void {
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
 
-        const result = try frame.draw(&swapchain, clear, recordScene, &scene);
+        const result = try frame.draw(&swapchain, clear, recordScene, &scene, prePass, &scene);
         if (result == .resize_needed) {
             try swapchain.recreate(window.framebufferSize());
             try frame.recreateFramebuffers(&gpu, &swapchain);
@@ -731,6 +746,20 @@ fn recordScene(
     scene.arrows.record(cb, extent);
 }
 
+/// Pre-pass: compute dispatches that must happen outside the render pass.
+/// M10.3 GPU frustum culling lives here. Frustum extracted from the same
+/// view-projection the ocean pipeline uses, so cull math agrees with what
+/// the camera actually shows.
+fn prePass(
+    ctx: *anyopaque,
+    cb: render.types.vk.VkCommandBuffer,
+    extent: render.types.vk.VkExtent2D,
+) void {
+    _ = extent;
+    const scene: *Scene = @ptrCast(@alignCast(ctx));
+    scene.instanced.dispatchCull(cb, scene.view_proj);
+}
+
 /// Snapshot WASD / Space / Ctrl into a FlyCamera move vector. Each axis is
 /// the difference of two boolean keys, so chord cancellation works the same
 /// as any FPS (W+S = 0, A+D = 0). Diagonal (W+D) is unnormalized — gives
@@ -787,6 +816,11 @@ const Cli = struct {
     /// target. Piece geometry is identical (the same cube) — only the
     /// `PieceEntry` bookkeeping differs, which is what the gate measures.
     piece_types: u32 = 1,
+    /// M10.3 toggle: when true, skip GPU compute frustum culling and let
+    /// CPU prep write full bucket-size instance_counts + identity
+    /// visible-indices. A/B compare cull-on vs cull-off frametimes via
+    /// the M10.4 gate harness.
+    no_cull: bool = false,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -809,6 +843,8 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
             const v = args.next() orelse return error.MissingPieceTypesValue;
             cli.piece_types = try std.fmt.parseInt(u32, v, 10);
             if (cli.piece_types == 0) return error.PieceTypesMustBePositive;
+        } else if (std.mem.eql(u8, a, "--no-cull")) {
+            cli.no_cull = true;
         }
     }
     return cli;

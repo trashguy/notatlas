@@ -38,6 +38,13 @@ pub const DrawResult = enum { ok, resize_needed };
 /// `ctx` is whatever pointer the caller passed alongside the function.
 pub const RecordPassFn = *const fn (ctx: *anyopaque, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void;
 
+/// Optional pre-pass recorder. Invoked AFTER vkBeginCommandBuffer but
+/// BEFORE vkCmdBeginRenderPass. Use for compute dispatches + their
+/// pipeline barriers — neither legal inside a render pass. M10.3 GPU
+/// frustum culling rides this hook. Ctx pointer model matches
+/// `RecordPassFn`.
+pub const PrePassFn = *const fn (ctx: *anyopaque, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void;
+
 pub const Frame = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
@@ -143,6 +150,8 @@ pub const Frame = struct {
         clear_color: [4]f32,
         record_pass: ?RecordPassFn,
         record_ctx: ?*anyopaque,
+        pre_pass: ?PrePassFn,
+        pre_pass_ctx: ?*anyopaque,
     ) !DrawResult {
         _ = vk.vkWaitForFences(self.device, 1, &self.in_flight, vk.VK_TRUE, std.math.maxInt(u64));
 
@@ -171,6 +180,8 @@ pub const Frame = struct {
             clear_color,
             record_pass,
             record_ctx,
+            pre_pass,
+            pre_pass_ctx,
         );
 
         const render_finished = self.render_finished_per_image[image_index];
@@ -531,6 +542,8 @@ fn recordPass(
     clear_color: [4]f32,
     record_fn: ?RecordPassFn,
     ctx: ?*anyopaque,
+    pre_pass_fn: ?PrePassFn,
+    pre_pass_ctx: ?*anyopaque,
 ) !void {
     try types.check(vk.vkResetCommandBuffer(cb, 0), VulkanError.CommandBufferBeginFailed);
 
@@ -541,6 +554,10 @@ fn recordPass(
         .pInheritanceInfo = null,
     };
     try types.check(vk.vkBeginCommandBuffer(cb, &begin), VulkanError.CommandBufferBeginFailed);
+
+    // Pre-pass: compute dispatches + barriers, outside the render pass.
+    // M10.3 GPU frustum culling runs here.
+    if (pre_pass_fn) |f| f(pre_pass_ctx.?, cb, extent);
 
     const clears = [_]vk.VkClearValue{
         .{ .color = .{ .float32 = clear_color } },
