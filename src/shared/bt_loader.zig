@@ -804,7 +804,8 @@ test "loadFromFile — pirate_sloop.yaml fixture" {
 
     try testing.expectEqualStrings("pirate_sloop", arch.archetype);
     try testing.expectEqual(@as(u32, 600), arch.perception_radius);
-    try testing.expectEqual(@as(usize, 14), arch.nodes.len);
+    // 14 base nodes + 2 added (flee_to_storm_cover action, flee selector)
+    try testing.expectEqual(@as(usize, 16), arch.nodes.len);
     try testing.expectEqual(@as(bt.NodeId, 12), arch.root);
 
     // Spot-check the engage branch's cooldown wraps the fire action.

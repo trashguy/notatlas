@@ -11,8 +11,6 @@
 //! decision.
 //!
 //! Notable v1 stubs:
-//!   - `wind` defaults to {dir=0, speed=0} until env service ships.
-//!     env.cell.<x>_<y>.wind is drained today but not yet decoded.
 //!   - `threats` (slice of nearby hostiles) is deferred to a follow-up.
 //!     `lua_bind.pushValue` doesn't yet handle slice-of-struct; nearest_
 //!     _enemy alone is enough for the v0 demo.
@@ -47,6 +45,19 @@ pub const Enemy = struct {
     hp: f32,
 };
 
+/// Nearest storm-cell relative to own pose, as seen via env-sim's
+/// `env.storms` broadcast. Distance is from own-pose to storm center
+/// (the cover-eligible zone is `dist < radius_m`). y is omitted —
+/// storms are a 2D field over (x, z).
+pub const Storm = struct {
+    id: u32,
+    x: f32,
+    z: f32,
+    radius_m: f32,
+    strength_mps: f32,
+    dist: f32,
+};
+
 pub const PerceptionCtx = struct {
     tick: u64,
     dt: f32,
@@ -56,6 +67,12 @@ pub const PerceptionCtx = struct {
     wind: Wind,
     cell: Cell,
     nearest_enemy: ?Enemy,
+    /// Nearest active storm (by center distance) globally — storms
+    /// are addressable entities published in a single 1 Hz broadcast,
+    /// so v0 doesn't filter by radius. A null value means env-sim
+    /// hasn't published yet (boot race) or the wind.yaml has zero
+    /// storms. Used by `flee_to_storm_cover` for visibility cover.
+    nearest_storm: ?Storm,
 };
 
 pub const BuildOpts = struct {
@@ -81,6 +98,12 @@ pub const BuildOpts = struct {
     /// velocity vectors. Empty (or no entry for the AI's cell) → ctx
     /// wind defaults to `{0, 0}`.
     wind_cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
+    /// Global storm snapshot — last `env.storms` payload from env-sim,
+    /// raw wire.StormMsg slice. Storms are a global broadcast (not
+    /// cell-keyed), so a flat slice is the natural shape. Empty slice
+    /// → no storms or env-sim hasn't published yet → ctx.nearest_storm
+    /// resolves to null.
+    storms: []const wire.StormMsg,
 };
 
 /// Build a PerceptionCtx for `opts.ai_id` from the cohort's world
@@ -148,6 +171,8 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
         };
     }
 
+    const nearest_storm_v = nearestStorm(opts.storms, own.x, own.z);
+
     return .{
         .tick = opts.tick,
         .dt = opts.dt,
@@ -160,7 +185,35 @@ pub fn build(cohort: *const ai_state.Cohort, opts: BuildOpts) ?PerceptionCtx {
         .wind = wind,
         .cell = cell,
         .nearest_enemy = nearest,
+        .nearest_storm = nearest_storm_v,
     };
+}
+
+/// Pick the closest storm by horizontal (x, z) distance from own
+/// pose. No radius gating — storms are sparse (typically 1-4 per
+/// world per wind.yaml) and a fleeing ship wants to know about the
+/// nearest one even if it's currently far. The Lua leaf is what
+/// decides whether the storm is close enough to be a useful refuge.
+fn nearestStorm(storms: []const wire.StormMsg, sx: f32, sz: f32) ?Storm {
+    var best: ?Storm = null;
+    var best_d2: f32 = std.math.floatMax(f32);
+    for (storms) |s| {
+        const dx = s.pos_x - sx;
+        const dz = s.pos_z - sz;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = .{
+                .id = s.storm_id,
+                .x = s.pos_x,
+                .z = s.pos_z,
+                .radius_m = s.radius_m,
+                .strength_mps = s.strength_mps,
+                .dist = @sqrt(d2),
+            };
+        }
+    }
+    return best;
 }
 
 fn nearestEnemy(
@@ -226,6 +279,7 @@ test "perception: build returns null when own pose unknown" {
         .tick = 0,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     });
     try testing.expect(ctx == null);
 }
@@ -254,6 +308,7 @@ test "perception: nearest_enemy picks closest ship within radius" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     try testing.expect(ctx.nearest_enemy != null);
     try testing.expectEqual(near_id, ctx.nearest_enemy.?.id);
@@ -271,6 +326,7 @@ test "perception: cell derived from own pose floor()" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     // x=250 → floor(250/200)=1; z=-50 → floor(-50/200)=-1
     try testing.expectEqual(@as(i32, 1), ctx.cell.x);
@@ -290,6 +346,7 @@ test "perception: nearest_enemy nil when nothing in radius" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     try testing.expect(ctx.nearest_enemy == null);
 }
@@ -314,6 +371,7 @@ test "perception: nearestEnemy skips sunk ships" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     try testing.expectEqual(live_id, ctx.nearest_enemy.?.id);
     try testing.expectEqual(@as(f32, 0.5), ctx.nearest_enemy.?.hp);
@@ -339,6 +397,7 @@ test "perception: own_vel.ang.y carries angvel_y from firehose" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     try testing.expectEqual(@as(f32, 0.6), ctx.own_vel.ang.y);
     try testing.expectEqual(@as(f32, 0), ctx.own_vel.ang.x);
@@ -359,6 +418,7 @@ test "perception: own_hp pulled from firehose StateMsg.hp" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &empty_wind_cache,
+        .storms = &.{},
     }).?;
     try testing.expectEqual(@as(f32, 0.25), ctx.own_hp);
 }
@@ -383,9 +443,54 @@ test "perception: wind read from cache at AI's cell" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &cache,
+        .storms = &.{},
     }).?;
     try testing.expectApproxEqAbs(@as(f32, 10.0), ctx.wind.speed, 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.wind.dir, 1e-4);
+}
+
+test "perception: nearest_storm picks closest by 2D distance" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 0, .y = 0, .z = 0 }, 1);
+
+    const storms: []const wire.StormMsg = &.{
+        .{ .storm_id = notatlas.entity_kind.pack(.storm, 0), .pos_x = 800, .pos_z = 0, .radius_m = 300, .strength_mps = 10, .vortex_mix = 0.2 },
+        .{ .storm_id = notatlas.entity_kind.pack(.storm, 1), .pos_x = -200, .pos_z = 100, .radius_m = 300, .strength_mps = 10, .vortex_mix = 0.2 },
+        .{ .storm_id = notatlas.entity_kind.pack(.storm, 2), .pos_x = 5000, .pos_z = 5000, .radius_m = 300, .strength_mps = 10, .vortex_mix = 0.2 },
+    };
+
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
+        .storms = storms,
+    }).?;
+    try testing.expect(ctx.nearest_storm != null);
+    const ns = ctx.nearest_storm.?;
+    try testing.expectEqual(notatlas.entity_kind.pack(.storm, 1), ns.id);
+    try testing.expectApproxEqAbs(@as(f32, @sqrt(@as(f32, 200 * 200 + 100 * 100))), ns.dist, 1e-3);
+}
+
+test "perception: nearest_storm null when storms slice empty" {
+    var c = ai_state.Cohort.init(testing.allocator);
+    defer c.deinit();
+    const self_id = notatlas.entity_kind.pack(.ship, 3);
+    try c.observeEntity(self_id, .{ .generation = 0, .x = 0, .y = 0, .z = 0 }, 1);
+    const ctx = build(&c, .{
+        .ai_id = self_id,
+        .perception_radius_m = 600,
+        .cell_side_m = 200,
+        .tick = 1,
+        .dt = 0.05,
+        .wind_cache = &empty_wind_cache,
+        .storms = &.{},
+    }).?;
+    try testing.expect(ctx.nearest_storm == null);
 }
 
 test "perception: wind defaults to zero when no entry for cell" {
@@ -407,6 +512,7 @@ test "perception: wind defaults to zero when no entry for cell" {
         .tick = 1,
         .dt = 0.05,
         .wind_cache = &cache,
+        .storms = &.{},
     }).?;
     try testing.expectEqual(@as(f32, 0), ctx.wind.speed);
     try testing.expectEqual(@as(f32, 0), ctx.wind.dir);

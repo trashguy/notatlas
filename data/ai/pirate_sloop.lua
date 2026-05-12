@@ -140,6 +140,26 @@ function flee_to_open_water()
   return "running"
 end
 
+-- Storm cells provide visibility cover (design_storms_as_cover.md).
+-- A fleeing AI heads toward the nearest storm center when the storm
+-- is closer than the enemy's cannon range gives them to fire — the
+-- storm masks the AI's silhouette and breaks the firing solution.
+-- If no storm is nearby or env-sim hasn't published yet, returns
+-- "failure" so the selector falls through to flee_to_open_water.
+local storm_cover_max_dist_m = 1200.0
+function flee_to_storm_cover()
+  local s = ctx.nearest_storm
+  if s == nil or s.dist > storm_cover_max_dist_m then return "failure" end
+  local own_heading = heading_from_pose(ctx.own_pose)
+  -- Head toward the storm CENTER, not the edge — the heading PD
+  -- controller already overshoots on tight diff so aiming at the
+  -- center gives margin for waves to push us off course.
+  local desired = math.atan(s.x - ctx.own_pose.x, -(s.z - ctx.own_pose.z))
+  set_thrust(1.0)
+  set_steer(steer_toward(desired, own_heading, ctx.own_vel.ang.y))
+  return "running"
+end
+
 function intercept()
   local e = ctx.nearest_enemy
   if e == nil then return "failure" end

@@ -20,15 +20,25 @@ root: 12
 
 nodes:
   # ------- flee branch -------
+  # When hp < 30%, prefer storm cover (visibility break, broken firing
+  # solution) over open-water flee. flee_to_storm_cover returns
+  # "failure" if no storm is within range, so the selector falls
+  # through to flee_to_open_water automatically.
   - id: 0
     kind: cond
     leaf: low_hp
+  - id: 14
+    kind: action
+    leaf: flee_to_storm_cover
   - id: 1
     kind: action
     leaf: flee_to_open_water
+  - id: 15
+    kind: selector
+    children: [14, 1]
   - id: 2
     kind: sequence
-    children: [0, 1]
+    children: [0, 15]
 
   # ------- engage branch -------
   - id: 3

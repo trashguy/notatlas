@@ -12,8 +12,7 @@
 //!     the v1 default; cell-affinity sharding is post-v1).
 //!   - Subscriptions:
 //!       sim.entity.*.state    — world snapshot firehose
-//!       env.cell.*.wind       — wind samples (drained, not yet used —
-//!                                step 6 perception API consumes)
+//!       env.cell.*.wind       — wind samples → perception ctx.wind
 //!   - Loads `data/ai/<archetype>.yaml` on boot; instantiates a
 //!     `bt.Tree` per AI ship (`--ai-ship <seq>` flags, repeatable).
 //!   - Loads `data/ai/<archetype>.lua` into the cohort VM; leaves
@@ -203,7 +202,8 @@ pub fn main() !void {
 
     const sub_state = try client.subscribe("sim.entity.*.state", .{});
     const sub_wind = try client.subscribe("env.cell.*.wind", .{});
-    std.debug.print("ai-sim: subscribed to sim.entity.*.state, env.cell.*.wind\n", .{});
+    const sub_storms = try client.subscribe("env.storms", .{});
+    std.debug.print("ai-sim: subscribed to sim.entity.*.state, env.cell.*.wind, env.storms\n", .{});
 
     // ----- archetype + Lua load -----
     var archetype = try bt_loader.loadFromFile(allocator, args.archetype_path);
@@ -241,6 +241,13 @@ pub fn main() !void {
     var wind_cache: std.AutoHashMapUnmanaged([2]i32, [2]f32) = .{};
     defer wind_cache.deinit(allocator);
 
+    // ----- storm snapshot (env-sim env.storms → perception ctx.nearest_storm) -----
+    // Replaced wholesale every receipt (1 Hz cadence, ~handful of
+    // storms per world). Owned by main; passed by slice into
+    // perception.build each tick.
+    var storms: std.ArrayListUnmanaged(wire.StormMsg) = .{};
+    defer storms.deinit(allocator);
+
     // ----- watcher state -----
     var archetype_mtime = statMtime(args.archetype_path) catch 0;
     var leaves_mtime = statMtime(args.leaves_path) catch 0;
@@ -256,16 +263,17 @@ pub fn main() !void {
     var input_pubs_total: u64 = 0;
     var state_msgs_total: u64 = 0;
     var wind_msgs_total: u64 = 0;
+    var storm_msgs_total: u64 = 0;
 
     while (g_running.load(.acquire)) {
         try client.processIncomingTimeout(5);
         try client.maybeSendPing();
 
-        // Drain inbound traffic. Both subs feed the cohort's world
-        // model — we don't act on wind yet, but we still drain so
-        // messages don't pile up in the client buffer.
+        // Drain inbound traffic. State feeds the cohort's entity
+        // table; wind feeds the per-cell cache read by perception.build.
         state_msgs_total += try drainStateSub(allocator, sub_state, &cohort, tick_n);
         wind_msgs_total += drainWindSub(allocator, sub_wind, &wind_cache);
+        storm_msgs_total += try drainStormsSub(allocator, sub_storms, &storms);
 
         const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var ticks_due: u32 = 0;
@@ -279,6 +287,7 @@ pub fn main() !void {
                 archetype.perception_radius,
                 args.cell_side_m,
                 &wind_cache,
+                storms.items,
             );
             tick_n += 1;
             last_tick_ns +%= tick_period_ns;
@@ -303,13 +312,14 @@ pub fn main() !void {
         if (now_ns -% last_log_ns >= log_interval_ns) {
             const ticks_in_window = tick_n - last_log_tick;
             std.debug.print(
-                "[ai-sim] {d} ticks last 1 s (target 20); {d} ais; {d} world ents; {d} state-msgs, {d} wind-msgs, {d} input-pubs / 1 s\n",
-                .{ ticks_in_window, cohort.aiCount(), cohort.entityCount(), state_msgs_total, wind_msgs_total, input_pubs_total },
+                "[ai-sim] {d} ticks last 1 s (target 20); {d} ais; {d} world ents; {d} state-msgs, {d} wind-msgs, {d} storm-msgs ({d} storms), {d} input-pubs / 1 s\n",
+                .{ ticks_in_window, cohort.aiCount(), cohort.entityCount(), state_msgs_total, wind_msgs_total, storm_msgs_total, storms.items.len, input_pubs_total },
             );
             last_log_tick = tick_n;
             last_log_ns = now_ns;
             state_msgs_total = 0;
             wind_msgs_total = 0;
+            storm_msgs_total = 0;
             input_pubs_total = 0;
         }
     }
@@ -356,6 +366,29 @@ fn drainWindSub(
     return count;
 }
 
+/// Drain `env.storms`. Each receipt is a full snapshot, so the cache
+/// is rebuilt wholesale (clearRetainingCapacity + appendSlice). v0
+/// storm count is fixed by `wind.yaml` so capacity stabilizes after
+/// the first publish.
+fn drainStormsSub(
+    allocator: std.mem.Allocator,
+    sub: anytype,
+    storms: *std.ArrayListUnmanaged(wire.StormMsg),
+) !u64 {
+    var count: u64 = 0;
+    while (sub.nextMsg()) |msg| {
+        var owned = msg;
+        defer owned.deinit();
+        const payload = owned.payload orelse continue;
+        const parsed = wire.decodeStormList(allocator, payload) catch continue;
+        defer parsed.deinit();
+        storms.clearRetainingCapacity();
+        try storms.appendSlice(allocator, parsed.value.storms);
+        count += 1;
+    }
+    return count;
+}
+
 /// One full tick of the cohort: build perception, BT step every AI,
 /// publish any pending input. Returns the number of inputs published
 /// this tick.
@@ -373,6 +406,7 @@ fn tickCohort(
     perception_radius_m: u32,
     cell_side_m: f32,
     wind_cache: *const std.AutoHashMapUnmanaged([2]i32, [2]f32),
+    storms: []const wire.StormMsg,
 ) !u64 {
     const now_ms: i64 = @intCast(@divFloor(@as(i128, tick) * @as(i128, std.time.ns_per_s / 20), std.time.ns_per_ms));
     var bt_ctx: bt.TickCtx = .{ .now_ms = now_ms, .dispatcher = disp.dispatcher() };
@@ -386,6 +420,7 @@ fn tickCohort(
             .tick = tick,
             .dt = tick_dt,
             .wind_cache = wind_cache,
+            .storms = storms,
         }) orelse continue;
 
         disp.beginAi(ai, &p_ctx);

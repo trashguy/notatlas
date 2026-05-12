@@ -336,6 +336,7 @@ test "dispatcher: set_thrust mutates current_ai pending_input" {
         .wind = .{ .dir = 0, .speed = 0 },
         .cell = .{ .x = 0, .y = 0 },
         .nearest_enemy = null,
+        .nearest_storm = null,
     };
 
     d.beginAi(&ai, &ctx);
@@ -369,6 +370,7 @@ test "dispatcher: set_thrust clamps to [-1, 1]" {
         .wind = .{ .dir = 0, .speed = 0 },
         .cell = .{ .x = 0, .y = 0 },
         .nearest_enemy = null,
+        .nearest_storm = null,
     };
 
     d.beginAi(&ai, &ctx);
@@ -405,6 +407,7 @@ test "dispatcher: leaf reads ctx.own_pose from pushed global" {
         .wind = .{ .dir = 0, .speed = 0 },
         .cell = .{ .x = 0, .y = 0 },
         .nearest_enemy = null,
+        .nearest_storm = null,
     };
 
     d.beginAi(&ai, &ctx);
@@ -435,6 +438,7 @@ test "dispatcher: nearest_enemy nil reads as nil in lua" {
         .wind = .{ .dir = 0, .speed = 0 },
         .cell = .{ .x = 0, .y = 0 },
         .nearest_enemy = null,
+        .nearest_storm = null,
     };
 
     d.beginAi(&ai, &ctx_nil);
@@ -491,6 +495,7 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
             .wind = .{ .dir = 0, .speed = 0 },
             .cell = .{ .x = 0, .y = 0 },
             .nearest_enemy = null,
+            .nearest_storm = null,
         };
         d.beginAi(&ai, &ctx);
         defer d.endAi();
@@ -516,6 +521,7 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
             .wind = .{ .dir = 0, .speed = 0 },
             .cell = .{ .x = 0, .y = 0 },
             .nearest_enemy = null,
+            .nearest_storm = null,
         };
         d.beginAi(&ai, &ctx);
         defer d.endAi();
@@ -540,6 +546,7 @@ test "dispatcher: PD steer reads ctx.own_vel.ang.y and damps overshoot" {
             .wind = .{ .dir = 0, .speed = 0 },
             .cell = .{ .x = 0, .y = 0 },
             .nearest_enemy = null,
+            .nearest_storm = null,
         };
         d.beginAi(&ai, &ctx);
         defer d.endAi();
