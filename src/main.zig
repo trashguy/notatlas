@@ -29,6 +29,8 @@ const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
 const instanced_vert_shader_path = "assets/shaders/instanced.vert";
 const instanced_frag_shader_path = "assets/shaders/instanced.frag";
+const merged_vert_shader_path = "assets/shaders/merged.vert";
+const merged_frag_shader_path = "assets/shaders/merged.frag";
 
 /// Passenger count for the M5.5 multi-pax demo. Three NPCs scattered on
 /// the deck at fixed local poses with distinct colors. Every frame their
@@ -46,6 +48,13 @@ const Scene = struct {
     /// from the interpolated ship pose; albedos are written once at init.
     instanced: *render.Instanced,
     arrows: *render.WindArrows,
+    /// M11.1: merged-mesh renderer for far-LOD anchorages. Always init'd;
+    /// per-frame only records draws if `anchorage_mesh` is set.
+    merged_renderer: *render.MergedMeshRenderer,
+    /// M11.1: optional anchorage merged-mesh. null when `--anchorage-pieces`
+    /// is 0; set at startup to a single pre-baked cluster otherwise. LOD
+    /// switching (M11.2) lands later; for now if set, it renders.
+    anchorage_mesh: ?*render.MergedMesh = null,
     /// M10.3: per-frame view-projection used by the GPU cull pass.
     /// Populated in the main loop right after `ocean.updateCamera`; read
     /// by prePass to upload frustum planes for the compute dispatch.
@@ -134,10 +143,18 @@ pub fn main() !void {
 
     var arrows = try render.WindArrows.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, arrow_count);
     defer arrows.deinit();
+
+    // M11.1 far-LOD merged-mesh renderer. Shares the same camera UBO as
+    // ocean / instanced / arrows so all four passes agree on view/proj
+    // without duplicate uploads.
+    var merged_renderer = try render.MergedMeshRenderer.init(&gpu, frame.render_pass, ocean.camera_ubo.handle);
+    defer merged_renderer.deinit();
+
     var scene: Scene = .{
         .ocean = &ocean,
         .instanced = &instanced,
         .arrows = &arrows,
+        .merged_renderer = &merged_renderer,
     };
 
     const wave_params = try loadWaves(gpa, wave_config_path);
@@ -311,6 +328,106 @@ pub fn main() !void {
             .{ n, n, grid_slot_count, cli.piece_types },
         );
     }
+
+    // M11.1 anchorage cluster. When --anchorage-pieces N > 0, generate
+    // a deterministic cluster of N pieces inside a `--anchorage-radius`
+    // disc centered ~120 m down +X from spawn, bake into one merged mesh,
+    // and render via the far-LOD path. No instanced-path slot is consumed
+    // for these pieces in M11.1 — LOD switching (M11.2) lands next.
+    var anchorage_mesh: ?render.MergedMesh = null;
+    defer if (anchorage_mesh) |*m| m.deinit();
+    if (cli.anchorage_pieces > 0) {
+        if (cli.anchorage_piece_types > cli.piece_types) {
+            std.log.warn(
+                "anchorage-piece-types ({d}) > palette piece_types ({d}); clamping",
+                .{ cli.anchorage_piece_types, cli.piece_types },
+            );
+        }
+        const n: u32 = cli.anchorage_pieces;
+        const types_used: u32 = @min(cli.anchorage_piece_types, cli.piece_types);
+        const radius: f32 = cli.anchorage_radius;
+        // Deterministic seed so the harness scene is reproducible.
+        var rng = std.Random.DefaultPrng.init(0xA10C0A8E);
+        const r = rng.random();
+
+        const transforms = try gpa.alloc(notatlas.math.Mat4, n);
+        defer gpa.free(transforms);
+        const albedos = try gpa.alloc([4]f32, n);
+        defer gpa.free(albedos);
+        const pieces_for_merge = try gpa.alloc(render.mesh_palette.PieceMesh, n);
+        defer gpa.free(pieces_for_merge);
+
+        const center = notatlas.math.Vec3.init(120, 0, 0);
+        var k: u32 = 0;
+        while (k < n) : (k += 1) {
+            // Uniform-in-disc sample: r' = R·sqrt(u), θ = 2π·v.
+            const u = r.float(f32);
+            const v = r.float(f32);
+            const rad = radius * @sqrt(u);
+            const theta = 2.0 * std.math.pi * v;
+            const dx = rad * @cos(theta);
+            const dz = rad * @sin(theta);
+            // y: low buildings 1-4 m tall, base at sea level.
+            const height = 1.0 + r.float(f32) * 3.0;
+            const yaw = 2.0 * std.math.pi * r.float(f32);
+            const scale_xz = 1.0 + r.float(f32) * 2.0;
+            const scale_y = height;
+
+            const pos = notatlas.math.Vec3.init(
+                center.x + dx,
+                center.y + scale_y * 0.5,
+                center.z + dz,
+            );
+            const s_half = @sin(yaw * 0.5);
+            const c_half = @cos(yaw * 0.5);
+            transforms[k] = notatlas.math.Mat4.trs(
+                pos,
+                .{ 0, s_half, 0, c_half },
+                notatlas.math.Vec3.init(scale_xz, scale_y, scale_xz),
+            );
+
+            // Albedo: warm dockside palette banded by piece type.
+            const tier: f32 = @as(f32, @floatFromInt(k % types_used)) /
+                @as(f32, @floatFromInt(types_used));
+            albedos[k] = .{
+                0.55 + 0.30 * tier,
+                0.40 + 0.20 * (1.0 - tier),
+                0.30 + 0.40 * r.float(f32),
+                0,
+            };
+
+            // Round-robin across piece types — same pattern as the M10
+            // instance-grid case so each piece-type bucket gets used.
+            pieces_for_merge[k] = palette_pieces[k % types_used];
+        }
+
+        var merge_timer = try std.time.Timer.start();
+        anchorage_mesh = try render.cluster_merge.MergedMesh.initFromJob(
+            &gpu,
+            gpa,
+            .{
+                .pieces = pieces_for_merge,
+                .transforms = transforms,
+                .albedos = albedos,
+            },
+        );
+        const merge_ns = merge_timer.read();
+        const m = &anchorage_mesh.?;
+        std.log.info(
+            "M11 anchorage: {d} pieces × {d} types in r={d:.1} m → {d} verts / {d} idx; merge {d:.2} ms (bounding r={d:.1} m)",
+            .{
+                n,
+                types_used,
+                radius,
+                m.vertex_count,
+                m.index_count,
+                @as(f64, @floatFromInt(merge_ns)) / 1.0e6,
+                m.radius,
+            },
+        );
+        scene.anchorage_mesh = m;
+    }
+
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -356,7 +473,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &instanced, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &instanced, &merged_renderer, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -640,6 +757,7 @@ fn handleReload(
     gpa: std.mem.Allocator,
     ocean: *render.Ocean,
     instanced: *render.Instanced,
+    merged_renderer: *render.MergedMeshRenderer,
     arrows: *render.WindArrows,
     hull: *notatlas.hull_params.HullParams,
     buoy: *physics.Buoyancy,
@@ -719,6 +837,16 @@ fn handleReload(
             return;
         };
 
+        // M11.1 merged-mesh shaders.
+        const merged_vert_spv = render.shader_compile.compileGlsl(gpa, merged_vert_shader_path, "merged.vert") catch return;
+        defer gpa.free(merged_vert_spv);
+        const merged_frag_spv = render.shader_compile.compileGlsl(gpa, merged_frag_shader_path, "merged.frag") catch return;
+        defer gpa.free(merged_frag_spv);
+        merged_renderer.reloadShaders(render_pass, merged_vert_spv, merged_frag_spv) catch |err| {
+            std.log.err("reload merged shaders: {s}", .{@errorName(err)});
+            return;
+        };
+
         const arrows_vert_spv = render.shader_compile.compileGlsl(gpa, arrows_vert_path, "wind_arrows.vert") catch return;
         defer gpa.free(arrows_vert_spv);
         const arrows_frag_spv = render.shader_compile.compileGlsl(gpa, arrows_frag_path, "wind_arrows.frag") catch return;
@@ -743,6 +871,13 @@ fn recordScene(
     // one drawIndexed per piece type (currently 1). Return is the draw-call
     // count; we discard it here — the M10.4 gate harness will sample it.
     _ = scene.instanced.record(cb, extent);
+    // M11.1: far-LOD merged anchorage(s) render as one drawIndexed each.
+    // No anchorage → no work. LOD selection (M11.2) decides when this
+    // path fires vs the instanced path; M11.1 always uses merged when
+    // anchorage_mesh is set.
+    if (scene.anchorage_mesh) |mesh| {
+        _ = scene.merged_renderer.record(cb, extent, mesh);
+    }
     scene.arrows.record(cb, extent);
 }
 
@@ -821,6 +956,22 @@ const Cli = struct {
     /// visible-indices. A/B compare cull-on vs cull-off frametimes via
     /// the M10.4 gate harness.
     no_cull: bool = false,
+    /// M11.1: spawn a single anchorage cluster of N pieces at startup,
+    /// merged into one mesh and rendered via the far-LOD merged path.
+    /// 0 = off. Coexists with --instance-grid; the anchorage cluster is
+    /// placed ~120 m down +X from the ship spawn so both are visible.
+    /// LOD switching (M11.2) is not in this sub-commit — when set,
+    /// the anchorage always renders via the merged path.
+    anchorage_pieces: u32 = 0,
+    /// M11.1: piece-type count for the anchorage (default 20, matches
+    /// the M10 gate ceiling). Pieces are the same procedural cube as
+    /// M10, drawn from the palette by id; the gate scene authors
+    /// variety via per-piece TRS + per-instance albedo.
+    anchorage_piece_types: u32 = 20,
+    /// M11.1: anchorage cluster radius in metres (the disc within
+    /// which piece transforms are randomized). Default 50 m matches
+    /// the design cap for a single anchorage footprint.
+    anchorage_radius: f32 = 50.0,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -845,6 +996,16 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
             if (cli.piece_types == 0) return error.PieceTypesMustBePositive;
         } else if (std.mem.eql(u8, a, "--no-cull")) {
             cli.no_cull = true;
+        } else if (std.mem.eql(u8, a, "--anchorage-pieces")) {
+            const v = args.next() orelse return error.MissingAnchoragePiecesValue;
+            cli.anchorage_pieces = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--anchorage-piece-types")) {
+            const v = args.next() orelse return error.MissingAnchoragePieceTypesValue;
+            cli.anchorage_piece_types = try std.fmt.parseInt(u32, v, 10);
+            if (cli.anchorage_piece_types == 0) return error.AnchoragePieceTypesMustBePositive;
+        } else if (std.mem.eql(u8, a, "--anchorage-radius")) {
+            const v = args.next() orelse return error.MissingAnchorageRadiusValue;
+            cli.anchorage_radius = try std.fmt.parseFloat(f32, v);
         }
     }
     return cli;

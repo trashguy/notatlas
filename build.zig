@@ -84,6 +84,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // M11.1 cluster_merge has a pure-CPU bake (mergeCluster /
+    // measureCluster) covered by unit tests. Lives in src/render/ which
+    // notatlas_mod doesn't see; needs notatlas math + Vulkan headers
+    // (header references only — no link). The MergedMeshRenderer init
+    // path is gated behind @embedFile-in-init so test compilation works
+    // without the sandbox's SPV anonymous imports.
+    const cluster_merge_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/render/cluster_merge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cluster_merge_test_mod.addImport("notatlas", notatlas_mod);
+    cluster_merge_test_mod.addIncludePath(vulkan_include);
+    const cluster_merge_tests = b.addTest(.{ .root_module = cluster_merge_test_mod });
+    test_step.dependOn(&b.addRunArtifact(cluster_merge_tests).step);
+
     // Jolt physics — vendored at vendor/JoltPhysics (v5.5.0). Built as a
     // static C++ lib with the same compile defs Jolt's CMake emits for the
     // default x86_64 Linux configuration so headers see a matching ABI when
@@ -176,6 +192,8 @@ pub fn build(b: *std.Build) void {
     embedShader(b, sandbox_mod, "assets/shaders/instanced.vert", "instanced_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/instanced.frag", "instanced_frag_spv");
     embedShader(b, sandbox_mod, "assets/shaders/instanced_cull.comp", "instanced_cull_comp_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/merged.vert", "merged_vert_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/merged.frag", "merged_frag_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.vert", "wind_arrows_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.frag", "wind_arrows_frag_spv");
 
