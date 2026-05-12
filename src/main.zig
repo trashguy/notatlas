@@ -340,6 +340,16 @@ pub fn main() !void {
     // camera distance + a 10% hysteresis band.
     var anchorage: ?render.cluster_merge.Anchorage = null;
     defer if (anchorage) |*a| a.deinit();
+
+    // M11.3 off-thread merge worker. Spawned unconditionally — cheap
+    // when idle (one parked thread waiting on a cond). Used only when
+    // an anchorage invalidates (I key in the sandbox; damage/placement
+    // events in Phase 3).
+    const worker = try render.cluster_merge_worker.Worker.spawn(gpa);
+    defer worker.deinit();
+    var pending_results: std.ArrayList(render.cluster_merge_worker.Result) = .empty;
+    defer pending_results.deinit(gpa);
+    var last_i_state: zglfw.Action = .release;
     if (cli.anchorage_pieces > 0) {
         if (cli.anchorage_piece_types > cli.piece_types) {
             std.log.warn(
@@ -683,6 +693,66 @@ pub fn main() !void {
                 });
             }
             last_l_state = l_state;
+
+            // M11.3: drain worker results (if any) and apply. Done
+            // before LOD selection so the new merged mesh is the one
+            // we may render this frame. applyMerge calls
+            // vkDeviceWaitIdle internally — safe to free the old GPU
+            // mesh because no in-flight GPU work references it.
+            const drained = worker.drain(&pending_results) catch 0;
+            if (drained > 0) {
+                for (pending_results.items) |result| {
+                    defer gpa.free(result.vertices);
+                    defer gpa.free(result.indices);
+                    if (a.id != result.anchorage_id) continue;
+                    a.applyMerge(&gpu, result.vertices, result.indices, result.stats) catch |err| {
+                        std.log.err("anchorage[{d}] applyMerge: {s}", .{ a.id, @errorName(err) });
+                        continue;
+                    };
+                    std.log.info(
+                        "anchorage[{d}]: merge applied ({d} verts / {d} idx, worker {d:.2} ms, bounding r={d:.1} m)",
+                        .{
+                            a.id,
+                            result.stats.vertex_count,
+                            result.stats.index_count,
+                            @as(f64, @floatFromInt(result.elapsed_ns)) / 1.0e6,
+                            result.stats.radius,
+                        },
+                    );
+                }
+                pending_results.clearRetainingCapacity();
+            }
+
+            // M11.3: I key kicks an invalidate. Snapshots cached
+            // PieceRefs into parallel slices + enqueues to the worker.
+            // Heap-allocated; freed after enqueue (worker dup-copies).
+            const i_state = window.handle.getKey(.i);
+            if (i_state == .press and last_i_state == .release) {
+                const n = a.pieces.len;
+                const snap_pieces = gpa.alloc(render.mesh_palette.PieceMesh, n) catch null;
+                const snap_transforms = gpa.alloc(notatlas.math.Mat4, n) catch null;
+                const snap_albedos = gpa.alloc([4]f32, n) catch null;
+                if (snap_pieces != null and snap_transforms != null and snap_albedos != null) {
+                    defer gpa.free(snap_pieces.?);
+                    defer gpa.free(snap_transforms.?);
+                    defer gpa.free(snap_albedos.?);
+                    a.snapshotForMerge(palette_pieces, snap_pieces.?, snap_transforms.?, snap_albedos.?);
+                    worker.enqueue(a.id, .{
+                        .pieces = snap_pieces.?,
+                        .transforms = snap_transforms.?,
+                        .albedos = snap_albedos.?,
+                    }) catch |err| {
+                        std.log.err("anchorage[{d}] enqueue: {s}", .{ a.id, @errorName(err) });
+                    };
+                    std.log.info("anchorage[{d}]: invalidate (enqueued worker job)", .{a.id});
+                } else {
+                    if (snap_pieces) |s| gpa.free(s);
+                    if (snap_transforms) |s| gpa.free(s);
+                    if (snap_albedos) |s| gpa.free(s);
+                    std.log.err("anchorage[{d}] invalidate: OOM building snapshot", .{a.id});
+                }
+            }
+            last_i_state = i_state;
 
             const transition = a.selectLod(world_eye, cli.anchorage_lod_distance);
             switch (transition) {

@@ -100,6 +100,21 @@ pub fn build(b: *std.Build) void {
     const cluster_merge_tests = b.addTest(.{ .root_module = cluster_merge_test_mod });
     test_step.dependOn(&b.addRunArtifact(cluster_merge_tests).step);
 
+    // M11.3 cluster_merge_worker. Worker spawn/enqueue/drain has a
+    // synthetic merge job round-trip test that exercises the producer
+    // /consumer pattern end-to-end. Same dependency shape as the
+    // cluster_merge test target (notatlas math + Vulkan headers for
+    // the cluster_merge import chain).
+    const cluster_merge_worker_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/render/cluster_merge_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cluster_merge_worker_test_mod.addImport("notatlas", notatlas_mod);
+    cluster_merge_worker_test_mod.addIncludePath(vulkan_include);
+    const cluster_merge_worker_tests = b.addTest(.{ .root_module = cluster_merge_worker_test_mod });
+    test_step.dependOn(&b.addRunArtifact(cluster_merge_worker_tests).step);
+
     // Jolt physics — vendored at vendor/JoltPhysics (v5.5.0). Built as a
     // static C++ lib with the same compile defs Jolt's CMake emits for the
     // default x86_64 Linux configuration so headers see a matching ABI when

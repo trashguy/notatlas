@@ -250,6 +250,49 @@ pub const MergedMesh = struct {
         self.index_buffer.deinit();
         self.vertex_buffer.deinit();
     }
+
+    /// M11.3 worker-result path: take pre-baked CPU slices (the worker
+    /// already ran `mergeCluster`) and only do the GPU upload. Caller
+    /// retains ownership of the input slices; we memcpy into mapped
+    /// buffers and the slices can be freed immediately after.
+    pub fn initFromCpu(
+        gpu: *const gpu_mod.GpuContext,
+        vertices: []const MergedVertex,
+        indices: []const u32,
+        stats: MergeStats,
+    ) MergeError!MergedMesh {
+        std.debug.assert(stats.vertex_count == vertices.len);
+        std.debug.assert(stats.index_count == indices.len);
+
+        const vbo_size: vk.VkDeviceSize = vertices.len * @sizeOf(MergedVertex);
+        const ibo_size: vk.VkDeviceSize = indices.len * @sizeOf(u32);
+
+        var vbo = try buffer_mod.Buffer.init(
+            gpu,
+            vbo_size,
+            vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        );
+        errdefer vbo.deinit();
+
+        var ibo = try buffer_mod.Buffer.init(
+            gpu,
+            ibo_size,
+            vk.VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        );
+        errdefer ibo.deinit();
+
+        @memcpy(vbo.mapped[0..vbo_size], std.mem.sliceAsBytes(vertices));
+        @memcpy(ibo.mapped[0..ibo_size], std.mem.sliceAsBytes(indices));
+
+        return .{
+            .vertex_buffer = vbo,
+            .index_buffer = ibo,
+            .vertex_count = stats.vertex_count,
+            .index_count = stats.index_count,
+            .centroid = stats.centroid,
+            .radius = stats.radius,
+        };
+    }
 };
 
 /// Pipeline + descriptor set for the merged-mesh draw path. One
@@ -909,6 +952,54 @@ pub const Anchorage = struct {
             };
         }
         self.instance_ids.clearRetainingCapacity();
+    }
+
+    /// M11.3: snapshot cached piece refs into parallel slices shaped
+    /// for `MergeJob`. Caller owns the slices and frees after the
+    /// worker has consumed them (the worker dup-copies on enqueue, so
+    /// the caller can free as soon as enqueue returns). `out_pieces`
+    /// is filled from the caller-provided palette table — Anchorage
+    /// only knows piece_id, not the PieceMesh body.
+    pub fn snapshotForMerge(
+        self: *const Anchorage,
+        palette: []const palette_mod.PieceMesh,
+        out_pieces: []palette_mod.PieceMesh,
+        out_transforms: []Mat4,
+        out_albedos: [][4]f32,
+    ) void {
+        std.debug.assert(out_pieces.len == self.pieces.len);
+        std.debug.assert(out_transforms.len == self.pieces.len);
+        std.debug.assert(out_albedos.len == self.pieces.len);
+        for (self.pieces, 0..) |ref, i| {
+            std.debug.assert(ref.piece_id < palette.len);
+            out_pieces[i] = palette[ref.piece_id];
+            out_transforms[i] = .{ .data = ref.model };
+            out_albedos[i] = ref.albedo;
+        }
+    }
+
+    /// M11.3: install a worker-produced merged mesh in place of the
+    /// current one. Calls `vkDeviceWaitIdle` first so the old mesh
+    /// isn't being read by an in-flight command buffer when we free
+    /// it. Acceptable because invalidate is rare (damage/placement
+    /// events, not per-frame). If the rate climbs in Phase 3, swap
+    /// for a per-frame pending-destroy ring keyed on the fence.
+    ///
+    /// `gpu` is needed for `vkDeviceWaitIdle` + the new buffer alloc.
+    /// `vertices` + `indices` slices are caller-owned; we memcpy and
+    /// the caller can free immediately on return.
+    pub fn applyMerge(
+        self: *Anchorage,
+        gpu: *const gpu_mod.GpuContext,
+        vertices: []const MergedVertex,
+        indices: []const u32,
+        stats: MergeStats,
+    ) MergeError!void {
+        var new_mesh = try MergedMesh.initFromCpu(gpu, vertices, indices, stats);
+        errdefer new_mesh.deinit();
+        _ = vk.vkDeviceWaitIdle(gpu.device);
+        self.merged.deinit();
+        self.merged = new_mesh;
     }
 };
 
