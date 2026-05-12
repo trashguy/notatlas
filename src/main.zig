@@ -94,16 +94,22 @@ pub fn main() !void {
 
     // M10.1: single-piece palette (the same ±0.5 cube `Box` used). Ship +
     // passengers feed instance rows; one drawIndexed covers them all.
-    // Future piece types (M11) extend the palette without touching this
-    // glue.
-    const palette_pieces = [_]render.mesh_palette.PieceMesh{.{
-        .vertices = &render.box.cube_vertices,
-        .indices = &render.box.cube_indices,
-        // ±0.5 unit cube → smallest enclosing sphere radius = √3/2.
-        .bounds_center = .{ 0, 0, 0 },
-        .bounds_radius = 0.8660254,
-    }};
-    var palette = try render.MeshPalette.init(gpa, &gpu, &palette_pieces);
+    // M10.4: `--piece-types K` replicates the same cube mesh K times so
+    // each gets a distinct PieceEntry (and therefore a distinct
+    // indirect-command bucket). Geometry is identical; the gate measures
+    // bookkeeping, not mesh variety.
+    const palette_pieces = try gpa.alloc(render.mesh_palette.PieceMesh, cli.piece_types);
+    defer gpa.free(palette_pieces);
+    for (palette_pieces) |*p| {
+        p.* = .{
+            .vertices = &render.box.cube_vertices,
+            .indices = &render.box.cube_indices,
+            // ±0.5 unit cube → smallest enclosing sphere radius = √3/2.
+            .bounds_center = .{ 0, 0, 0 },
+            .bounds_radius = 0.8660254,
+        };
+    }
+    var palette = try render.MeshPalette.init(gpa, &gpu, palette_pieces);
     defer palette.deinit();
 
     // Reserve slots for ship + passengers + the optional NxN stress grid.
@@ -273,6 +279,7 @@ pub fn main() !void {
         const half: f32 = @as(f32, @floatFromInt(n - 1)) * spacing * 0.5;
         const lift_y: f32 = 6.0;
         var gi: u32 = 0;
+        var spawn_idx: u32 = 0;
         while (gi < n) : (gi += 1) {
             var gj: u32 = 0;
             while (gj < n) : (gj += 1) {
@@ -286,10 +293,17 @@ pub fn main() !void {
                 const r: f32 = @as(f32, @floatFromInt(gi)) / @as(f32, @floatFromInt(n));
                 const g: f32 = @as(f32, @floatFromInt(gj)) / @as(f32, @floatFromInt(n));
                 const albedo: [4]f32 = .{ r, g, 0.5, 0 };
-                _ = try instanced.addInstance(0, m.data, albedo);
+                // Round-robin across piece types so each bucket has a
+                // ~uniform population — the gate scenario.
+                const piece_id: u32 = spawn_idx % cli.piece_types;
+                _ = try instanced.addInstance(piece_id, m.data, albedo);
+                spawn_idx += 1;
             }
         }
-        std.log.info("M10.1 stress: spawned {d}x{d}={d} static instances", .{ n, n, grid_slot_count });
+        std.log.info(
+            "M10 stress: spawned {d}x{d}={d} static instances across {d} piece type(s)",
+            .{ n, n, grid_slot_count, cli.piece_types },
+        );
     }
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
@@ -306,6 +320,7 @@ pub fn main() !void {
     var soak_stats: SoakStats = .{};
     var wind_soak: WindSoakStats = .{};
     var pax_soak: PaxSoakStats = .{};
+    var frame_soak: FrameSoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -341,6 +356,11 @@ pub fn main() !void {
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
         t += dt;
         perf.tick(frame_ns);
+        // M10.4 gate: per-render-frame timing histogrammed so we can
+        // report p50/p99 at exit without storing every sample. ≥1 sample
+        // outlier from the first frame (shader compile / pipeline cache
+        // miss) is absorbed by the histogram, which is what we want.
+        if (cli.soak_seconds > 0) frame_soak.observe(frame_ns);
 
         // Fixed-step physics. Owe `phys_accum` seconds of sim; consume in
         // exact 1/60 s chunks. `max_steps_per_frame` caps runaway: if the
@@ -550,6 +570,7 @@ pub fn main() !void {
         soak_stats.report(t);
         wind_soak.report(wind_params, t);
         pax_soak.report(t);
+        frame_soak.report(cli, instanced.activeCount(), palette.pieceCount());
     }
 }
 
@@ -758,6 +779,14 @@ const Cli = struct {
     /// exactly one drawIndexed regardless of N (the M10 gate). Static
     /// once placed — updateTransform never called for grid cells.
     instance_grid: u32 = 0,
+    /// M10.4 gate harness: number of distinct piece types the palette
+    /// holds. Grid instances round-robin across them, so each piece type
+    /// gets its own bucket and indirect-command entry. The M10 gate is
+    /// ≤20 piece types renderable at once; setting this to 20 with
+    /// --instance-grid 71 (5041 instances) exercises the published
+    /// target. Piece geometry is identical (the same cube) — only the
+    /// `PieceEntry` bookkeeping differs, which is what the gate measures.
+    piece_types: u32 = 1,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -776,6 +805,10 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--instance-grid")) {
             const v = args.next() orelse return error.MissingInstanceGridValue;
             cli.instance_grid = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--piece-types")) {
+            const v = args.next() orelse return error.MissingPieceTypesValue;
+            cli.piece_types = try std.fmt.parseInt(u32, v, 10);
+            if (cli.piece_types == 0) return error.PieceTypesMustBePositive;
         }
     }
     return cli;
@@ -1010,6 +1043,106 @@ const PaxSoakStats = struct {
             std.log.info("  pax[{d}] ({s}): world_eye y∈[{d:.2},{d:.2}] max_step={d:.4} m", .{
                 i, role, self.y_min[i], self.y_max[i], self.max_step[i],
             });
+        }
+    }
+};
+
+/// M10.4 per-render-frame timing histogram. 0.1 ms bins from 0..50 ms;
+/// frames over 50 ms land in the top bin (won't poison the percentile —
+/// the gate fails on either count anyway). Fixed memory cost (500 u32s)
+/// regardless of soak duration; numerically robust for long runs.
+///
+/// `observe` skips the first `warmup_skip` calls so pipeline-cache misses
+/// + shader compile cost on early frames don't poison the distribution.
+const FrameSoakStats = struct {
+    const bin_count: usize = 500;
+    const bin_width_ms: f64 = 0.1;
+    const warmup_skip: u32 = 30;
+
+    bins: [bin_count]u32 = .{0} ** bin_count,
+    total_samples: u64 = 0,
+    skipped: u32 = 0,
+    max_frame_ns: u64 = 0,
+    min_frame_ns: u64 = std.math.maxInt(u64),
+    sum_frame_ns: u64 = 0,
+
+    fn observe(self: *FrameSoakStats, frame_ns: u64) void {
+        if (self.skipped < warmup_skip) {
+            self.skipped += 1;
+            return;
+        }
+        self.total_samples += 1;
+        self.sum_frame_ns += frame_ns;
+        if (frame_ns > self.max_frame_ns) self.max_frame_ns = frame_ns;
+        if (frame_ns < self.min_frame_ns) self.min_frame_ns = frame_ns;
+
+        const frame_ms: f64 = @as(f64, @floatFromInt(frame_ns)) / 1.0e6;
+        var bin: usize = @intFromFloat(@floor(frame_ms / bin_width_ms));
+        if (bin >= bin_count) bin = bin_count - 1;
+        self.bins[bin] +%= 1;
+    }
+
+    /// Linear-interpolated percentile across the histogram. Returns 0 on
+    /// empty (no samples). Approximate at bin granularity (0.5 ms).
+    fn percentileMs(self: *const FrameSoakStats, p: f64) f64 {
+        if (self.total_samples == 0) return 0;
+        const target = @as(f64, @floatFromInt(self.total_samples)) * (p / 100.0);
+        var cumulative: f64 = 0;
+        var i: usize = 0;
+        while (i < bin_count) : (i += 1) {
+            cumulative += @as(f64, @floatFromInt(self.bins[i]));
+            if (cumulative >= target) {
+                return @as(f64, @floatFromInt(i)) * bin_width_ms + bin_width_ms * 0.5;
+            }
+        }
+        return @as(f64, bin_count) * bin_width_ms;
+    }
+
+    fn report(self: *const FrameSoakStats, cli: Cli, active_instances: u32, piece_types: usize) void {
+        if (self.total_samples == 0) {
+            std.log.info("frame soak: no samples", .{});
+            return;
+        }
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        const avg_ms = (@as(f64, @floatFromInt(self.sum_frame_ns)) / @as(f64, @floatFromInt(self.total_samples))) * ns_to_ms;
+        const min_ms = @as(f64, @floatFromInt(self.min_frame_ns)) * ns_to_ms;
+        const max_ms = @as(f64, @floatFromInt(self.max_frame_ns)) * ns_to_ms;
+        const p50 = self.percentileMs(50.0);
+        const p99 = self.percentileMs(99.0);
+        const fps_avg = 1000.0 / avg_ms;
+
+        // M10 gate: ≤20 draw calls (logical indirect-cmd buckets = piece
+        // type count for now, since every piece has ≥1 instance in the
+        // round-robin distribution). + 60 fps target. The instanced pass
+        // currently issues exactly 1 vkCmdDrawIndexedIndirect/frame, so
+        // the API-level draw call count is 1 regardless.
+        const gate_60fps = avg_ms <= 16.67;
+        const gate_p99 = p99 <= 16.67;
+        const gate_draws = piece_types <= 20;
+
+        std.log.info("==== M10 gate harness ====", .{});
+        std.log.info("  scene: {d} instances across {d} piece type(s) ({d}x{d} grid + 4 dynamic)", .{
+            active_instances, piece_types, cli.instance_grid, cli.instance_grid,
+        });
+        std.log.info("  present mode: {s}", .{if (cli.uncap) "MAILBOX (uncapped)" else "FIFO (vsync — frametime clamped to refresh)"});
+        std.log.info("  frametime: avg {d:.3} ms  min {d:.3}  p50 {d:.2}  p99 {d:.2}  max {d:.3}", .{
+            avg_ms, min_ms, p50, p99, max_ms,
+        });
+        std.log.info("  fps (avg): {d:.1}", .{fps_avg});
+        std.log.info("  samples: {d} (skipped first {d} for warmup)", .{ self.total_samples, self.skipped });
+
+        // Under FIFO the GPU finishes early and idles to vsync; the
+        // p99/max metrics are effectively dropped-frame counts, not
+        // workload cost. Under MAILBOX the histogram reflects real GPU
+        // time. We report both gates either way; only --uncap is
+        // load-bearing for "do we have headroom past the 5000 target."
+        std.log.info("  gate: piece-types≤20 {s} | avg≤16.67ms (60fps) {s} | p99≤16.67ms {s}", .{
+            if (gate_draws) "PASS" else "FAIL",
+            if (gate_60fps) "PASS" else "FAIL",
+            if (gate_p99) "PASS" else "FAIL",
+        });
+        if (!cli.uncap) {
+            std.log.warn("  ^ FIFO mode: p99/max include vsync waits; rerun with --uncap for true GPU cost", .{});
         }
     }
 };
