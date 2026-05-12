@@ -205,7 +205,7 @@ Eight services. Two existing in fallen-runes; six new for notatlas.
 | **ship-sim** | new | 60 Hz | All 60Hz rigid-body authority: per-ship physics (hull/sail/cannon/damage state) + free-agent player physics (Jolt body when not aboard a ship). Aboard-ship players live as ship-local passenger entries on the ship they're attached to. Board / disembark = one-shot transition at this service. See [08 §2A](08-phase1-architecture.md#2a-ship-sim-scope-ships-and-free-agent-players). |
 | **cell-mgr** | new | 10-30 Hz aggregation | Spatial interest within one cell region |
 | **spatial-index** | new | continuous | Entity → cell membership, radius queries |
-| **env** | new | 5 Hz, persisted | Wind field, weather, wave seed, time of day |
+| **env** | new | 5 Hz wind+waves, 1 Hz ToD+storms | Wind field, wave preset, time-of-day, storms-as-cover. Producer side closed 2026-05-12; consumers wired in ship-sim, ai-sim, gateway. |
 | **persistence-writer** | new | seconds-scale, batched | Sole PG writer, consumes change streams |
 | **voice-sfu** | new (LiveKit) | per-client audio | Spatial-filtered voice |
 
@@ -221,7 +221,12 @@ Phase 2 added three more services beyond the canonical 8:
   boot. The explicit rate-limiter between gameplay write rate and
   Postgres capacity (`architecture_inventory_write_buffer.md`).
 
-Still future: `match` (raid window scheduling).
+Still future: `match` (full raid-window scheduling — matchmaking which
+anchorages are raidable when, signaling the hibernation protection
+state). The login-side gate already lives in gateway as of 2026-05-12
+(`data/raid_windows.yaml` + env.time subscription); `match` would
+extend that into per-anchorage scheduling once raids are actually
+playable.
 
 ## NATS subject scheme
 
@@ -236,8 +241,13 @@ sim.entity.<id>.input              # client → entity-owning service
 
 # Cell-bound environmental state (Option D)
 env.cell.<x>_<y>.weather           # JetStream KV
-env.cell.<x>_<y>.wind              # JetStream KV
+env.cell.<x>_<y>.wind              # core NATS, 5 Hz (shipped)
+env.cell.<x>_<y>.waves             # core NATS, 5 Hz (shipped)
 env.cell.<x>_<y>.terrain.delta     # JetStream
+
+# Global environmental state (single broadcast — not cell-keyed)
+env.time                           # core NATS, 1 Hz world-clock + day_fraction
+env.storms                         # core NATS, 1 Hz storm list (Kind.storm=0x04)
 
 # Spatial index
 idx.spatial.cell.<x>_<y>.delta     # JetStream, entity in/out events

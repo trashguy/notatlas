@@ -418,6 +418,96 @@ state. No cascading failures into ship-sim or the player experience.
    (re-acquire targets on warm-up). Phase 2 may want some persistence
    for long-lived AI like patrolling fleets — TBD.
 
+## 13a. Archetype extensibility (ghost ships, kraken, NPC variety)
+
+The architecture supports unconventional NPCs — ghost ships that
+ignore wind, kraken that don't follow ship physics, sentries that
+teleport — **without engine changes**. New content lands as a new
+archetype + new hull. The clean split is what enables this:
+
+### 13a.1 Decision layer (this service)
+
+Each archetype is `data/ai/<archetype>.yaml` (BT shape) +
+`data/ai/<archetype>.lua` (leaves). The `ctx` global pushed by the
+dispatcher always carries the full perception surface
+(§7.1) — wind, nearest storm, nearest enemy, own hp, etc. **Leaves
+choose what to read.**
+
+- A `pirate_sloop.lua` reads `ctx.wind` for sail-aware steering and
+  `ctx.nearest_storm` for visibility cover (see
+  `flee_to_storm_cover` in `data/ai/pirate_sloop.lua`).
+- A `ghost_sloop.lua` simply never references `ctx.wind` or
+  `ctx.nearest_storm`. The ghost ship's BT has no flee branch and no
+  storm-cover leaf — those just don't exist for that archetype.
+- A `kraken.lua` ignores ship-shaped fields entirely and reads
+  `ctx.own_pose` + `ctx.nearest_enemy` only.
+
+No registry lookup, no per-field opt-in flags, no archetype-aware
+code in `perception.zig`. The omission of a field reference in Lua
+is the opt-out.
+
+### 13a.2 Physics layer (ship-sim)
+
+The AI publishes `sim.entity.<id>.input` regardless of archetype
+(thrust / steer / fire). What those inputs *physically mean* is
+determined by the hull yaml at `data/hulls/<hull>.yaml`, loaded by
+ship-sim when the entity spawns. The hull config is where ghosts
+become ghosts:
+
+- **Sail force** is the sum `sail_force = sail_area_m2 × wind_dot ×
+  …`. A hull with `sail_area_m2: 0` gets no wind force. The AI's
+  thrust input still drives the ship via the direct-thrust term;
+  the ship moves but is not wind-coupled. This is the simplest
+  ghost recipe.
+- **Buoyancy** is gated on hull params. A hull with a fixed-altitude
+  attractor (or a buoyancy model that ignores `wave_query`) gets a
+  ship that floats above waves at a constant height — kraken / wraith
+  shapes.
+- **Hit response** likewise lives in hull config. A
+  `hull.damage_model: spectral` hull could be configured to take
+  damage only from blessed-cannonball rounds, leaving normal
+  cannonballs to pass through.
+
+The architectural invariant `architecture_ai_sim_decisions_only.md`
+holds: ai-sim never branches on archetype for physics. The ai-sim
+side stays a pure thrust/steer/fire emitter; the ship-sim side stays
+a pure physics integrator that reads hull config. Add ghosts by
+adding a hull yaml + an archetype yaml + a Lua file. No code edits.
+
+### 13a.3 Where to push back
+
+This architecture works for ships with sail-equivalents — anything
+that moves via the thrust/steer input contract. Two non-ship NPC
+shapes break the contract:
+
+- **Pure aerial / flying NPCs** (gulls, harpies). The thrust/steer
+  input model is 2D + heading; flying entities need pitch + roll
+  control. Either extend the input wire shape, or — more likely —
+  introduce a separate physics entity kind alongside `Kind.ship`
+  (e.g., `Kind.flier=0x05`) with its own input shape.
+- **Stationary spawners** (totems, anchored monsters). These don't
+  need physics inputs at all. They likely belong as a different
+  entity kind that ai-sim drives via a different output subject
+  (e.g., `sim.entity.<id>.spawn_request`).
+
+Those are entity-kind extensions, not archetype additions — and they
+are deliberately out of v1 scope. The boundary is clean: same
+input wire → archetype lift; new wire → new entity kind.
+
+### 13a.4 Implementation cost when first ghost ship lands
+
+Rough estimate of work (not now — when content asks):
+
+- `data/hulls/ghost_sloop.yaml`: ~30 lines, mostly extending
+  `_base.yaml` and zeroing sail_area_m2 (~1 commit)
+- `data/ai/ghost_sloop.yaml` + `data/ai/ghost_sloop.lua`: ~100
+  lines total, modeled on `pirate_sloop.*` (~1-2 commits)
+- ship-sim spawn flag (`--ai-ship 3 --hull ghost_sloop`): ~10 LOC
+  if the loader doesn't already wire it (~part of the above commit)
+- Smoke harness asserting ghost ship moves with zero wind: ~30 LOC
+
+Total: half a day, no engine code.
+
 ## 14. Implementation order
 
 When ai-sim's turn comes (after combat slice scaffolding closes — see

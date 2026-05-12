@@ -46,7 +46,21 @@ than state owners.
 
 ## Status
 
-As of 2026-04-27: design and architecture front is closed (ratified). Next
-deliverable is Phase 0 work — the engine water lift (Gerstner ocean + wave
-query + buoyancy + ship-as-vehicle in the sandbox). See
-[roadmap.md](04-roadmap.md).
+As of 2026-05-12:
+
+- **Phase 0 (engine water lift)** closed 2026-04-28 — Gerstner ocean,
+  wave-query, buoyancy, wind, ship-as-vehicle.
+- **Phase 1 (networked ship combat)** closed 2026-05-01 — M1.5 stress
+  gate held at 30 ships × 50 clients on a single cell.
+- **Phase 2 (architectural payoff)** in progress:
+  - cell-mgr / spatial-index / cross-cell transit — closed
+  - persistence-writer + 4-producer SLA arc — closed 2026-05-11;
+    multi-stream stress gate green 2026-05-12 at 1000 inv/s sustained
+  - env service (wind / waves / time-of-day / storms) — producer
+    side + consumers closed 2026-05-12
+  - M10/M11/M12 client renderer — next up (gpu-driven instancing,
+    structure LOD merge, animation LOD)
+
+Design and architecture front is closed (ratified). See
+[roadmap.md](04-roadmap.md) for the full delivery plan and stress-test
+gates.

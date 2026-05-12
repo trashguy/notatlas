@@ -118,10 +118,11 @@ when waves pass. Doesn't sink, doesn't fly. Stable for 5 minutes.
 
 ---
 
-### 4. wind-field (server, env service)
+### 4. wind-field + env service (server, env service)
 
 2D vector field over world coordinates. Owned by the env service.
-Published via JetStream KV. Sails consume it to compute force.
+Published over core NATS (not JetStream KV — see below). Sails
+consume it to compute force.
 
 **API surface:**
 ```zig
@@ -133,10 +134,30 @@ region) with smooth interpolation, plus storm cells as perturbations
 that travel across the world.
 
 **Data:** `data/wind.yaml` — global rotation period, gust frequency,
-storm cell spawn parameters.
+storm cell spawn parameters. `data/waves/<preset>.yaml` — wave kernel
+preset published as the active wave state.
 
-**NATS:** env service publishes `env.cell.<x>_<y>.wind` JetStream KV
-on change (~1 Hz).
+**NATS surface (shipped 2026-05-11 / 2026-05-12):**
+- `env.cell.<x>_<y>.wind` — core NATS, 5 Hz per cell. Ship-sim
+  consumes for sail-force; ai-sim caches per cell for perception
+  ctx.wind.
+- `env.cell.<x>_<y>.waves` — core NATS, 5 Hz per cell. WaveMsg
+  preset broadcast; ship-sim swaps `wave_params` at runtime
+  (`wave_broadcast_smoke.sh`).
+- `env.time` — core NATS, 1 Hz global. Carries `world_time_s` +
+  `day_fraction`. Gateway subscribes for the raid-window login
+  gate (`data/raid_windows.yaml`); sky shaders subscribe for the
+  dawn/dusk gradient.
+- `env.storms` — core NATS, 1 Hz global broadcast of all active
+  storm centers with Kind.storm (0x04) top-byte tags. AI consumes
+  for cover-bias (`flee_to_storm_cover` leaf); visibility / fog /
+  audio later.
+
+Core NATS chosen over JetStream KV because v0 publish cadence is low
+(≤ 5 Hz per cell), all consumers are happy with at-most-once
+semantics (boot races resolve at the first publish), and avoiding
+KV keeps the failure mode trivial. Migrate to KV if a consumer
+needs the "what's the current value" replay-on-attach property.
 
 **Milestone gate (M4):** wind direction visible via debug arrows; client
 samples match server; storm cells travel across the world over hours.
