@@ -51,6 +51,22 @@ comptime {
     std.debug.assert(@offsetOf(Instance, "bounds") == 80);
 }
 
+/// Wire-compatible with `VkDrawIndexedIndirectCommand`. 20 B fixed layout
+/// per the Vulkan spec; we build one entry per non-empty piece bucket each
+/// frame, upload to `indirect_buffer`, and let the driver dispatch via
+/// `vkCmdDrawIndexedIndirect`.
+pub const DrawIndexedIndirectCommand = extern struct {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    vertex_offset: i32,
+    first_instance: u32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(DrawIndexedIndirectCommand) == 20);
+}
+
 /// Sentinel piece_id meaning "this slot is dead — skip at draw time."
 /// `addInstance` rejects this value as input; `destroy` writes it.
 const TOMBSTONE: u32 = std.math.maxInt(u32);
@@ -78,10 +94,18 @@ pub const Instanced = struct {
     descriptor_set: vk.VkDescriptorSet,
 
     /// Per-instance SSBO. Host-visible coherent so `record` writes through
-    /// the persistent map; M10.2 may move to a device-local + staging copy
+    /// the persistent map; M10.3 may move to a device-local + staging copy
     /// once we measure the cost of host-visible-on-GPU bandwidth.
     instance_buffer: buffer_mod.Buffer,
     max_instances: u32,
+
+    /// M10.2 indirect-draw command buffer. Sized for one
+    /// `DrawIndexedIndirectCommand` per piece type. Per frame we populate
+    /// the first `draw_count` entries and call `vkCmdDrawIndexedIndirect`
+    /// once. M10.3 will swap this CPU build for compute-shader output and
+    /// use `vkCmdDrawIndexedIndirectCount`.
+    indirect_buffer: buffer_mod.Buffer,
+    indirect_scratch: []DrawIndexedIndirectCommand,
 
     /// CPU storage. Slot index is the stable `InstanceId`. `n_slots` is the
     /// high-water mark — slots [0, n_slots) are either active or
@@ -135,6 +159,13 @@ pub const Instanced = struct {
         );
         errdefer instance_buffer.deinit();
 
+        var indirect_buffer = try buffer_mod.Buffer.init(
+            gpu,
+            @as(vk.VkDeviceSize, palette.pieces.len) * @sizeOf(DrawIndexedIndirectCommand),
+            vk.VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        );
+        errdefer indirect_buffer.deinit();
+
         const pool = try createDescriptorPool(gpu.device);
         errdefer vk.vkDestroyDescriptorPool(gpu.device, pool, null);
 
@@ -155,6 +186,8 @@ pub const Instanced = struct {
         errdefer gpa.free(offsets);
         const cursors = try gpa.alloc(u32, piece_count);
         errdefer gpa.free(cursors);
+        const indirect = try gpa.alloc(DrawIndexedIndirectCommand, piece_count);
+        errdefer gpa.free(indirect);
 
         return .{
             .gpa = gpa,
@@ -167,6 +200,8 @@ pub const Instanced = struct {
             .descriptor_set = set,
             .instance_buffer = instance_buffer,
             .max_instances = max_instances,
+            .indirect_buffer = indirect_buffer,
+            .indirect_scratch = indirect,
             .instances = instances,
             .pieces_per_instance = pieces,
             .free_list = .empty,
@@ -180,6 +215,7 @@ pub const Instanced = struct {
 
     pub fn deinit(self: *Instanced) void {
         self.free_list.deinit(self.gpa);
+        self.gpa.free(self.indirect_scratch);
         self.gpa.free(self.bucket_cursors);
         self.gpa.free(self.bucket_offsets);
         self.gpa.free(self.bucket_counts);
@@ -188,6 +224,7 @@ pub const Instanced = struct {
         self.gpa.free(self.instances);
 
         vk.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+        self.indirect_buffer.deinit();
         self.instance_buffer.deinit();
         vk.vkDestroyPipeline(self.device, self.pipeline, null);
         vk.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
@@ -329,24 +366,41 @@ pub const Instanced = struct {
         vk.vkCmdBindVertexBuffers(cb, 0, 1, &self.palette.vertex_buffer.handle, &offset);
         vk.vkCmdBindIndexBuffer(cb, self.palette.index_buffer.handle, 0, vk.VK_INDEX_TYPE_UINT16);
 
-        // 6. One drawIndexed per non-empty bucket.
-        var draw_calls: u32 = 0;
+        // 6. M10.2: pack one indirect command per non-empty bucket and let
+        // the driver dispatch them in a single vkCmdDrawIndexedIndirect.
+        // The actual API draw-call count is now exactly 1 regardless of
+        // the number of piece types; the returned `draw_count` is the
+        // number of *logical* indirect commands, which is what the M10
+        // gate cares about (≤20 piece types renderable at once).
+        var draw_count: u32 = 0;
         p = 0;
         while (p < piece_count) : (p += 1) {
             const count = self.bucket_counts[p];
             if (count == 0) continue;
             const entry = self.palette.pieces[p];
-            vk.vkCmdDrawIndexed(
-                cb,
-                entry.index_count,
-                count,
-                entry.first_index,
-                entry.vertex_offset,
-                self.bucket_offsets[p],
-            );
-            draw_calls += 1;
+            self.indirect_scratch[draw_count] = .{
+                .index_count = entry.index_count,
+                .instance_count = count,
+                .first_index = entry.first_index,
+                .vertex_offset = entry.vertex_offset,
+                .first_instance = self.bucket_offsets[p],
+            };
+            draw_count += 1;
         }
-        return draw_calls;
+
+        if (draw_count == 0) return 0;
+
+        const cmd_bytes = std.mem.sliceAsBytes(self.indirect_scratch[0..draw_count]);
+        @memcpy(self.indirect_buffer.mapped[0..cmd_bytes.len], cmd_bytes);
+
+        vk.vkCmdDrawIndexedIndirect(
+            cb,
+            self.indirect_buffer.handle,
+            0,
+            draw_count,
+            @sizeOf(DrawIndexedIndirectCommand),
+        );
+        return draw_count;
     }
 
     /// Hot-reload entry: rebuild the pipeline against fresh SPIR-V. Mirrors

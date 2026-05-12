@@ -365,7 +365,15 @@ fn createLogicalDevice(
     }
 
     const exts = [_][*:0]const u8{vk.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    const features = std.mem.zeroes(vk.VkPhysicalDeviceFeatures);
+    // M10.2: enable indirect-draw features. `multiDrawIndirect` lets
+    // `vkCmdDrawIndexedIndirect` issue more than one command per call;
+    // `drawIndirectFirstInstance` lets indirect commands carry a non-zero
+    // firstInstance (we use it to point each piece-bucket at its base row
+    // in the instance SSBO). Both are core 1.0 optional features supported
+    // by every desktop GPU we target.
+    var features = std.mem.zeroes(vk.VkPhysicalDeviceFeatures);
+    features.multiDrawIndirect = vk.VK_TRUE;
+    features.drawIndirectFirstInstance = vk.VK_TRUE;
 
     const create_info = vk.VkDeviceCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,

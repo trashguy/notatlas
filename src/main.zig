@@ -106,13 +106,17 @@ pub fn main() !void {
     var palette = try render.MeshPalette.init(gpa, &gpu, &palette_pieces);
     defer palette.deinit();
 
+    // Reserve slots for ship + passengers + the optional NxN stress grid.
+    // Grid slots only allocated if --instance-grid > 0; the SSBO sizes for
+    // the high-water mark either way.
+    const grid_slot_count: u32 = cli.instance_grid * cli.instance_grid;
     var instanced = try render.Instanced.init(
         gpa,
         &gpu,
         frame.render_pass,
         ocean.camera_ubo.handle,
         &palette,
-        pax_total_count,
+        pax_total_count + grid_slot_count,
     );
     defer instanced.deinit();
 
@@ -257,6 +261,35 @@ pub fn main() !void {
     var pax_instances: [npc_pax_count]render.instanced.InstanceId = undefined;
     for (0..npc_pax_count) |i| {
         pax_instances[i] = try instanced.addInstance(0, initial_model, npc_albedo[i]);
+    }
+
+    // M10.1 stress smoke. NxN cubes spaced 4 m apart on a flat grid
+    // centered on the ship and lifted ~6 m above sea level. Static — IDs
+    // are discarded since we never updateTransform. Albedo is a procedural
+    // gradient over (i, j) so visually it's obvious if any cell is missing.
+    if (cli.instance_grid > 0) {
+        const n = cli.instance_grid;
+        const spacing: f32 = 4.0;
+        const half: f32 = @as(f32, @floatFromInt(n - 1)) * spacing * 0.5;
+        const lift_y: f32 = 6.0;
+        var gi: u32 = 0;
+        while (gi < n) : (gi += 1) {
+            var gj: u32 = 0;
+            while (gj < n) : (gj += 1) {
+                const x = @as(f32, @floatFromInt(gi)) * spacing - half;
+                const z = @as(f32, @floatFromInt(gj)) * spacing - half;
+                const m = notatlas.math.Mat4.trs(
+                    notatlas.math.Vec3.init(x, lift_y, z),
+                    .{ 0, 0, 0, 1 },
+                    notatlas.math.Vec3.init(1, 1, 1),
+                );
+                const r: f32 = @as(f32, @floatFromInt(gi)) / @as(f32, @floatFromInt(n));
+                const g: f32 = @as(f32, @floatFromInt(gj)) / @as(f32, @floatFromInt(n));
+                const albedo: [4]f32 = .{ r, g, 0.5, 0 };
+                _ = try instanced.addInstance(0, m.data, albedo);
+            }
+        }
+        std.log.info("M10.1 stress: spawned {d}x{d}={d} static instances", .{ n, n, grid_slot_count });
     }
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
@@ -718,6 +751,13 @@ const Cli = struct {
     /// Run the loop for this many seconds with pose telemetry accumulated,
     /// then print stats and exit. 0 = normal interactive run.
     soak_seconds: f32 = 0,
+    /// M10.1 stress smoke: spawn an N×N grid of static cubes around the
+    /// ship at startup. 0 = disabled. Validates the instanced renderer's
+    /// SSBO/bucket/draw path scales beyond the 4 dynamic instances the
+    /// sandbox uses by default; per piece-type bucketing still issues
+    /// exactly one drawIndexed regardless of N (the M10 gate). Static
+    /// once placed — updateTransform never called for grid cells.
+    instance_grid: u32 = 0,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -733,6 +773,9 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--soak")) {
             const v = args.next() orelse return error.MissingSoakValue;
             cli.soak_seconds = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--instance-grid")) {
+            const v = args.next() orelse return error.MissingInstanceGridValue;
+            cli.instance_grid = try std.fmt.parseInt(u32, v, 10);
         }
     }
     return cli;
