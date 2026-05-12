@@ -173,6 +173,8 @@ pub fn build(b: *std.Build) void {
     embedShader(b, sandbox_mod, "assets/shaders/water.frag", "water_frag_spv");
     embedShader(b, sandbox_mod, "assets/shaders/box.vert", "box_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/box.frag", "box_frag_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/instanced.vert", "instanced_vert_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/instanced.frag", "instanced_frag_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.vert", "wind_arrows_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.frag", "wind_arrows_frag_spv");
 

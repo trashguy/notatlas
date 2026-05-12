@@ -27,8 +27,8 @@ const arrow_grid_step_m: f32 = 50.0;
 const arrow_count: u32 = arrow_grid_dim * arrow_grid_dim;
 const vert_shader_path = "assets/shaders/fullscreen.vert";
 const frag_shader_path = "assets/shaders/water.frag";
-const box_vert_shader_path = "assets/shaders/box.vert";
-const box_frag_shader_path = "assets/shaders/box.frag";
+const instanced_vert_shader_path = "assets/shaders/instanced.vert";
+const instanced_frag_shader_path = "assets/shaders/instanced.frag";
 
 /// Passenger count for the M5.5 multi-pax demo. Three NPCs scattered on
 /// the deck at fixed local poses with distinct colors. Every frame their
@@ -40,13 +40,12 @@ const pax_total_count: u32 = 1 + npc_pax_count;
 
 const Scene = struct {
     ocean: *render.Ocean,
-    box: *render.Box,
+    /// M10.1: GPU-driven instancing path. Ship + passengers all live as
+    /// slots in one SSBO and render in a single drawIndexed (one piece
+    /// type for now). main.zig calls `updateTransform(id, ...)` each frame
+    /// from the interpolated ship pose; albedos are written once at init.
+    instanced: *render.Instanced,
     arrows: *render.WindArrows,
-    /// Combined ship + passenger draws share the Box pipeline. Index 0 is
-    /// the ship itself; 1..=npc_pax_count are the NPC passengers. main.zig
-    /// repopulates these every frame from the interpolated ship pose.
-    box_models: [1 + npc_pax_count][16]f32,
-    box_albedos: [1 + npc_pax_count][4]f32,
 };
 
 pub fn main() !void {
@@ -93,16 +92,36 @@ pub fn main() !void {
     var ocean = try render.Ocean.init(gpa, &gpu, frame.render_pass, .{});
     defer ocean.deinit();
 
-    var box = try render.Box.init(&gpu, frame.render_pass, ocean.camera_ubo.handle);
-    defer box.deinit();
+    // M10.1: single-piece palette (the same ±0.5 cube `Box` used). Ship +
+    // passengers feed instance rows; one drawIndexed covers them all.
+    // Future piece types (M11) extend the palette without touching this
+    // glue.
+    const palette_pieces = [_]render.mesh_palette.PieceMesh{.{
+        .vertices = &render.box.cube_vertices,
+        .indices = &render.box.cube_indices,
+        // ±0.5 unit cube → smallest enclosing sphere radius = √3/2.
+        .bounds_center = .{ 0, 0, 0 },
+        .bounds_radius = 0.8660254,
+    }};
+    var palette = try render.MeshPalette.init(gpa, &gpu, &palette_pieces);
+    defer palette.deinit();
+
+    var instanced = try render.Instanced.init(
+        gpa,
+        &gpu,
+        frame.render_pass,
+        ocean.camera_ubo.handle,
+        &palette,
+        pax_total_count,
+    );
+    defer instanced.deinit();
+
     var arrows = try render.WindArrows.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, arrow_count);
     defer arrows.deinit();
     var scene: Scene = .{
         .ocean = &ocean,
-        .box = &box,
+        .instanced = &instanced,
         .arrows = &arrows,
-        .box_models = .{[_]f32{0} ** 16} ** (1 + npc_pax_count),
-        .box_albedos = .{.{ 0, 0, 0, 0 }} ** (1 + npc_pax_count),
     };
 
     const wave_params = try loadWaves(gpa, wave_config_path);
@@ -223,6 +242,22 @@ pub fn main() !void {
         npc_pax[i].boardShip(box_id, npc_init[i].local_pos);
         npc_pax[i].yaw = npc_init[i].yaw;
     }
+
+    // M10.1: allocate one instance slot for the ship and one per passenger.
+    // IDs are stable until destroy(); we hold them for the lifetime of the
+    // sandbox and call updateTransform() once per frame from the
+    // interpolated pose. Albedo is fixed at addInstance time.
+    const initial_model: [16]f32 = .{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    };
+    const ship_instance = try instanced.addInstance(0, initial_model, render.box.ship_albedo);
+    var pax_instances: [npc_pax_count]render.instanced.InstanceId = undefined;
+    for (0..npc_pax_count) |i| {
+        pax_instances[i] = try instanced.addInstance(0, initial_model, npc_albedo[i]);
+    }
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -267,7 +302,7 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &box, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
+        if (events.any()) handleReload(gpa, &ocean, &instanced, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -357,8 +392,7 @@ pub fn main() !void {
             render_rot,
             notatlas.math.Vec3.init(2 * hull.half_extents[0], 2 * hull.half_extents[1], 2 * hull.half_extents[2]),
         );
-        scene.box_models[0] = ship_model.data;
-        scene.box_albedos[0] = render.box.ship_albedo;
+        instanced.updateTransform(ship_instance, ship_model.data);
 
         // Indices 1.. = NPC passengers, composed as ship_pose ⊗ pax_local.
         // ship_pose_only is unscaled (identity scale); the per-pax scale
@@ -384,8 +418,10 @@ pub fn main() !void {
                 notatlas.math.quatYaw(p.yaw),
                 notatlas.math.Vec3.init(0.5, 1.7, 0.5),
             );
-            scene.box_models[1 + i] = notatlas.math.Mat4.mul(ship_pose_only, local_model).data;
-            scene.box_albedos[1 + i] = npc_albedo[i];
+            instanced.updateTransform(
+                pax_instances[i],
+                notatlas.math.Mat4.mul(ship_pose_only, local_model).data,
+            );
         }
 
         if (cli.soak_seconds > 0 and t >= cli.soak_seconds) break;
@@ -534,7 +570,7 @@ fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.Buoyanc
 fn handleReload(
     gpa: std.mem.Allocator,
     ocean: *render.Ocean,
-    box: *render.Box,
+    instanced: *render.Instanced,
     arrows: *render.WindArrows,
     hull: *notatlas.hull_params.HullParams,
     buoy: *physics.Buoyancy,
@@ -605,12 +641,12 @@ fn handleReload(
             return;
         };
 
-        const box_vert_spv = render.shader_compile.compileGlsl(gpa, box_vert_shader_path, "box.vert") catch return;
-        defer gpa.free(box_vert_spv);
-        const box_frag_spv = render.shader_compile.compileGlsl(gpa, box_frag_shader_path, "box.frag") catch return;
-        defer gpa.free(box_frag_spv);
-        box.reloadShaders(render_pass, box_vert_spv, box_frag_spv) catch |err| {
-            std.log.err("reload box shaders: {s}", .{@errorName(err)});
+        const inst_vert_spv = render.shader_compile.compileGlsl(gpa, instanced_vert_shader_path, "instanced.vert") catch return;
+        defer gpa.free(inst_vert_spv);
+        const inst_frag_spv = render.shader_compile.compileGlsl(gpa, instanced_frag_shader_path, "instanced.frag") catch return;
+        defer gpa.free(inst_frag_spv);
+        instanced.reloadShaders(render_pass, inst_vert_spv, inst_frag_spv) catch |err| {
+            std.log.err("reload instanced shaders: {s}", .{@errorName(err)});
             return;
         };
 
@@ -634,12 +670,10 @@ fn recordScene(
 ) void {
     const scene: *Scene = @ptrCast(@alignCast(ctx));
     scene.ocean.record(cb, extent);
-    // Single Box bind, multiple draws: ship + N passengers share the
-    // pipeline and mesh; only push constants change per draw.
-    scene.box.bind(cb, extent);
-    for (0..scene.box_models.len) |i| {
-        scene.box.draw(cb, scene.box_models[i], scene.box_albedos[i]);
-    }
+    // M10.1: single SSBO-driven instanced pass covers ship + passengers in
+    // one drawIndexed per piece type (currently 1). Return is the draw-call
+    // count; we discard it here — the M10.4 gate harness will sample it.
+    _ = scene.instanced.record(cb, extent);
     scene.arrows.record(cb, extent);
 }
 
