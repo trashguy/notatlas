@@ -121,8 +121,8 @@ pub const Ocean = struct {
         self.pipeline.deinit();
     }
 
-    pub fn updateCamera(self: *Ocean, camera: camera_mod.Camera) void {
-        const ubo = camera_mod.Ubo.fromCamera(camera);
+    pub fn updateCamera(self: *Ocean, camera: camera_mod.Camera, time_s: f32) void {
+        const ubo = camera_mod.Ubo.fromCamera(camera, time_s);
         self.camera_ubo.upload(std.mem.asBytes(&ubo));
     }
 

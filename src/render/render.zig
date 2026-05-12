@@ -15,6 +15,7 @@ pub const mesh_palette = @import("mesh_palette.zig");
 pub const instanced = @import("instanced.zig");
 pub const cluster_merge = @import("cluster_merge.zig");
 pub const cluster_merge_worker = @import("cluster_merge_worker.zig");
+pub const anim_lod = @import("anim_lod.zig");
 pub const wind_arrows = @import("wind_arrows.zig");
 pub const waves = @import("waves.zig");
 pub const ocean_uniform = @import("ocean_uniform.zig");

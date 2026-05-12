@@ -383,6 +383,20 @@ pub const Instanced = struct {
         self.instances[id].albedo = albedo;
     }
 
+
+    /// M12: pack per-instance vertex-shader anim params into the
+    /// reserved `meta.yz` slots. `meta.y` = floatBitsToUint(phase) in
+    /// radians; `meta.z` = floatBitsToUint(amplitude) in metres. Both
+    /// default to 0.0 (no anim) so unused instances are unaffected.
+    /// The shader reads them via uintBitsToFloat and adds a Y bobble
+    /// proportional to amp · sin(time + phase). amp=0 short-circuits.
+    pub fn setAnimParams(self: *Instanced, id: InstanceId, phase: f32, amp: f32) void {
+        std.debug.assert(id < self.n_slots);
+        std.debug.assert(self.pieces_per_instance[id] != TOMBSTONE);
+        self.instances[id].meta[1] = @bitCast(phase);
+        self.instances[id].meta[2] = @bitCast(amp);
+    }
+
     /// Mark a slot dead and return it to the free list. Subsequent
     /// `addInstance` calls may reuse the same id, so callers must drop
     /// their handle on destroy.

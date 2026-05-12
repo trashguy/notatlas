@@ -25,7 +25,11 @@ struct Instance {
     mat4 model;    // column-major, rigid-ish; cull reads max-axis scale
     vec4 albedo;   // xyz = sRGB-ish color, w = unused (std430 padding)
     vec4 bounds;   // xyz = piece-local center, w = radius (cull transforms by model)
-    uvec4 meta;    // x = piece_id (cull reads); yzw reserved
+    // meta.x = piece_id (cull reads);
+    // meta.y = floatBitsToUint(M12 anim phase, radians)   — 0 = no anim
+    // meta.z = floatBitsToUint(M12 anim amplitude, metres) — 0 = no anim
+    // meta.w = reserved
+    uvec4 meta;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer Instances {
@@ -50,6 +54,20 @@ void main() {
     Instance inst = instances.data[orig];
 
     vec4 wp = inst.model * vec4(i_pos, 1.0);
+
+    // M12 vertex-shader anim atlas. amp = 0 (default for ships, pax,
+    // grid, anchorage pieces) short-circuits — no displacement, no
+    // extra work beyond the uintBitsToFloat decode. Non-zero amp is
+    // set only by `Instanced.setAnimParams` on M12 characters; their
+    // far-tier CPU path does NOT call updateTransform, so this is
+    // the ONLY signal that moves them. cam.eye.w carries monotonic
+    // seconds (see src/render/camera.zig).
+    float amp = uintBitsToFloat(inst.meta.z);
+    if (amp != 0.0) {
+        float phase = uintBitsToFloat(inst.meta.y);
+        wp.y += amp * sin(cam.eye.w * 2.0 + phase);
+    }
+
     v_world_pos = wp.xyz;
     v_world_normal = mat3(inst.model) * i_normal;
     v_albedo = inst.albedo.xyz;

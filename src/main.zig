@@ -128,8 +128,8 @@ pub fn main() !void {
     // Reserve slots for ship + passengers + the optional NxN stress grid
     // + the optional M11.2 anchorage (which only consumes Instanced slots
     // when in near-LOD; reserved up-front to avoid allocator churn on
-    // every LOD transition). The SSBO sizes for the high-water mark
-    // either way.
+    // every LOD transition) + the optional M12 character pool. The SSBO
+    // sizes for the high-water mark either way.
     const grid_slot_count: u32 = cli.instance_grid * cli.instance_grid;
     var instanced = try render.Instanced.init(
         gpa,
@@ -137,7 +137,7 @@ pub fn main() !void {
         frame.render_pass,
         ocean.camera_ubo.handle,
         &palette,
-        pax_total_count + grid_slot_count + cli.anchorage_pieces,
+        pax_total_count + grid_slot_count + cli.anchorage_pieces + cli.m12_chars,
     );
     defer instanced.deinit();
     instanced.setCullEnabled(!cli.no_cull);
@@ -448,6 +448,103 @@ pub fn main() !void {
         scene.anchorage = a;
     }
 
+    // M12.1: spawn N "characters" in three deterministic distance
+    // bands around the ship spawn. The bands are weighted so each
+    // tier (.near / .mid / .far) gets ~equal coverage at the §12 gate
+    // numbers (200 chars: ~67 near, ~67 mid, ~66 far). Geometry is the
+    // same procedural cube the grid + anchorage use — the M12 gate
+    // measures the CPU anim dispatch, not the visuals.
+    var m12_chars: []render.anim_lod.Character = &.{};
+    defer gpa.free(m12_chars);
+    var m12_system: ?render.anim_lod.System = null;
+    if (cli.m12_chars > 0) {
+        m12_chars = try gpa.alloc(render.anim_lod.Character, cli.m12_chars);
+        var prng = std.Random.DefaultPrng.init(0xC1A12C1A);
+        const rng = prng.random();
+        // Three concentric bands centered on the ship spawn (0, ~5, 0).
+        // Band radii chosen so each band's midpoint lands in the
+        // correct tier under the default 30/100 thresholds.
+        const near_band_max: f32 = cli.m12_near_threshold * 0.85; // ~25 m
+        const mid_band_min: f32 = cli.m12_near_threshold * 1.15; // ~34 m
+        const mid_band_max: f32 = cli.m12_mid_threshold * 0.85; // ~85 m
+        const far_band_min: f32 = cli.m12_mid_threshold * 1.20; // ~120 m
+        const far_band_max: f32 = cli.m12_mid_threshold * 2.00; // ~200 m
+        const n: u32 = cli.m12_chars;
+        const near_count: u32 = n / 3;
+        const mid_count: u32 = n / 3;
+        // far_count = remainder so totals always sum to n
+        var k: u32 = 0;
+        while (k < n) : (k += 1) {
+            const band_lo: f32 = if (k < near_count)
+                0.0
+            else if (k < near_count + mid_count)
+                mid_band_min
+            else
+                far_band_min;
+            const band_hi: f32 = if (k < near_count)
+                near_band_max
+            else if (k < near_count + mid_count)
+                mid_band_max
+            else
+                far_band_max;
+            const r: f32 = band_lo + (band_hi - band_lo) * rng.float(f32);
+            const theta: f32 = rng.float(f32) * std.math.tau;
+            const ax: f32 = r * @cos(theta);
+            const az: f32 = r * @sin(theta);
+            // Place at y=0.5 (just above the deck plane in the
+            // sandbox). The bobble adds ≤amp on top.
+            const ay: f32 = 0.5;
+            const piece_id: u32 = 0; // any palette slot works — the cube
+            const albedo: [4]f32 = .{
+                0.7 + 0.3 * rng.float(f32),
+                0.5 + 0.3 * rng.float(f32),
+                0.4 + 0.3 * rng.float(f32),
+                1.0,
+            };
+            const model: [16]f32 = .{
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                ax, ay, az, 1,
+            };
+            const id = try instanced.addInstance(piece_id, model, albedo);
+            const phase: f32 = rng.float(f32) * std.math.tau;
+            const amp: f32 = 0.15 + 0.25 * rng.float(f32);
+            // Stamp the per-instance anim params into the SSBO so the
+            // vertex shader can apply the bobble regardless of tier
+            // (M12.2). Far tier relies on this exclusively; near/mid
+            // get a shader bobble plus whatever CPU work simBones
+            // accumulates. amp != 0 is the "anim-eligible" signal.
+            instanced.setAnimParams(id, phase, amp);
+            m12_chars[k] = .{
+                .id = id,
+                .base_model = model,
+                .anchor = .{ ax, ay, az },
+                .phase = phase,
+                .amp = amp,
+            };
+        }
+        m12_system = render.anim_lod.System.init(m12_chars, .{
+            .near_threshold = cli.m12_near_threshold,
+            .mid_threshold = cli.m12_mid_threshold,
+            .mid_hz = cli.m12_mid_hz,
+            .near_bones = cli.m12_near_bones,
+            .mid_bones = cli.m12_mid_bones,
+        });
+        std.log.info(
+            "M12 chars: {d} (near≤{d:.1} m, mid≤{d:.1} m, far>{d:.1} m; mid_hz={d:.1}, bones near={d} mid={d})",
+            .{
+                n,
+                cli.m12_near_threshold,
+                cli.m12_mid_threshold,
+                cli.m12_mid_threshold,
+                cli.m12_mid_hz,
+                cli.m12_near_bones,
+                cli.m12_mid_bones,
+            },
+        );
+    }
+
     var last_cursor: ?[2]f64 = null;
     var cursor_captured: bool = false;
     // Capture the cursor at startup so mouse-look works from the first frame.
@@ -464,6 +561,7 @@ pub fn main() !void {
     var wind_soak: WindSoakStats = .{};
     var pax_soak: PaxSoakStats = .{};
     var frame_soak: FrameSoakStats = .{};
+    var m12_soak: M12SoakStats = .{};
 
     // 1Hz frame-time HUD for the M2.7 perf gate. Bar is ≤6.7 ms /
     // ≥150 fps on the dev box (RX 9070 XT @ 1280×720). Discard the
@@ -677,7 +775,7 @@ pub fn main() !void {
             .fov_y = player.fov_y,
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
-        ocean.updateCamera(camera);
+        ocean.updateCamera(camera, t);
         ocean.updateTime(t);
         // M10.3: stash view-proj for the prePass cull dispatch. Same
         // matrices the ocean UBO got — guarantees cull frustum matches
@@ -792,6 +890,16 @@ pub fn main() !void {
             }
         }
 
+        // M12.1: tier-dispatched placeholder anim tick. Runs BEFORE
+        // `instanced.prepareFrame` so any writeTransform() calls land
+        // in the same SSBO upload. `world_eye` is the camera-space
+        // anchor used for the bucket test — same vector the anchorage
+        // selectLod uses, so the two systems agree on "distance".
+        if (m12_system) |*sys| {
+            sys.tick(world_eye, dt, &instanced);
+            if (cli.soak_seconds > 0) m12_soak.observe(&sys.last);
+        }
+
         // M10.3: CPU bucket/scatter/upload runs BEFORE `frame.draw` so the
         // indirect + instance buffers are visible to the compute culler
         // (which dispatches in `prePass` outside the render pass).
@@ -843,6 +951,13 @@ pub fn main() !void {
             frame_soak.avgMs(),
             frame_soak.percentileMs(99.0),
             if (anchorage) |*a| a else null,
+        );
+        // M12 gate block. Reads the per-frame anim-tick stats observed
+        // during the soak + frame-time aggregates already computed.
+        m12_soak.report(
+            cli,
+            frame_soak.avgMs(),
+            frame_soak.percentileMs(99.0),
         );
     }
 }
@@ -1130,6 +1245,28 @@ const Cli = struct {
     /// largest observed merge latency is reported alongside the M11
     /// gate clauses at soak end.
     anchorage_invalidate_after_s: f32 = 0,
+    /// M12.1: spawn N animated "characters" (placeholder anim — see
+    /// `src/render/anim_lod.zig`) in three distance bands around the
+    /// ship. The §12 gate is 200 chars at varied distances with CPU
+    /// anim ≤2 ms/frame. 0 = disabled.
+    m12_chars: u32 = 0,
+    /// M12.1: tier threshold in metres for .near → .mid transition.
+    /// Default 30 m matches `docs/03-engine-subsystems.md §12`.
+    m12_near_threshold: f32 = 30.0,
+    /// M12.1: tier threshold in metres for .mid → .far transition.
+    /// Default 100 m matches §12.
+    m12_mid_threshold: f32 = 100.0,
+    /// M12.1: mid-tier tick rate in Hz. §12 calls for 5 Hz.
+    m12_mid_hz: f32 = 5.0,
+    /// M12.1: synthetic bones-per-char for the near tier (full rig
+    /// stand-in). Each "bone" runs one rotation accumulation — see
+    /// `anim_lod.System.simBones`. M27 swaps this for real glTF
+    /// skin-palette upload.
+    m12_near_bones: u32 = 32,
+    /// M12.1: synthetic bones-per-char for the mid tier (reduced
+    /// rig stand-in). §12 calls for "reduced rig" without naming a
+    /// count; 8 is a reasonable v0 placeholder.
+    m12_mid_bones: u32 = 8,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1172,6 +1309,24 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--anchorage-invalidate-after")) {
             const v = args.next() orelse return error.MissingAnchorageInvalidateAfterValue;
             cli.anchorage_invalidate_after_s = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--m12-chars")) {
+            const v = args.next() orelse return error.MissingM12CharsValue;
+            cli.m12_chars = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--m12-near-threshold")) {
+            const v = args.next() orelse return error.MissingM12NearThresholdValue;
+            cli.m12_near_threshold = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--m12-mid-threshold")) {
+            const v = args.next() orelse return error.MissingM12MidThresholdValue;
+            cli.m12_mid_threshold = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--m12-mid-hz")) {
+            const v = args.next() orelse return error.MissingM12MidHzValue;
+            cli.m12_mid_hz = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--m12-near-bones")) {
+            const v = args.next() orelse return error.MissingM12NearBonesValue;
+            cli.m12_near_bones = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--m12-mid-bones")) {
+            const v = args.next() orelse return error.MissingM12MidBonesValue;
+            cli.m12_mid_bones = try std.fmt.parseInt(u32, v, 10);
         }
     }
     return cli;
@@ -1601,6 +1756,127 @@ const M11SoakStats = struct {
             if (gate_far_draws) "PASS" else "SKIP (near-LOD; rerun with --force-far)",
             if (gate_avg_60) "PASS" else "FAIL",
             if (gate_p99_60) "PASS" else "FAIL",
+        });
+        if (!cli.uncap) {
+            std.log.warn("  ^ FIFO mode: rerun with --uncap for honest frametime gate", .{});
+        }
+    }
+};
+
+const M12SoakStats = struct {
+    /// Per-tick anim cost histogrammed at 10-µs resolution up to ~5 ms.
+    /// Anything past the last bin is clamped — those frames are FAILs
+    /// against the ≤2 ms gate anyway.
+    const bin_count: usize = 500;
+    const bin_width_us: f64 = 10.0;
+
+    bins: [bin_count]u32 = .{0} ** bin_count,
+    samples: u64 = 0,
+    sum_ns: u64 = 0,
+    max_ns: u64 = 0,
+    /// Track tier counts from the LAST observed tick so the gate
+    /// report can show what scene composition the numbers measure.
+    last_near: u32 = 0,
+    last_mid_in_band: u32 = 0,
+    last_mid_ticked: u32 = 0,
+    last_far: u32 = 0,
+    /// Cumulative mid-tier work fired over the soak. Used to confirm
+    /// the 5 Hz dispatch actually fires at the configured rate.
+    total_mid_ticks: u64 = 0,
+
+    fn observe(self: *M12SoakStats, tick: *const render.anim_lod.TickStats) void {
+        self.samples += 1;
+        self.sum_ns += tick.elapsed_ns;
+        if (tick.elapsed_ns > self.max_ns) self.max_ns = tick.elapsed_ns;
+
+        const us: f64 = @as(f64, @floatFromInt(tick.elapsed_ns)) / 1.0e3;
+        var bin: usize = @intFromFloat(@floor(us / bin_width_us));
+        if (bin >= bin_count) bin = bin_count - 1;
+        self.bins[bin] +%= 1;
+
+        self.last_near = tick.near_ticked;
+        self.last_mid_in_band = tick.mid_in_band;
+        self.last_mid_ticked = tick.mid_ticked;
+        self.last_far = tick.far_skipped;
+        self.total_mid_ticks += tick.mid_ticked;
+    }
+
+    fn avgMs(self: *const M12SoakStats) f64 {
+        if (self.samples == 0) return 0;
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        return (@as(f64, @floatFromInt(self.sum_ns)) / @as(f64, @floatFromInt(self.samples))) * ns_to_ms;
+    }
+
+    fn percentileMs(self: *const M12SoakStats, p: f64) f64 {
+        if (self.samples == 0) return 0;
+        const target = @as(f64, @floatFromInt(self.samples)) * (p / 100.0);
+        var cumulative: f64 = 0;
+        var i: usize = 0;
+        while (i < bin_count) : (i += 1) {
+            cumulative += @as(f64, @floatFromInt(self.bins[i]));
+            if (cumulative >= target) {
+                // Bin midpoint in ms.
+                return ((@as(f64, @floatFromInt(i)) + 0.5) * bin_width_us) / 1000.0;
+            }
+        }
+        return (@as(f64, bin_count) * bin_width_us) / 1000.0;
+    }
+
+    fn report(
+        self: *const M12SoakStats,
+        cli: Cli,
+        frame_avg_ms: f64,
+        frame_p99_ms: f64,
+    ) void {
+        std.log.info("==== M12 gate harness ====", .{});
+        if (cli.m12_chars == 0 or self.samples == 0) {
+            std.log.info("  no M12 characters spawned (set --m12-chars N to engage)", .{});
+            return;
+        }
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        const avg_ms = self.avgMs();
+        const max_ms = @as(f64, @floatFromInt(self.max_ns)) * ns_to_ms;
+        const p99_ms = self.percentileMs(99.0);
+
+        std.log.info(
+            "  scene: {d} chars in distance bands (last tick: near={d} mid_in_band={d} mid_ticked={d} far={d})",
+            .{
+                cli.m12_chars,
+                self.last_near,
+                self.last_mid_in_band,
+                self.last_mid_ticked,
+                self.last_far,
+            },
+        );
+        std.log.info(
+            "  config: near≤{d:.1} m / mid≤{d:.1} m, mid_hz={d:.1}, bones near={d} mid={d}",
+            .{
+                cli.m12_near_threshold,
+                cli.m12_mid_threshold,
+                cli.m12_mid_hz,
+                cli.m12_near_bones,
+                cli.m12_mid_bones,
+            },
+        );
+        std.log.info(
+            "  cpu-anim: avg {d:.3} ms  p99 {d:.3} ms  max {d:.3} ms  ({d} ticks, {d} mid total)",
+            .{ avg_ms, p99_ms, max_ms, self.samples, self.total_mid_ticks },
+        );
+
+        // M12 gate clauses:
+        //   - cpu-anim ≤ 2 ms/frame   (§12 spec)
+        //   - far tier exists and was skipped (load-bearing for the
+        //     "vertex-shader anim atlas, no CPU work" intent)
+        //   - frame budget still met under the anim tick load
+        const gate_cpu = avg_ms <= 2.0 and p99_ms <= 2.0;
+        const gate_far_zero = self.last_far > 0; // far chars present and skipped
+        const gate_avg = frame_avg_ms <= 16.67;
+        const gate_p99 = frame_p99_ms <= 16.67;
+        std.log.info("  gate: cpu-anim≤2ms {s} | far-tier-skipped {s} | avg≤16.67ms {s} | p99≤16.67ms {s}", .{
+            if (gate_cpu) "PASS" else "FAIL",
+            if (gate_far_zero) "PASS" else "FAIL (no chars landed in .far band)",
+            if (gate_avg) "PASS" else "FAIL",
+            if (gate_p99) "PASS" else "FAIL",
         });
         if (!cli.uncap) {
             std.log.warn("  ^ FIFO mode: rerun with --uncap for honest frametime gate", .{});

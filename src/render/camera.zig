@@ -3,9 +3,10 @@
 //!
 //! UBO is std140: two consecutive mat4s (128 B) plus a vec4 eye (16 B) =
 //! 144 B total. `eye.xyz` is the world-space camera position used by the
-//! fragment stage for view-direction, fresnel, and the underwater fog gate;
-//! `eye.w` is unused padding (mat4 follows on a 16 B boundary, so no
-//! explicit padding is needed before it either).
+//! fragment stage for view-direction, fresnel, and the underwater fog gate.
+//! `eye.w` carries monotonic seconds since spawn — read by `instanced.vert`
+//! as the global time channel for the M12 vertex-shader anim atlas (far
+//! tier zero-CPU path). Was unused padding pre-M12.
 
 const std = @import("std");
 const notatlas = @import("notatlas");
@@ -36,11 +37,11 @@ pub const Ubo = extern struct {
     proj: math.Mat4,
     eye: math.Vec4,
 
-    pub fn fromCamera(cam: Camera) Ubo {
+    pub fn fromCamera(cam: Camera, time_s: f32) Ubo {
         return .{
             .view = cam.view(),
             .proj = cam.projection(),
-            .eye = .{ .x = cam.eye.x, .y = cam.eye.y, .z = cam.eye.z, .w = 1.0 },
+            .eye = .{ .x = cam.eye.x, .y = cam.eye.y, .z = cam.eye.z, .w = time_s },
         };
     }
 };
