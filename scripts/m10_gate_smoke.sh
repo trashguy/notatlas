@@ -48,11 +48,15 @@ echo ">>> running sandbox (log: $LOG)"
 echo ">>> harness report:"
 sed -n '/==== M10 gate harness ====/,$p' "$LOG"
 
-FAILS=$(grep -E "gate:.*FAIL" "$LOG" || true)
-if [[ -n "$FAILS" ]]; then
+M10_LINE=$(grep -E "gate: piece-types≤20" "$LOG" || true)
+if [[ -z "$M10_LINE" ]]; then
+  echo "!!! M10 gate line not found — see $LOG"
+  exit 1
+fi
+if echo "$M10_LINE" | grep -q "FAIL"; then
   echo
   echo "!!! M10 gate FAILED"
-  echo "$FAILS"
+  echo "$M10_LINE"
   exit 1
 fi
 

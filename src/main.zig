@@ -2123,11 +2123,19 @@ const M16SoakStats = struct {
         m12_avg_ms: f64,
         m12_p99_ms: f64,
     ) void {
-        std.log.info("==== M1.6 synthetic-harbor gate harness ====", .{});
         const has_structures = cli.anchorage_pieces > 0;
         const has_ships = cli.m1_6_ships > 0;
         const has_chars = cli.m12_chars > 0;
         const has_emitters = cli.m1_6_emitters > 0;
+        // M1.6 gate is the synthetic-harbor-stress composition gate:
+        // only meaningful when structures + ships + chars are ALL
+        // engaged (emitters are an optional disposable add-on).
+        // Stay silent otherwise so isolated M10/M11/M12 runs don't
+        // spuriously emit "composition FAIL" output.
+        if (!(has_structures and has_ships and has_chars)) {
+            return;
+        }
+        std.log.info("==== M1.6 synthetic-harbor gate harness ====", .{});
         std.log.info(
             "  scene: {d} structures + {d} ships + {d} chars + {d} emitters × {d} particles = {d} instanced slots",
             .{

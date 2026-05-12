@@ -205,3 +205,9 @@ envelope.
 - `M16SoakStats.particle_*` fields + report lines
 - `--m1_6-emitters` CLI flag + parsing
 - `m1_6_particles_per_emitter` const
+
+## Cross-references
+
+- `docs/research/m10_gpu_driven_instancing_synthetic.md` — M10 baseline; M1.6 rides M10's Instanced + cull infrastructure.
+- `docs/research/m11_structure_lod_merge_synthetic.md` — M11 baseline; M1.6's 500 anchorage pieces use the M11 path (near-LOD at this camera distance).
+- `docs/research/m12_animation_lod_synthetic.md` — M12 baseline; M1.6's 200 chars + their tier dispatch come from M12.

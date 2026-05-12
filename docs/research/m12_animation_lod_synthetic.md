@@ -230,3 +230,9 @@ diff metadata fields above are the replay contract — anything not
 captured here is a fishing expedition at re-gate time.
 
 **Don't lose this doc** — it's the zero-point for that diff.
+
+## Cross-references
+
+- `docs/research/m10_gpu_driven_instancing_synthetic.md` — M10 baseline; M12 claims `instance.meta.y/z` + `cam.eye.w` from M10's reserved fields.
+- `docs/research/m11_structure_lod_merge_synthetic.md` — M11 baseline; shares the cube-geometry content shape.
+- `docs/research/m1_6_synthetic_harbor_stress_synthetic.md` — Phase 2 closer; composes M10 + M11 + M12 in one scene.

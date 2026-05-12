@@ -176,3 +176,9 @@ phase opens.
 
 M27 (Phase 2.5 close) re-runs this gate harness with real assets.
 **Don't lose this doc** — it's the zero-point for that diff.
+
+## Cross-references
+
+- `docs/research/m10_gpu_driven_instancing_synthetic.md` — M10 baseline; M11 rides M10's SSBO + cull infrastructure for the near-LOD path.
+- `docs/research/m12_animation_lod_synthetic.md` — M12 baseline; uses the same procedural cube content shape.
+- `docs/research/m1_6_synthetic_harbor_stress_synthetic.md` — Phase 2 closer; composes M10 + M11 + M12 in one scene.
