@@ -72,6 +72,7 @@ spatial-index, env, persistence-writer services.
 | ✓ multi-commit | Persistence-writer service | v1 shipped 2026-05-10. 4 workqueue streams (sessions / market trades / cell handoffs / inventory changes); tier-0 fast lane + slow tier round-robin; stream_seq idempotency + ack_wait 300s (`3295f6a`); live metrics + `admin.pwriter.status` snapshots (`05d82f7`); 5-harness smoke suite (`c87d130`). Sole PG writer; never on the hot path. |
 | ✓ multi-commit | SLA-arc producers | All 4 producers shipped 2026-05-10 / 2026-05-11. `events.session` ← gateway on login + paired disconnect (`6b3f87f`); `events.handoff.cell` ← spatial-index on cross-cell transition (`5c80027`); `events.market.trade` ← market-sim order matching v0 (`28c345c`); `events.inventory.change.<id>` ← inventory-sim batched + coalesced (`0abb788` + `a386fb7`, 60 s flush + PG hydration). |
 | ✓ multi-commit | Cross-cell ship transit | Sloop sails A→B with no stutter via `idx.spatial.cell.*.delta` + cell-mgr's geometry-filter `relayState` (`8934526` + `051df59` + `019b396`). Transit smoke (`transit_smoke.sh`) hard-asserts both visual continuity and cell_handoffs PG rows. |
+| ✓ multi-commit 2026-05-12 | SLA-arc multi-stream stress | Multi-stream stress gate on the persistence arc — all 4 producers concurrent, 30 s sustained @ 1000 inv/s + 200 market/s + 100 handoff/s + 100 session/s. Surfaced + fixed session fast-tier SLA breach via fast-lane interleave + 1 ms nats-zig timeout floor workaround (`bad87bc` + `5e8e270` + `2b69ea3`). New comfortable ceiling: 1000 inv/s sustained (122 ms session p99, 40 % under SLA); 1500 inv/s is bursty. Per-batch `--trace-batches` instrumentation in pwriter as a permanent diagnostic surface. See `docs/research/sla_arc_stress.md`. |
 | ▢ | M10: gpu-driven-instancing | 5000 instances at 60 fps; ≤20 draw calls |
 | ▢ | M11: structure-lod-merge | 500-piece anchorage merges <100 ms; far-LOD = 1 draw |
 | ▢ | M12: animation-lod | 200 animated chars at varied distance; CPU ≤2 ms |
@@ -135,9 +136,89 @@ players over multiple sessions. Iterate on friction.
 | Telemetry + observability | Identify what's loved, hated, broken |
 | Engine bug-bash | Multi-session stability fixes |
 | Balance pass | Data-driven adjustments; recipe tuning |
+| Spatial-index regional sharding (if needed) | Build only if Phase 4 load reveals single-instance ceiling. Design ratified 2026-05-12 (this conversation, see below). |
 
 **End-of-phase:** decision point. If the loop is fun, scale to open
 playtest. If not, iterate.
+
+### Deferred: spatial-index regional sharding
+
+Design captured here so the build doesn't get stuck on a fresh design
+pass when load actually demands it. Trigger: stress measurement (see
+gates table) shows single spatial-index hits ingest or query ceiling
+under realistic Phase 4 load.
+
+**Cell ownership vs entity tracking — the load-bearing distinction.**
+
+- Each cell has *exactly one* owner spatial-index. Cell→region map is
+  static config (`data/spatial_shards.yaml` or KV bucket).
+- Each spatial-index *tracks* entities in its own cells **plus** an
+  overlap belt of border cells in neighboring regions. Both regions
+  know about an entity near the boundary; only the owner of any given
+  cell emits `idx.spatial.cell.<x>_<y>.delta` for that cell.
+- When entity crosses from a cell owned by NW to a cell owned by NE,
+  no coordination happens at the moment of crossing — both regions
+  see the same `sim.entity.X.state` update via the broker's
+  per-subject ordering, both apply the same deterministic rule (emit
+  delta for cells in my owned set), the right region emits the
+  enter / exit delta. No two-phase commit, no lease, no leader
+  election for handoff.
+
+**Audit-event emission (events.handoff.cell):** the region that owns
+the *from-cell* emits the handoff event. Same rule as cell delta
+emission, applied to the audit stream — exactly-once across regions
+without coordination.
+
+**Subject hierarchy stays unchanged.** Subjects are cell-keyed
+(`idx.spatial.cell.<x>_<y>.delta`), not region-keyed. Going from 1
+spatial-index to N is a service-internal config change; downstream
+consumers (cell-mgrs, gateway, pwriter) don't notice. Rebalancing
+the cell→region map at server restart is the only operational
+knob — no migration protocol needed.
+
+**Belt width tuning:**
+- Width = 1 cell for slow entities (galleon at 10 m/s × 100 m cells
+  takes 10 s to traverse one cell).
+- Wider belt (e.g. 5 cells) if spatial radius queries near the
+  boundary need to be answered without cross-region fan-out (a
+  500 m sight-line on 100 m cells reaches 5 cells).
+- Projectiles (fast, short-lived) likely don't cross regions in
+  practice; if they do and we miss them, the cannonball just
+  despawns at the boundary — accept it.
+
+**Implementation lift (rough estimate when triggered):**
+- Cell→region config + bootstrap: ~50 LOC
+- Spatial-index CLI flags (`--region`, `--cells`, `--belt`): ~50 LOC
+- Belt membership check in position-update handler: ~30 LOC
+- Emit-gating logic for cell deltas + handoff events: ~20 LOC
+- Cross-region transit smoke (entity sails across N regions, no
+  gap in cell-membership signal, exactly-once handoff event): ~200
+  LOC
+- Total: roughly half a day of focused work once stress data justifies
+  the build.
+
+**Invariant relied on:** NATS preserves per-subject message ordering
+across all subscribers. Today this holds because ship-sim shards by
+entity-ID range (not by region), so a given entity always publishes
+state from one ship-sim shard on one subject. If that invariant
+changes — e.g. ship-sim ever migrates entities between shards mid-
+flight — the deterministic-from-input property breaks and this
+design needs revisiting.
+
+**Why this isn't designing into a corner:** zero new coordination
+primitives. State derives from `state = f(immutable_config,
+ordered_inputs)`. Add regions, remove regions, rebalance — all
+without anyone agreeing on anything at runtime.
+
+**Architecturally consistent alternative considered:** shard
+spatial-index by entity-ID hash instead of by region (matches how
+ship-sim and pwriter already shard). Loses cell-locality cache
+benefit; gains zero handoff problem because every shard sees every
+entity it owns regardless of where the entity is. Revisit choice
+when triggered — the answer might be "Option C" instead of
+"Option A" depending on what the stress test reveals about whether
+spatial queries (radius / polygon / LoS) dominate or whether the
+position firehose ingest is the bottleneck.
 
 ## Phase 5+ — Content scale and live ops (open-ended)
 
@@ -162,6 +243,8 @@ Driven by playtest data and player demand. Possible additions:
 | ✓ verified 2026-04-28 (`d1f4976`) | M5 multi-player | Phase 0 | Ship-as-vehicle works for >1 player |
 | ✓ verified 2026-04-29 (`6ce6a33`) | M6 phase gate (synthetic + BW) | Phase 1 | 100×50 fanout correct + ≤1 Mbps slow-lane budget held |
 | ✓ verified 2026-05-01 | Milestone 1.5 (live load) | Phase 1 → 2 | 50 conns × 30 ships × actual gateway/NATS path → multi-gateway 32.1%, single-gateway+JWT 17.3% of 1 Mbps/client budget |
+| ✓ verified 2026-05-12 | SLA-arc multi-stream stress | Phase 2 | All 4 producers concurrent @ 1000 inv/s sustained, session SLA holds. Fast-lane interleave fix + nats-zig 1 ms timeout. Comfortable ceiling identified; bursty ceiling at 1500 inv/s. |
+| ▢ | Single spatial-index throughput ceiling | Phase 4 prep | Stress with 1000s of synthetic entities publishing 60 Hz position firehose; measure delta-emit latency and query response time. Result determines whether regional sharding is needed before Phase 4 playtest or post-launch. |
 | ▢ | Milestone 1.6 | Phase 2 → 3 | Renderer holds 60 fps in dense scene |
 | ▢ | Closed playtest | Phase 4 | The loop is actually fun |
 
