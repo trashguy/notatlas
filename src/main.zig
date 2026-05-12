@@ -340,6 +340,11 @@ pub fn main() !void {
     // camera distance + a 10% hysteresis band.
     var anchorage: ?render.cluster_merge.Anchorage = null;
     defer if (anchorage) |*a| a.deinit();
+    // M11.4 stats. Track the largest merge time observed (sync initial
+    // bake + any worker invalidates) for the gate report. merge_count
+    // = 1 (sync) plus however many invalidates the soak triggers.
+    var m11_stats: M11SoakStats = .{};
+    var invalidate_fired: bool = false;
 
     // M11.3 off-thread merge worker. Spawned unconditionally — cheap
     // when idle (one parked thread waiting on a cond). Used only when
@@ -424,6 +429,7 @@ pub fn main() !void {
             refs,
         );
         const merge_ns = merge_timer.read();
+        m11_stats.observeMerge(merge_ns);
         const a = &anchorage.?;
         a.setForceFar(cli.force_far);
         std.log.info(
@@ -709,6 +715,7 @@ pub fn main() !void {
                         std.log.err("anchorage[{d}] applyMerge: {s}", .{ a.id, @errorName(err) });
                         continue;
                     };
+                    m11_stats.observeMerge(result.elapsed_ns);
                     std.log.info(
                         "anchorage[{d}]: merge applied ({d} verts / {d} idx, worker {d:.2} ms, bounding r={d:.1} m)",
                         .{
@@ -723,11 +730,22 @@ pub fn main() !void {
                 pending_results.clearRetainingCapacity();
             }
 
+            // M11.4: programmatic invalidate (auto-fire during soak).
+            // Fires exactly once when t >= --anchorage-invalidate-after,
+            // letting the M11.4 harness exercise the worker path under
+            // soak conditions. Shares the I-key snapshot path below.
+            const auto_invalidate =
+                cli.anchorage_invalidate_after_s > 0 and
+                !invalidate_fired and
+                t >= cli.anchorage_invalidate_after_s;
+            if (auto_invalidate) invalidate_fired = true;
+
             // M11.3: I key kicks an invalidate. Snapshots cached
             // PieceRefs into parallel slices + enqueues to the worker.
             // Heap-allocated; freed after enqueue (worker dup-copies).
             const i_state = window.handle.getKey(.i);
-            if (i_state == .press and last_i_state == .release) {
+            const i_just_pressed = i_state == .press and last_i_state == .release;
+            if (i_just_pressed or auto_invalidate) {
                 const n = a.pieces.len;
                 const snap_pieces = gpa.alloc(render.mesh_palette.PieceMesh, n) catch null;
                 const snap_transforms = gpa.alloc(notatlas.math.Mat4, n) catch null;
@@ -817,6 +835,15 @@ pub fn main() !void {
         wind_soak.report(wind_params, t);
         pax_soak.report(t);
         frame_soak.report(cli, instanced.activeCount(), palette.pieceCount());
+        // M11.4 gate block — reads the frame-time stats already
+        // computed above + the anchorage merge stats observed during
+        // the soak.
+        m11_stats.report(
+            cli,
+            frame_soak.avgMs(),
+            frame_soak.percentileMs(99.0),
+            if (anchorage) |*a| a else null,
+        );
     }
 }
 
@@ -1097,6 +1124,12 @@ const Cli = struct {
     /// camera distance. The gate harness sets this so frametime
     /// measurements reflect the merged path.
     force_far: bool = false,
+    /// M11.4: when > 0 and a soak is running, programmatically fire
+    /// one anchorage invalidate at T seconds into the soak. Exercises
+    /// the M11.3 off-thread merge path without needing the I key. The
+    /// largest observed merge latency is reported alongside the M11
+    /// gate clauses at soak end.
+    anchorage_invalidate_after_s: f32 = 0,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1136,6 +1169,9 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
             cli.anchorage_lod_distance = try std.fmt.parseFloat(f32, v);
         } else if (std.mem.eql(u8, a, "--force-far")) {
             cli.force_far = true;
+        } else if (std.mem.eql(u8, a, "--anchorage-invalidate-after")) {
+            const v = args.next() orelse return error.MissingAnchorageInvalidateAfterValue;
+            cli.anchorage_invalidate_after_s = try std.fmt.parseFloat(f32, v);
         }
     }
     return cli;
@@ -1409,6 +1445,14 @@ const FrameSoakStats = struct {
         self.bins[bin] +%= 1;
     }
 
+    /// Mean frame-time across all observed samples (after warmup
+    /// skip). Returns 0 on empty.
+    fn avgMs(self: *const FrameSoakStats) f64 {
+        if (self.total_samples == 0) return 0;
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        return (@as(f64, @floatFromInt(self.sum_frame_ns)) / @as(f64, @floatFromInt(self.total_samples))) * ns_to_ms;
+    }
+
     /// Linear-interpolated percentile across the histogram. Returns 0 on
     /// empty (no samples). Approximate at bin granularity (0.5 ms).
     fn percentileMs(self: *const FrameSoakStats, p: f64) f64 {
@@ -1470,6 +1514,96 @@ const FrameSoakStats = struct {
         });
         if (!cli.uncap) {
             std.log.warn("  ^ FIFO mode: p99/max include vsync waits; rerun with --uncap for true GPU cost", .{});
+        }
+    }
+};
+
+/// M11.4 stats. Tracks the largest single merge latency observed
+/// (sync initial bake + any worker invalidates) and merge count for
+/// the gate report. The gate clause is `max ≤ 100 ms`.
+const M11SoakStats = struct {
+    merge_count: u32 = 0,
+    max_merge_ns: u64 = 0,
+    last_merge_ns: u64 = 0,
+    sum_merge_ns: u64 = 0,
+
+    fn observeMerge(self: *M11SoakStats, ns: u64) void {
+        self.merge_count += 1;
+        self.last_merge_ns = ns;
+        self.sum_merge_ns += ns;
+        if (ns > self.max_merge_ns) self.max_merge_ns = ns;
+    }
+
+    /// Emit the M11 gate block. Caller supplies frame stats (already
+    /// computed by FrameSoakStats.report) so we don't recompute, plus
+    /// scene context to identify which gate scenario was tested.
+    fn report(
+        self: *const M11SoakStats,
+        cli: Cli,
+        avg_ms: f64,
+        p99_ms: f64,
+        anchorage: ?*const render.cluster_merge.Anchorage,
+    ) void {
+        std.log.info("==== M11 gate harness ====", .{});
+        if (cli.anchorage_pieces == 0 or anchorage == null) {
+            std.log.info("  no anchorage spawned (set --anchorage-pieces N to engage M11)", .{});
+            return;
+        }
+        const a = anchorage.?;
+        const ns_to_ms: f64 = 1.0 / 1.0e6;
+        const max_merge_ms = @as(f64, @floatFromInt(self.max_merge_ns)) * ns_to_ms;
+        const avg_merge_ms = if (self.merge_count == 0)
+            0.0
+        else
+            (@as(f64, @floatFromInt(self.sum_merge_ns)) / @as(f64, @floatFromInt(self.merge_count))) * ns_to_ms;
+
+        std.log.info(
+            "  scene: anchorage[{d}] {d} pieces × ≤{d} piece types in r={d:.1} m → {d} verts / {d} idx (bounding r={d:.1} m)",
+            .{
+                a.id,
+                cli.anchorage_pieces,
+                cli.anchorage_piece_types,
+                cli.anchorage_radius,
+                a.merged.vertex_count,
+                a.merged.index_count,
+                a.merged.radius,
+            },
+        );
+        std.log.info(
+            "  lod: {s}{s} (threshold {d:.1} m, hysteresis ±10%)",
+            .{
+                @tagName(a.tier),
+                if (a.force_far) " [force-far]" else "",
+                cli.anchorage_lod_distance,
+            },
+        );
+        std.log.info(
+            "  merges: {d} (max {d:.2} ms, avg {d:.2} ms, last {d:.2} ms)",
+            .{
+                self.merge_count,
+                max_merge_ms,
+                avg_merge_ms,
+                @as(f64, @floatFromInt(self.last_merge_ns)) * ns_to_ms,
+            },
+        );
+
+        // M11 gate: 500-piece anchorage merges <100 ms; far-LOD = 1
+        // draw. The draws-per-anchorage gate is always 1 by construction
+        // (cluster_merge.MergedMeshRenderer.record always issues exactly
+        // one drawIndexed), so we report it as a static PASS once the
+        // anchorage is rendering via the merged path.
+        const gate_merge = max_merge_ms <= 100.0;
+        const gate_far_draws = a.shouldDrawMerged();
+        const gate_avg_60 = avg_ms <= 16.67;
+        const gate_p99_60 = p99_ms <= 16.67;
+        std.log.info("  gate: merge≤100ms {s} | far-LOD draws=1 {s} | avg≤16.67ms {s} | p99≤16.67ms {s}", .{
+            if (gate_merge) "PASS" else "FAIL",
+            if (gate_far_draws) "PASS" else "SKIP (near-LOD; rerun with --force-far)",
+            if (gate_avg_60) "PASS" else "FAIL",
+            if (gate_p99_60) "PASS" else "FAIL",
+        });
+        if (!cli.uncap) {
+            std.log.warn("  ^ FIFO mode: rerun with --uncap for honest frametime gate", .{});
         }
     }
 };
