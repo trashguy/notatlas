@@ -42,6 +42,8 @@ pub const VulkanError = error{
     DescriptorSetAllocationFailed,
     PipelineLayoutCreationFailed,
     PipelineCreationFailed,
+    SamplerCreationFailed,
+    UnsupportedTextureFormat,
 };
 
 pub const QueueFamilies = struct {

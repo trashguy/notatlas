@@ -291,6 +291,7 @@ pub fn build(b: *std.Build) void {
     sandbox_mod.addImport("zglfw", zglfw_dep.module("root"));
     sandbox_mod.addImport("physics", physics_mod);
     sandbox_mod.addImport("vma", vma_mod);
+    sandbox_mod.addImport("ktx", ktx_mod);
     sandbox_mod.addIncludePath(vulkan_include);
     sandbox_mod.linkLibrary(zglfw_dep.artifact("glfw"));
     sandbox_mod.linkLibrary(jolt);
@@ -320,6 +321,10 @@ pub fn build(b: *std.Build) void {
     embedShader(b, sandbox_mod, "assets/shaders/merged.frag", "merged_frag_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.vert", "wind_arrows_vert_spv");
     embedShader(b, sandbox_mod, "assets/shaders/wind_arrows.frag", "wind_arrows_frag_spv");
+    // M14.2c textured-cube shaders. Same vertex+frag shape as box but
+    // adds a vec2 UV attribute + set=0 binding=1 combined image sampler.
+    embedShader(b, sandbox_mod, "assets/shaders/textured.vert", "textured_vert_spv");
+    embedShader(b, sandbox_mod, "assets/shaders/textured.frag", "textured_frag_spv");
 
     const sandbox = b.addExecutable(.{
         .name = "notatlas-sandbox",
