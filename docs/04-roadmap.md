@@ -140,7 +140,7 @@ drift.
 
 | Status | Milestone | Deliverable |
 |---|---|---|
-| ◐ | M13: glTF static mesh loader | Lift fallen-runes' `gltf_loader.zig`; load + render a Blender-exported building piece in place of the procedural cube; hot-reload on file save |
+| ✓ `ac7f06e`+`a70bb42` 2026-05-14 | M13: glTF static mesh loader | Hand-rolled minimal parser (single mesh / POSITION+NORMAL+u16 indices / base64 data URI). `--m13` opt-in renders the test asset as palette piece `cli.piece_types` next to the procedural cube — visual parity is the gate. Hot-reload via inotify on `data/props/*.gltf` + `MeshPalette.updatePiece` in-place memcpy (same-shape constraint until M15). Smoke: `scripts/m13_gate_smoke.sh`. |
 | ▢ | M14: KTX2 texture + material v1 | Texture sampling pipeline; basic PBR (albedo + normal + roughness); material YAML manifest |
 | ▢ | M15: Per-asset YAML manifest + hot-reload | `data/props/*.yaml`, `data/ships/*.yaml`, `data/npcs/*.yaml`, `data/islands/*.yaml` — one file per unit; mesh + texture + material refs; hot-reload extended to meshes / textures / materials |
 | ▢ | M16: Skeletal anim format + skinning shader | Bone palette + per-vertex weights + anim clip format; GPU skinning shader. Placed NPCs render idle-animated even without AI behavior. Also unlocks M27 re-gate against real rigs |
