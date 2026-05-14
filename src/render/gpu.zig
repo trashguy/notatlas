@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("vulkan_types.zig");
 const window_mod = @import("window.zig");
+const vma = @import("vma");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -30,6 +31,10 @@ pub const GpuContext = struct {
     present_queue: vk.VkQueue,
     families: QueueFamilies,
     validation_active: bool,
+    /// VMA allocator backing every buffer + image in the renderer.
+    /// Created after the device is up; destroyed before the device.
+    /// One per GpuContext (one per VkDevice).
+    allocator: vma.Allocator,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -60,6 +65,14 @@ pub const GpuContext = struct {
         const families = try findQueueFamilies(gpa, physical_device, surface);
 
         const device_result = try createLogicalDevice(physical_device, families);
+        errdefer vk.vkDestroyDevice(device_result.device, null);
+
+        const allocator = try vma.Allocator.init(.{
+            .instance = @ptrCast(instance),
+            .physical_device = @ptrCast(physical_device),
+            .device = @ptrCast(device_result.device),
+            .api_version = vk.VK_API_VERSION_1_3,
+        });
 
         return .{
             .instance = instance,
@@ -71,11 +84,14 @@ pub const GpuContext = struct {
             .present_queue = device_result.present_queue,
             .families = families,
             .validation_active = validation_active,
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *GpuContext) void {
         _ = vk.vkDeviceWaitIdle(self.device);
+        // VMA owns all buffer + image memory; destroy before the device.
+        self.allocator.deinit();
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroySurfaceKHR(self.instance, self.surface, null);
         if (self.validation_active) destroyDebugMessenger(self.instance, self.debug_messenger);

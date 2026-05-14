@@ -84,6 +84,29 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // VMA module needs to be defined before any test mod that
+    // transitively imports buffer.zig (cluster_merge_test_mod,
+    // cluster_merge_worker_test_mod). The full VMA + libktx setup
+    // stays grouped lower; this is just the module definition.
+    const vma_lib = buildVMA(b, target, optimize);
+    const vma_mod = b.addModule("vma", .{
+        .root_source_file = b.path("src/render/vma.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vma_mod.addIncludePath(vulkan_include);
+    vma_mod.addIncludePath(b.path("vendor/VulkanMemoryAllocator/include"));
+    vma_mod.linkLibrary(vma_lib);
+    if (is_windows) {
+        if (vulkan_lib_path) |p| vma_mod.addLibraryPath(p);
+        vma_mod.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        vma_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        vma_mod.linkSystemLibrary("vulkan", .{});
+    }
+    vma_mod.link_libcpp = true;
+    vma_mod.link_libc = true;
+
     // M11.1 cluster_merge has a pure-CPU bake (mergeCluster /
     // measureCluster) covered by unit tests. Lives in src/render/ which
     // notatlas_mod doesn't see; needs notatlas math + Vulkan headers
@@ -96,6 +119,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cluster_merge_test_mod.addImport("notatlas", notatlas_mod);
+    cluster_merge_test_mod.addImport("vma", vma_mod);
     cluster_merge_test_mod.addIncludePath(vulkan_include);
     const cluster_merge_tests = b.addTest(.{ .root_module = cluster_merge_test_mod });
     test_step.dependOn(&b.addRunArtifact(cluster_merge_tests).step);
@@ -111,6 +135,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cluster_merge_worker_test_mod.addImport("notatlas", notatlas_mod);
+    cluster_merge_worker_test_mod.addImport("vma", vma_mod);
     cluster_merge_worker_test_mod.addIncludePath(vulkan_include);
     const cluster_merge_worker_tests = b.addTest(.{ .root_module = cluster_merge_worker_test_mod });
     test_step.dependOn(&b.addRunArtifact(cluster_merge_worker_tests).step);
@@ -251,6 +276,7 @@ pub fn build(b: *std.Build) void {
     sandbox_mod.addImport("notatlas", notatlas_mod);
     sandbox_mod.addImport("zglfw", zglfw_dep.module("root"));
     sandbox_mod.addImport("physics", physics_mod);
+    sandbox_mod.addImport("vma", vma_mod);
     sandbox_mod.addIncludePath(vulkan_include);
     sandbox_mod.linkLibrary(zglfw_dep.artifact("glfw"));
     sandbox_mod.linkLibrary(jolt);
@@ -853,6 +879,51 @@ fn collectLuaSources(b: *std.Build) ![]const []const u8 {
         try list.append(b.allocator, rel);
     }
     return list.toOwnedSlice(b.allocator);
+}
+
+const vma_root = "vendor/VulkanMemoryAllocator";
+
+/// Build VMA as a static C++ library from our single-TU wrapper
+/// (src/render/vma_impl.cpp). VMA is single-header — vk_mem_alloc.h
+/// IS the library; including it once with VMA_IMPLEMENTATION defined
+/// emits the symbols. No CMake-from-zig needed.
+///
+/// Function-pointer dispatch: we set VMA_STATIC_VULKAN_FUNCTIONS=1 in
+/// vma_impl.cpp, so VMA finds vk* symbols at link time (we statically
+/// link libvulkan / vulkan-1.lib already). No runtime
+/// vkGetInstanceProcAddr indirection.
+fn buildVMA(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+    });
+    mod.addIncludePath(b.path(vma_root ++ "/include"));
+    // VMA's header transitively includes <vulkan/vulkan.h>; we use
+    // the same vendored Khronos headers as the rest of the renderer.
+    const vk_dep = b.dependency("vulkan-headers", .{});
+    mod.addIncludePath(vk_dep.path("include"));
+
+    mod.addCSourceFile(.{
+        .file = b.path("src/render/vma_impl.cpp"),
+        .language = .cpp,
+        .flags = &.{
+            "-std=c++17",
+            // VMA's header issues many implicit-cast / unused-param
+            // warnings under -Wall; mirror the upstream build's silence.
+            "-w",
+        },
+    });
+
+    return b.addLibrary(.{
+        .name = "vma",
+        .root_module = mod,
+        .linkage = .static,
+    });
 }
 
 const ktx_root = "vendor/KTX-Software";
