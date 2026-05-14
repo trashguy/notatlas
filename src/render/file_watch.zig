@@ -26,9 +26,13 @@ pub const Events = packed struct {
     hull: bool = false,
     wind: bool = false,
     shader: bool = false,
+    /// M13.2 — any `.gltf` file under `data/props/` changed. Single
+    /// bool because there's one active glTF asset in the sandbox; M15
+    /// will fan this out per-manifest-entry.
+    gltf: bool = false,
 
     pub fn any(self: Events) bool {
-        return self.wave or self.ocean or self.hull or self.wind or self.shader;
+        return self.wave or self.ocean or self.hull or self.wind or self.shader or self.gltf;
     }
 };
 
@@ -36,6 +40,7 @@ pub const Paths = struct {
     data_dir: [:0]const u8 = "data",
     waves_dir: [:0]const u8 = "data/waves",
     ships_dir: [:0]const u8 = "data/ships",
+    props_dir: [:0]const u8 = "data/props",
     shaders_dir: [:0]const u8 = "assets/shaders",
     wave_basename: []const u8 = "storm.yaml",
     hull_basename: []const u8 = "box.yaml",
@@ -48,6 +53,7 @@ const LinuxWatcher = struct {
     wd_data: i32,
     wd_waves: i32,
     wd_ships: i32,
+    wd_props: i32,
     wd_shaders: i32,
 
     /// Basename of the active wave config, e.g. "storm.yaml". The watcher
@@ -66,6 +72,9 @@ const LinuxWatcher = struct {
         const wd_data = try posix.inotify_add_watch(fd, paths.data_dir, mask);
         const wd_waves = try posix.inotify_add_watch(fd, paths.waves_dir, mask);
         const wd_ships = try posix.inotify_add_watch(fd, paths.ships_dir, mask);
+        // Props dir is optional — only fail-soft if missing so older
+        // setups without data/props/ don't error at startup.
+        const wd_props = posix.inotify_add_watch(fd, paths.props_dir, mask) catch -1;
         const wd_shaders = try posix.inotify_add_watch(fd, paths.shaders_dir, mask);
 
         return .{
@@ -73,6 +82,7 @@ const LinuxWatcher = struct {
             .wd_data = wd_data,
             .wd_waves = wd_waves,
             .wd_ships = wd_ships,
+            .wd_props = wd_props,
             .wd_shaders = wd_shaders,
             .wave_basename = paths.wave_basename,
             .hull_basename = paths.hull_basename,
@@ -112,6 +122,13 @@ const LinuxWatcher = struct {
                     if (std.mem.eql(u8, name, self.wave_basename)) events.wave = true;
                 } else if (ev.wd == self.wd_ships) {
                     if (std.mem.eql(u8, name, self.hull_basename)) events.hull = true;
+                } else if (ev.wd == self.wd_props and self.wd_props >= 0) {
+                    // M13.2 — fire on any `.gltf` save. M15 will fan
+                    // out per-manifest-entry; for now there's a single
+                    // active glTF asset in the sandbox.
+                    if (std.mem.endsWith(u8, name, ".gltf")) {
+                        events.gltf = true;
+                    }
                 } else if (ev.wd == self.wd_shaders) {
                     // Match by extension so future passes (M5+ ships,
                     // structures) auto-reload without an enumeration.

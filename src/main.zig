@@ -750,7 +750,13 @@ pub fn main() !void {
         if (window.shouldClose()) break;
 
         const events = watcher.poll();
-        if (events.any()) handleReload(gpa, &ocean, &instanced, &merged_renderer, &arrows, &hull, &buoy, &wind_params, frame.render_pass, events);
+        if (events.any()) {
+            const m13_cfg: ?M13ReloadCfg = if (cli.m13) .{
+                .piece_id = cli.piece_types,
+                .asset = cli.m13_asset,
+            } else null;
+            handleReload(gpa, &ocean, &instanced, &merged_renderer, &arrows, &hull, &buoy, &wind_params, &palette, gpu.device, m13_cfg, frame.render_pass, events);
+        }
 
         const frame_ns = timer.lap();
         const dt: f32 = @as(f32, @floatFromInt(frame_ns)) / @as(f32, std.time.ns_per_s);
@@ -1209,6 +1215,14 @@ fn buoyancyConfigFromHull(hull: notatlas.hull_params.HullParams) physics.Buoyanc
     };
 }
 
+/// M13.2 — glTF hot-reload context. The piece_id slot the M13 mesh
+/// occupies in the palette, plus the asset path to re-parse on save.
+/// Optional: caller passes null when --m13 is off.
+const M13ReloadCfg = struct {
+    piece_id: u32,
+    asset: []const u8,
+};
+
 /// Apply whatever the watcher flagged. Errors are logged and swallowed —
 /// a typo in YAML or a broken shader must not kill the running sandbox;
 /// the user fixes the file and saves again.
@@ -1221,6 +1235,9 @@ fn handleReload(
     hull: *notatlas.hull_params.HullParams,
     buoy: *physics.Buoyancy,
     wind_params: *notatlas.wind_query.WindParams,
+    palette: *render.MeshPalette,
+    gpu_device: render.types.vk.VkDevice,
+    m13_cfg: ?M13ReloadCfg,
     render_pass: render.types.vk.VkRenderPass,
     events: render.file_watch.Events,
 ) void {
@@ -1271,6 +1288,42 @@ fn handleReload(
             logWind(new_params, 0.0);
         } else |err| {
             std.log.err("reload {s}: {s}", .{ wind_config_path, @errorName(err) });
+        }
+    }
+
+    // M13.2 glTF hot-reload. Same-shape constraint: vertex / index COUNT
+    // must match the originally-loaded mesh (palette is packed once at
+    // init; changing counts would invalidate every downstream piece's
+    // offsets). Real artists adding/removing verts get a clear warning
+    // pointing at the restart workaround until M15/M18 lands dynamic
+    // packing.
+    if (events.gltf) {
+        if (m13_cfg) |cfg| {
+            if (render.gltf.load(gpa, cfg.asset)) |loaded_val| {
+                var loaded = loaded_val;
+                defer loaded.deinit();
+                // Buffers are host-visible + persistently mapped; the GPU
+                // may be mid-frame reading the old bytes. Drain in-flight
+                // work before the memcpy. Cheap — hot-reload is interactive,
+                // not on the render hot path.
+                _ = render.types.vk.vkDeviceWaitIdle(gpu_device);
+                if (palette.updatePiece(cfg.piece_id, loaded.pieceMesh())) {
+                    std.log.info("reload {s}: {d} verts, {d} indices ({d} ms)", .{
+                        cfg.asset,
+                        loaded.vertices.len,
+                        loaded.indices.len,
+                        timer.lap() / std.time.ns_per_ms,
+                    });
+                } else |err| switch (err) {
+                    error.ShapeChanged => std.log.warn(
+                        "reload {s}: vertex/index count changed — restart sandbox to pick up shape changes (M15+ will lift this)",
+                        .{cfg.asset},
+                    ),
+                    error.OutOfRange => std.log.err("reload {s}: piece_id {d} out of range", .{ cfg.asset, cfg.piece_id }),
+                }
+            } else |err| {
+                std.log.err("reload {s}: {s}", .{ cfg.asset, @errorName(err) });
+            }
         }
     }
 

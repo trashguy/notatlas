@@ -34,16 +34,24 @@ pub const PieceMesh = struct {
 };
 
 /// Per-piece bookkeeping. Field names mirror `vkCmdDrawIndexed`'s parameter
-/// order so the instanced renderer can paste them straight in.
+/// order so the instanced renderer can paste them straight in. `vertex_count`
+/// is carried alongside so M13's hot-reload path can verify same-shape
+/// before doing an in-place vbo/ibo memcpy.
 pub const PieceEntry = struct {
     first_index: u32,
     index_count: u32,
     vertex_offset: i32,
+    vertex_count: u32,
     bounds_center: [3]f32,
     bounds_radius: f32,
 };
 
 pub const PaletteError = error{ NoPieces, IndexOverflow } || VulkanError || std.mem.Allocator.Error;
+
+/// M13.2 in-place hot-reload constraint: changing vertex/index COUNT
+/// would require re-packing every downstream piece's offsets. Out of
+/// scope until M15/M18's dynamic asset management lands.
+pub const UpdateError = error{ ShapeChanged, OutOfRange };
 
 pub const MeshPalette = struct {
     gpa: std.mem.Allocator,
@@ -113,6 +121,7 @@ pub const MeshPalette = struct {
                 .first_index = index_cursor,
                 .index_count = @intCast(p.indices.len),
                 .vertex_offset = vertex_cursor,
+                .vertex_count = @intCast(p.vertices.len),
                 .bounds_center = p.bounds_center,
                 .bounds_radius = p.bounds_radius,
             };
@@ -138,6 +147,31 @@ pub const MeshPalette = struct {
 
     pub fn pieceCount(self: *const MeshPalette) usize {
         return self.pieces.len;
+    }
+
+    /// M13.2 hot-reload: replace piece `piece_id`'s vertex + index data
+    /// in place. Vertex and index counts must match the original — the
+    /// palette is packed once at init and the downstream PieceEntry
+    /// offsets cannot move without invalidating every later piece.
+    /// Caller must `vkDeviceWaitIdle` (or otherwise drain in-flight
+    /// frames) before invoking; buffers are host-visible + coherent, so
+    /// no explicit flush is needed after the memcpy.
+    pub fn updatePiece(self: *MeshPalette, piece_id: usize, mesh: PieceMesh) UpdateError!void {
+        if (piece_id >= self.pieces.len) return UpdateError.OutOfRange;
+        const entry = &self.pieces[piece_id];
+        if (mesh.vertices.len != entry.vertex_count) return UpdateError.ShapeChanged;
+        if (mesh.indices.len != entry.index_count) return UpdateError.ShapeChanged;
+
+        const v_off: usize = @as(usize, @intCast(entry.vertex_offset)) * @sizeOf(Vertex);
+        const v_bytes = std.mem.sliceAsBytes(mesh.vertices);
+        @memcpy(self.vertex_buffer.mapped[v_off..][0..v_bytes.len], v_bytes);
+
+        const i_off: usize = @as(usize, entry.first_index) * @sizeOf(u16);
+        const i_bytes = std.mem.sliceAsBytes(mesh.indices);
+        @memcpy(self.index_buffer.mapped[i_off..][0..i_bytes.len], i_bytes);
+
+        entry.bounds_center = mesh.bounds_center;
+        entry.bounds_radius = mesh.bounds_radius;
     }
 };
 
@@ -174,6 +208,7 @@ test "MeshPalette packs vertex/index offsets correctly" {
             .first_index = index_cursor,
             .index_count = @intCast(p.indices.len),
             .vertex_offset = vertex_cursor,
+            .vertex_count = @intCast(p.vertices.len),
             .bounds_center = p.bounds_center,
             .bounds_radius = p.bounds_radius,
         };
