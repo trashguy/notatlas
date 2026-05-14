@@ -154,6 +154,20 @@ pub fn build(b: *std.Build) void {
     const gltf_tests = b.addTest(.{ .root_module = gltf_test_mod });
     test_step.dependOn(&b.addRunArtifact(gltf_tests).step);
 
+    // M14.2b SPIR-V reflection. Tests embed box_vert_spv + box_frag_spv
+    // and assert reflection finds set=0 binding=0 UBO etc. Vulkan
+    // headers needed for VkDescriptorType constants.
+    const spirv_reflect_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/render/spirv_reflect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spirv_reflect_test_mod.addIncludePath(vulkan_include);
+    embedShader(b, spirv_reflect_test_mod, "assets/shaders/box.vert", "box_vert_spv");
+    embedShader(b, spirv_reflect_test_mod, "assets/shaders/box.frag", "box_frag_spv");
+    const spirv_reflect_tests = b.addTest(.{ .root_module = spirv_reflect_test_mod });
+    test_step.dependOn(&b.addRunArtifact(spirv_reflect_tests).step);
+
     // Jolt physics — vendored at vendor/JoltPhysics (v5.5.0). Built as a
     // static C++ lib with the same compile defs Jolt's CMake emits for the
     // default x86_64 Linux configuration so headers see a matching ABI when

@@ -28,6 +28,7 @@ const types = @import("vulkan_types.zig");
 const gpu_mod = @import("gpu.zig");
 const buffer_mod = @import("buffer.zig");
 const shader_mod = @import("shader.zig");
+const spirv_reflect = @import("spirv_reflect.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -119,7 +120,7 @@ pub const Box = struct {
         render_pass: vk.VkRenderPass,
         camera_ubo: vk.VkBuffer,
     ) !Box {
-        const set_layout = try createSetLayout(gpu.device);
+        const set_layout = try createSetLayoutReflected(gpu.device);
         errdefer vk.vkDestroyDescriptorSetLayout(gpu.device, set_layout, null);
 
         const pipeline_layout = try createPipelineLayout(gpu.device, set_layout);
@@ -296,19 +297,50 @@ const identity_mat: [16]f32 = .{
 /// deck look cream-white in M5.5 first-person view).
 pub const ship_albedo: [4]f32 = .{ 0.38, 0.22, 0.12, 0 };
 
-fn createSetLayout(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
-    const bindings = [_]vk.VkDescriptorSetLayoutBinding{.{
-        .binding = 0,
-        .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = null,
-    }};
+/// Build the descriptor set layout from SPIR-V reflection of both
+/// shader stages. M14.2b: replaces the prior hand-mirrored binding
+/// array — bindings now come from the shader source as the single
+/// source of truth. Adding/removing a `layout(set=, binding=)` in
+/// box.vert/frag automatically flows through to the descriptor layout
+/// at sandbox start.
+fn createSetLayoutReflected(device: vk.VkDevice) !vk.VkDescriptorSetLayout {
+    // 64 KB buffer matches textured.zig — see comment there for sizing.
+    var heap_buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&heap_buf);
+    const arena = fba.allocator();
+
+    const vert = try spirv_reflect.reflectBindings(
+        arena,
+        &box_vert_spv,
+        vk.VK_SHADER_STAGE_VERTEX_BIT,
+    );
+    const frag = try spirv_reflect.reflectBindings(
+        arena,
+        &box_frag_spv,
+        vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+    );
+    const merged = try spirv_reflect.merge(arena, &.{ vert, frag });
+
+    // Box only uses set=0; assert and unpack into VkDescriptorSetLayoutBinding.
+    var bindings: [16]vk.VkDescriptorSetLayoutBinding = undefined;
+    var count: u32 = 0;
+    for (merged) |b| {
+        std.debug.assert(b.set == 0);
+        bindings[count] = .{
+            .binding = b.binding,
+            .descriptorType = b.descriptor_type,
+            .descriptorCount = b.descriptor_count,
+            .stageFlags = b.stage_flags,
+            .pImmutableSamplers = null,
+        };
+        count += 1;
+    }
+
     const ci = vk.VkDescriptorSetLayoutCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .bindingCount = bindings.len,
+        .bindingCount = count,
         .pBindings = &bindings,
     };
     var layout: vk.VkDescriptorSetLayout = undefined;
