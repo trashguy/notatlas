@@ -153,6 +153,61 @@ pub fn build(b: *std.Build) void {
     const lua = buildLua(b, target, optimize) catch @panic("lua source enumeration failed");
     b.installArtifact(lua);
 
+    // libktx — vendored at vendor/KTX-Software (v4.4.2). Build via the
+    // upstream CMake (1645-line, with sub-deps on basisu / dfdutils /
+    // etcdec) — mirroring it into build.zig the way Jolt does is
+    // multi-day infrastructure. M14 vintage targets `ktx_read`: read +
+    // transcode, no Basis encoder. See `feedback_thin_c_bindings.md`:
+    // we still bind against libktx's own C surface in our tree
+    // (src/render/ktx_c.zig), the build is just delegated.
+    //
+    // Requires `cmake` on PATH. Output dir is Zig-managed via
+    // addPrefixedOutputDirectoryArg, so the .a survives across zig
+    // builds and reruns on argv changes.
+    const ktx_artifacts = buildKTX(b, target);
+
+    const ktx_mod = b.addModule("ktx", .{
+        .root_source_file = b.path("src/render/ktx_c.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ktx_mod.addIncludePath(ktx_artifacts.include_path);
+    ktx_mod.addObjectFile(ktx_artifacts.lib_path);
+    // basisu transcoder + etcdec are C++; libktx headers themselves are C.
+    ktx_mod.link_libcpp = true;
+    ktx_mod.link_libc = true;
+
+    // M14.1 smoke binary: open a KTX2 file, print its metadata, exit.
+    // Proves the libktx vendoring + thin C binding round-trip without
+    // any Vulkan/render integration. M14.2 wires the actual sampling
+    // pipeline; this binary stays as the lowest-level libktx smoke.
+    const m14_dump_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/m14_ktx_dump/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    m14_dump_mod.addImport("ktx", ktx_mod);
+    const m14_dump = b.addExecutable(.{
+        .name = "m14-ktx-dump",
+        .root_module = m14_dump_mod,
+    });
+    b.installArtifact(m14_dump);
+
+    // ktx_c.zig has a tiny round-trip test (CreateFromMemory on a
+    // hand-built minimal KTX2 byte stream + Destroy) so an upstream
+    // C-API drift surfaces under `make test`.
+    const ktx_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/render/ktx_c.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ktx_test_mod.addIncludePath(ktx_artifacts.include_path);
+    ktx_test_mod.addObjectFile(ktx_artifacts.lib_path);
+    ktx_test_mod.link_libcpp = true;
+    ktx_test_mod.link_libc = true;
+    const ktx_tests = b.addTest(.{ .root_module = ktx_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ktx_tests).step);
+
     // Shared module: thin C binding (lua_c.zig) + comptime marshaling
     // (lua_bind.zig, ported from fallen-runes onto our own thin layer).
     // Anyone embedding Lua imports `lua` and links the `lua` artifact.
@@ -798,6 +853,74 @@ fn collectLuaSources(b: *std.Build) ![]const []const u8 {
         try list.append(b.allocator, rel);
     }
     return list.toOwnedSlice(b.allocator);
+}
+
+const ktx_root = "vendor/KTX-Software";
+
+const KtxArtifacts = struct {
+    /// Path to libktx_read.a — the read + transcode subset (no Basis encoder).
+    lib_path: std.Build.LazyPath,
+    /// Path to KTX-Software/include — exposes ktx.h and (when enabled later)
+    /// ktxvulkan.h. M14.1 only uses the core ktx.h surface.
+    include_path: std.Build.LazyPath,
+};
+
+/// Configure + build libktx via upstream's CMake, wrapped as one
+/// `sh -c` Run step. Two reasons not to use separate configure/build
+/// Run steps:
+///   1. Zig's LazyPath dependency edge follows the producing step.
+///      A subpath of configure's output dir doesn't carry a dep on
+///      build_cmd, so consumers wouldn't wait for the .a to exist.
+///   2. cmake's own incremental tracking handles re-runs cheaply
+///      inside the same build dir; no benefit to splitting.
+///
+/// Feature flags disable everything not needed for runtime read +
+/// transcode: tools, tests, GL/Vulkan upload helpers, doc, JNI,
+/// Python bindings, loadtest apps. Built target is `ktx_read` (~2.5 MB
+/// .a vs 3.8 MB for the writer-included `ktx`).
+///
+/// KTX1 must stay ON: lib/texture.c's dispatcher unconditionally
+/// references `ktxTexture1_constructFromStreamAndHeader`, so disabling
+/// KTX1 leaves an unresolved symbol at link time. We don't use KTX1
+/// at runtime, but the symbol has to exist.
+fn buildKTX(b: *std.Build, target: std.Build.ResolvedTarget) KtxArtifacts {
+    _ = target; // Configured for host until M14 needs cross-compile.
+
+    const cmake_run = b.addSystemCommand(&.{ "sh", "-c" });
+    // Inline shell wrapper. $0=script-name (sh convention),
+    // $1=ktx_root, $2=build_dir, $3=published_lib_path.
+    cmake_run.addArg(
+        \\set -e
+        \\KTX_SRC="$1"
+        \\BUILD_DIR="$2"
+        \\LIB_OUT="$3"
+        \\cmake -S "$KTX_SRC" -B "$BUILD_DIR" \
+        \\  -DCMAKE_BUILD_TYPE=Release \
+        \\  -DBUILD_SHARED_LIBS=OFF \
+        \\  -DKTX_FEATURE_DOC=OFF \
+        \\  -DKTX_FEATURE_JNI=OFF \
+        \\  -DKTX_FEATURE_PY=OFF \
+        \\  -DKTX_FEATURE_TESTS=OFF \
+        \\  -DKTX_FEATURE_TOOLS=OFF \
+        \\  -DKTX_FEATURE_TOOLS_CTS=OFF \
+        \\  -DKTX_FEATURE_LOADTEST_APPS=OFF \
+        \\  -DKTX_FEATURE_GL_UPLOAD=OFF \
+        \\  -DKTX_FEATURE_VK_UPLOAD=OFF \
+        \\  -DKTX_FEATURE_KTX1=ON \
+        \\  -DKTX_FEATURE_KTX2=ON \
+        \\  -DKTX_FEATURE_ETC_UNPACK=ON >/dev/null
+        \\cmake --build "$BUILD_DIR" --target ktx_read --parallel
+        \\cp -f "$BUILD_DIR/libktx_read.a" "$LIB_OUT"
+    );
+    cmake_run.addArg("buildKTX"); // $0 — name reported in shell errors.
+    cmake_run.addArg(b.path(ktx_root).getPath(b)); // $1
+    _ = cmake_run.addOutputDirectoryArg("ktx-build"); // $2 — cmake's own dir.
+    const lib_path = cmake_run.addOutputFileArg("libktx_read.a"); // $3
+
+    return .{
+        .lib_path = lib_path,
+        .include_path = b.path(ktx_root ++ "/include"),
+    };
 }
 
 /// Walk `vendor/JoltPhysics/Jolt` and return every `.cpp` path relative to
