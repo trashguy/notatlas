@@ -95,85 +95,110 @@ spatial-index, env, persistence-writer services.
 3×3 grid; sail seamlessly across; smooth 200-character harbor scene.
 The thing Grapeshot couldn't do.
 
-## Phase 2.5 — Content pipeline & tooling (~3-6 months — sized for worst case)
+## Phase 2.5 — Standalone island builder + content pipeline (~4-6 months)
 
 The bridge between "engine algorithms proven at synthetic scale"
 (Phase 2) and "engine survives real production content" (Phase 3).
+Ratified 2026-05-14: the dev team is Houdini-Python-fluent, so the
+engine side owes **plumbing + a standalone authoring tool**, not
+designer-facing authoring UX.
+
+**The slice is the workflow boundary, not the feature set.**
+FiveM-RP devs author in-game-world because their world fits in
+one session. Notatlas's world doesn't — 5×5+ cells of seamless
+ocean and content is too large to author live. So Phase 2.5
+ships a **standalone `island-builder` binary** that authors one
+island at a time: HDA-cooked terrain + scatter, plus placed
+buildings / props / NPCs / ships. The builder loads + saves
+single-island scenes; a world-export step assembles placed
+islands across the cell grid for runtime ingest.
+
+**The feature set is the full content pipeline.** Every engine
+module the builder needs is also a module the runtime client
+needs — glTF, materials, skinning, particles, scene format,
+HDA cooking. Nothing is built "just for the builder." The
+standalone binary is a *consumer* of the engine; the engine
+modules ship to the runtime client unchanged.
+
 Built around the FiveM-RP team workflow per memory
-`project_asset_pipeline_fivem_team.md`: Blender / Photoshop /
-Aseprite → drop file → small YAML manifest → hot-reload. The
-TypeScriptToLua authoring layer per
-`project_typescript_dev_frontend.md` lands here too — designers
-write .ts, runtime executes Lua.
+`project_asset_pipeline_fivem_team.md`. Drop-file + small YAML
+manifest + hot-reload, but for ONE island at a time, in a tool
+purpose-built for that scope. NPC placements record position + a
+type ref; AI-sim integration is post-Phase-2.5 (TS-via-tstl in
+M19 lands once behavior authoring begins).
 
-Closing this phase requires both the pipeline lift AND a re-gate of
-the Phase 2 synthetic milestones against real assets — per
-`feedback_synthetic_baseline_then_diff.md`, the diff isolates
-content-shape regressions from algorithm bugs.
+Closing this phase requires the builder workflow proving out
+AND a re-gate of the Phase 2 synthetic milestones against real
+assets — per `feedback_synthetic_baseline_then_diff.md`, the
+diff isolates content-shape regressions from algorithm bugs.
 
-**Schedule note — plan for the worst:** the Houdini-Engine arc
-(M22-M26) is sized for the worst-case scope (full SDK integration
-with runtime cooking, parameter exposure, async cook worker,
-point-instance procedural placement). Actual depth depends on the
-dev team's workflow once they're onboard — if they prefer Blender
-+ lighter procedural tools, the Houdini arc compresses to an
-"HDA → glTF bake" workflow docs entry and the active milestone
-count drops to M13-M20 + M27. The roadmap absorbs the worst case
-so a late upshift doesn't re-open it.
+### Path to a first-usable island-builder
 
-### Base asset pipeline
+Each milestone unblocks the next stage of the builder. Numbering
+preserved from the prior breakdown so memory cross-refs don't
+drift.
 
 | Status | Milestone | Deliverable |
 |---|---|---|
-| ▢ | M13: glTF static mesh loader | Lift fallen-runes' `gltf_loader.zig`; load + render a Blender-exported building piece in place of the procedural cube; hot-reload on file save |
+| ◐ | M13: glTF static mesh loader | Lift fallen-runes' `gltf_loader.zig`; load + render a Blender-exported building piece in place of the procedural cube; hot-reload on file save |
 | ▢ | M14: KTX2 texture + material v1 | Texture sampling pipeline; basic PBR (albedo + normal + roughness); material YAML manifest |
-| ▢ | M15: Per-asset YAML manifest + hot-reload | `data/props/*.yaml`, `data/ships/*.yaml` — one file per unit; mesh + texture + material references; hot-reload extended to meshes / textures / materials |
-| ▢ | M16: Skeletal anim format + skinning shader | Bone palette + per-vertex weights + animation clip format; GPU skinning shader; unlocks M12 re-gate against real rigs |
-| ▢ | M17: Sprite + particle systems | 2D UI / decal / billboard pipeline (banners, signs); particle emitter system (M1.6's 100-emitter target lives here) |
-| ▢ | M18: Map / scene editor | In-engine placement tool for anchorages, props, biomes; saves to YAML; matches FiveM in-game-editor convention |
-| ▢ | M19: TypeScriptToLua content scripting | Designer-facing .ts authoring → Lua runtime per locked architecture; comparable to FiveM's resource manifest pattern |
-| ▢ | M20: Onboarding doc + worked examples | "How to add a building piece" / "sail texture" / "animated NPC" — written for someone who's installed Zig once |
+| ▢ | M15: Per-asset YAML manifest + hot-reload | `data/props/*.yaml`, `data/ships/*.yaml`, `data/npcs/*.yaml`, `data/islands/*.yaml` — one file per unit; mesh + texture + material refs; hot-reload extended to meshes / textures / materials |
+| ▢ | M16: Skeletal anim format + skinning shader | Bone palette + per-vertex weights + anim clip format; GPU skinning shader. Placed NPCs render idle-animated even without AI behavior. Also unlocks M27 re-gate against real rigs |
+| ▢ | M17: Sprite + particle systems | 2D UI / decal / billboard pipeline (banners, signs); particle emitter system. Environmental props (campfires, smoke, dust) — builder needs these to compose a realistic island |
+| ▢ | M22: Houdini Engine SDK vendor + thin C bindings | Per `feedback_thin_c_bindings.md`: bind against SideFX's C API directly. Out-of-process session lifecycle, headless cook smoke (cook a stock HDA, log mesh output) |
+| ▢ | M23: HDA-as-asset in the manifest system | `.hda` recognized as an asset type in M15's manifest; cook → ingest into the M13/M14 mesh+material path; hot-reload on HDA save → re-cook |
+| ▢ | M18: Standalone `island-builder` binary | New executable alongside `notatlas-sandbox`. Reuses engine renderer + ocean + camera; no networking, no simulation, no gameplay. Click-to-place asset palette (props / ships / NPCs / HDA terrain); drag-gizmo transforms; save / load single-island scene YAML |
+| ▢ | M24: HDA parameter exposure → YAML + editor UI | HDA parameter interface read at load; YAML pins param values; M18's placement panel renders param widgets so devs iterate islands without leaving the builder |
+| ▢ | M25: Async cook worker | Same pattern as M11.3 cluster-merge worker — long cooks (seconds) run off-thread; builder stays responsive; cook results applied with double-buffered swap |
+| ▢ | M26: HDA point-scatter → GPU instancing | Ingest HDA point output into the M10 instancing path: "drop an island HDA, get 500 trees + rocks scattered, all sharing one indirect draw" |
+| ▢ | M21: World export → runtime ingest | Assemble placed-island scenes across the cell grid; write a runtime-loadable map. Format: YAML scene refs initially (matches FiveM resource convention); baked binary blob is a post-Phase-3 optimization. Runtime client/server consumes the export untouched |
 
-### Houdini Engine arc (worst-case scope; may compress per dev-team workflow)
+### Deferred to when need surfaces
 
 | Status | Milestone | Deliverable |
 |---|---|---|
-| ▢ | M22: Houdini Engine SDK vendor + thin C bindings | Per `feedback_thin_c_bindings.md`: bind against SideFX's C API directly. Session lifecycle, headless cook smoke (cook a stock HDA, log mesh output; no engine integration yet) |
-| ▢ | M23: HDA-as-asset in the manifest system | `.hda` recognized as an asset type in M15's manifest; cook → ingest into the M13/M14 mesh+material path; hot-reload on HDA save → re-cook |
-| ▢ | M24: Parameter exposure → YAML + editor UI | HDA parameter interface read at load; YAML pins parameter values; M18 editor renders parameter widgets so designers iterate without leaving the engine |
-| ▢ | M25: Async cook worker | Same pattern as M11.3 cluster-merge worker — long cooks (seconds) run off-thread; editor stays responsive; cook results applied with double-buffered swap |
-| ▢ | M26: Point instances + procedural placement | Ingest HDA point output into the M10 GPU-instancing path; "designer authors a procedural anchorage in Houdini, drops the HDA, gets 500 placed pieces ready for M11 merge" |
+| ▢ | M19: TypeScriptToLua content scripting | Lands when behavior authoring begins (NPC AI, interactables, mission scripts). Designers write .ts → runtime executes Lua. No load-bearing use until AI / interaction layer is on the table |
+| ▢ | M20: Onboarding doc + worked examples | "How to add a building piece" / "animated NPC" / "Houdini-authored island" — written once the builder workflow stabilizes, so the docs reflect the actual loop devs use, not aspirational shape |
 
 ### Re-gate (synthetic → real-asset baseline diff)
 
 | Status | Milestone | Deliverable |
 |---|---|---|
-| ▢ | M27: Re-gate M10 / M11 / M12 / M1.6 with real assets | Each synthetic gate re-run with production glTF + KTX2 + rigs (+ HDA-cooked content if the Houdini arc shipped); per-gate diff doc against the synthetic baseline; content-shape regressions tracked per `feedback_synthetic_baseline_then_diff.md` |
+| ▢ | M27: Re-gate M10 / M11 / M12 / M1.6 with real assets | Each synthetic gate re-run with production glTF + KTX2 + rigs + HDA-cooked content authored in the builder; per-gate diff doc against the synthetic baseline; content-shape regressions tracked per `feedback_synthetic_baseline_then_diff.md` |
 
 **Practical notes (Houdini):**
 - Houdini Engine is free to integrate into a host app per SideFX
   terms; users authoring HDAs need their own Houdini license
-  (Indie / FX). The asset-authoring-license dependency is the cost
-  of admission for the worst-case path.
+  (Indie / FX).
 - Default session model is **out-of-process** (Houdini crashes
-  don't kill the engine); revisit if cook latency dominates.
+  don't kill the builder); revisit if cook latency dominates.
 - Library lookup goes through a `HOUDINI_PATH` env var, not
-  vendoring — users have Houdini installed elsewhere on disk.
+  vendoring — devs have Houdini installed elsewhere on disk.
 
-**Shipping model note (carried from prior preamble):** The shipping
-model can differ from FiveM's (we likely want pre-baked deterministic
-client builds with content versioning, not on-demand client
-downloads), but the **authoring** workflow should feel familiar.
+**Render-tuning side benefit:** the island-builder runs a real
+content scene continuously (HDA terrain + scatter + buildings +
+animated NPCs + particles), which surfaces real-asset frame
+budget pressure organically through the iteration loop. This
+is most of what M27 was designed to prove — but on the dev
+workflow instead of as a separate gate. M27 still ships as
+the formal close.
+
+**Shipping model note:** The shipping model can differ from FiveM's
+(we likely want pre-baked deterministic client builds with content
+versioning, not on-demand client downloads), but the **authoring**
+workflow should feel familiar.
 
 **Phase gate:** the FiveM-RP team onboards with the worked-example
 doc only — no architect intervention — and produces a new building
-piece, sail texture, and animated NPC end-to-end. The re-gate diffs
-against synthetic baselines are published; any regression attributed
-to content shape (not algorithm) gets a tracked follow-up.
+piece, sail texture, animated NPC, and a Houdini-cooked island
+in the builder end-to-end, exports it, and runtime ingests it
+without engine code touched. The re-gate diffs against synthetic
+baselines are published; any regression attributed to content
+shape (not algorithm) gets a tracked follow-up.
 
 **End-of-phase deliverable:** the engine is a *real* game engine
-ready for content. Phase 3's "land the actual game" work no longer
-gated on tooling.
+with a real authoring tool. Phase 3's "land the actual game"
+work no longer gated on tooling.
 
 ## Phase 3 — Survival, crafting, progression (solo or +1-2 devs, ~4-6 months)
 
