@@ -12,6 +12,7 @@ pub const pipeline = @import("pipeline.zig");
 pub const ocean = @import("ocean.zig");
 pub const box = @import("box.zig");
 pub const mesh_palette = @import("mesh_palette.zig");
+pub const gltf = @import("gltf.zig");
 pub const instanced = @import("instanced.zig");
 pub const cluster_merge = @import("cluster_merge.zig");
 pub const cluster_merge_worker = @import("cluster_merge_worker.zig");
