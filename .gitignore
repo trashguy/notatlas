@@ -4,6 +4,7 @@ zig-pkg/
 .serena/
 .claude/
 captures/
+videos/
 .idea/
 
 # Windows cross-compilation libs (downloaded by scripts/fetch_windows_deps.py)

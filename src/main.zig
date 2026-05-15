@@ -122,6 +122,33 @@ pub fn main() !void {
     var frame = try render.Frame.init(gpa, &gpu, &swapchain);
     defer frame.deinit();
 
+    // Optional video capture: ffmpeg subprocess piped raw BGRA → h264 mp4.
+    // Init AFTER the swapchain so we know the format + extent. Init failures
+    // are logged and `video` stays null so the sandbox keeps running. Output
+    // always lands under `videos/` (mirrors the `captures/` convention for
+    // RenderDoc) — `--video flicker.mp4` becomes `videos/flicker.mp4`.
+    var video: ?render.video.Video = null;
+    defer if (video) |*v| v.deinit();
+    var video_path_buf: ?[]const u8 = null;
+    defer if (video_path_buf) |b| gpa.free(b);
+    if (cli.video_path) |raw_path| {
+        try std.fs.cwd().makePath("videos");
+        const basename = std.fs.path.basename(raw_path);
+        const full_path = try std.fs.path.join(gpa, &.{ "videos", basename });
+        video_path_buf = full_path;
+        video = render.video.Video.init(
+            gpa,
+            &gpu,
+            swapchain.extent,
+            swapchain.format,
+            full_path,
+            60,
+        ) catch |err| blk: {
+            std.log.err("video init failed: {s} (continuing without recording)", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
     var ocean = try render.Ocean.init(gpa, &gpu, frame.render_pass, .{});
     defer ocean.deinit();
 
@@ -192,35 +219,36 @@ pub fn main() !void {
     var merged_renderer = try render.MergedMeshRenderer.init(&gpu, frame.render_pass, ocean.camera_ubo.handle);
     defer merged_renderer.deinit();
 
-    // M14.2c: optional textured-cube path. Loads a KTX2 + uploads via
-    // VMA + builds the textured.zig pipeline. Placed at (5, 4, -2) so
-    // it sits next to the M13 procedural cube (at (5, 4, 0)) for an
-    // easy visual A/B. Off unless --m14 — keeps every other gate
-    // running on the unmodified scene.
-    var m14_ktx: ?@import("ktx").Texture2 = null;
-    defer if (m14_ktx) |*t| t.deinit();
-    var m14_texture: ?render.Texture = null;
-    defer if (m14_texture) |*t| t.deinit();
+    // M14.3: optional PBR textured-cube path. Loads a material YAML
+    // manifest → reads albedo/normal/orm KTX2s via libktx → uploads
+    // each via VMA → builds the textured.zig pipeline with a 3-texture
+    // descriptor set. Placed at (5, 4, -2) next to the M13 procedural
+    // cube (at (5, 4, 0)) for an easy visual A/B. Off unless --m14 —
+    // keeps every other gate on the unmodified scene.
+    var m14_material: ?render.Material = null;
+    defer if (m14_material) |*m| m.deinit();
+    var m14_textures: ?render.MaterialTextures = null;
+    defer if (m14_textures) |*t| t.deinit();
     var m14_renderer: ?render.Textured = null;
     defer if (m14_renderer) |*r| r.deinit();
 
     if (cli.m14) {
-        const ktx = @import("ktx");
-        const path_z = try gpa.dupeZ(u8, cli.m14_asset);
-        defer gpa.free(path_z);
-        var loaded = try ktx.Texture2.fromFile(path_z, .{});
-        m14_ktx = loaded;
-        std.log.info("M14: loaded {s}: {d}x{d} vk_format={d} bytes={d}", .{
-            cli.m14_asset, loaded.width(), loaded.height(), loaded.vkFormat(), loaded.dataSize(),
+        const manifest = try render.material.loadFromFile(gpa, cli.m14_material);
+        m14_material = manifest;
+        std.log.info("M14: loaded material '{s}' from {s}", .{ manifest.name, cli.m14_material });
+        std.log.info("M14:   albedo={s}", .{manifest.albedo_path});
+        std.log.info("M14:   normal={s}", .{manifest.normal_path});
+        std.log.info("M14:   orm={s}", .{manifest.orm_path});
+        const tex_set = try render.MaterialTextures.loadFromManifest(gpa, &gpu, &m14_material.?);
+        m14_textures = tex_set;
+        std.log.info("M14: uploaded 3 VkImages (albedo {d}x{d}/{d}, normal {d}x{d}/{d}, orm {d}x{d}/{d})", .{
+            tex_set.albedo.width, tex_set.albedo.height, tex_set.albedo.format,
+            tex_set.normal.width, tex_set.normal.height, tex_set.normal.format,
+            tex_set.orm.width,    tex_set.orm.height,    tex_set.orm.format,
         });
-        const tex = try render.Texture.init(&gpu, loaded);
-        m14_texture = tex;
-        std.log.info("M14: uploaded to VkImage {d}x{d} format={d}", .{
-            tex.width, tex.height, tex.format,
-        });
-        const rr = try render.Textured.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, &m14_texture.?);
+        const rr = try render.Textured.init(&gpu, frame.render_pass, ocean.camera_ubo.handle, &m14_textures.?);
         m14_renderer = rr;
-        std.log.info("M14: textured pipeline ready; cube placed at (5, 4, -2)", .{});
+        std.log.info("M14: PBR pipeline ready; cube placed at (5, 4, -2)", .{});
     }
 
     var scene: Scene = .{
@@ -1165,7 +1193,7 @@ pub fn main() !void {
         const capturing_this_frame = capture != null and !capture_done and frame_index == capture_warmup_frames;
         if (capturing_this_frame) capture.?.start();
 
-        const result = try frame.draw(&swapchain, clear, recordScene, &scene, prePass, &scene);
+        const result = try frame.draw(&swapchain, clear, recordScene, &scene, prePass, &scene, if (video) |*v| v else null);
         if (result == .resize_needed) {
             try swapchain.recreate(window.framebufferSize());
             try frame.recreateFramebuffers(&gpu, &swapchain);
@@ -1429,7 +1457,12 @@ fn recordScene(
     extent: render.types.vk.VkExtent2D,
 ) void {
     const scene: *Scene = @ptrCast(@alignCast(ctx));
-    scene.ocean.record(cb, extent);
+    // Sky-pass: paints background (atmosphere + sun, or underwater fog)
+    // with depth disabled. Must run first so subsequent passes overwrite
+    // its color where they have geometry. Split off from water.frag at
+    // 2026-05-14 to fix the waterline depth flicker — see
+    // `docs/research/` notes / `issue_waterline_depth_flicker.md`.
+    scene.ocean.recordSky(cb, extent);
     // M10.1: single SSBO-driven instanced pass covers ship + passengers in
     // one drawIndexed per piece type (currently 1). Return is the draw-call
     // count; we discard it here — the M10.4 gate harness will sample it.
@@ -1450,6 +1483,10 @@ fn recordScene(
         tx.bind(cb, extent);
         tx.draw(cb, scene.textured_model, .{ 1, 1, 1, 1 });
     }
+    // Water surface: strict LESS, `discard` on no-hit. Runs AFTER all
+    // opaque geometry so cubes/ships occlude water behind them. Sky-pass
+    // already painted background; water just overwrites where it hits.
+    scene.ocean.record(cb, extent);
     scene.arrows.record(cb, extent);
 }
 
@@ -1604,15 +1641,21 @@ const Cli = struct {
     /// generated by `scripts/gen_test_cube_gltf.py` — same geometry
     /// as the procedural cube, so the gate is visual parity.
     m13_asset: []const u8 = "data/props/test_cube.gltf",
-    /// M14.2c: render one textured cube next to the M13 procedural
+    /// M14.3: render one PBR textured cube next to the M13 procedural
     /// cube. Default-off so existing gates pass unchanged. When ON,
-    /// loads `--m14-asset` (KTX2), uploads via VMA + staging buffer,
-    /// renders through the textured.zig pipeline.
+    /// loads `--m14-material` (YAML) → 3 KTX2 maps via libktx →
+    /// uploads via VMA + staging buffers → renders through the
+    /// textured.zig pipeline with Cook-Torrance PBR + normal mapping.
     m14: bool = false,
-    /// M14.2c: KTX2 albedo texture path. Defaults to libktx's vendor
-    /// reference RGBA8 image so M14.2c works without a project-side
-    /// asset (M14.3 introduces data/textures/* with named materials).
-    m14_asset: []const u8 = "vendor/KTX-Software/tests/testimages/rgba-reference-u.ktx2",
+    /// M14.3: material manifest path. Defaults to the test_cube
+    /// material generated by `python3 scripts/gen_test_textured_cube.py`
+    /// (256x256 sRGB checker albedo + flat normal + default ORM).
+    m14_material: []const u8 = "data/materials/test_cube.yaml",
+    /// Record the sandbox to mp4 via an ffmpeg subprocess. Use for
+    /// diagnosing TEMPORAL visual bugs (waterline flicker, animation
+    /// stepping) that single-frame RenderDoc captures can't show.
+    /// `null` disables; pass `--video clip.mp4` to enable.
+    video_path: ?[]const u8 = null,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1686,9 +1729,12 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
             cli.m13_asset = v;
         } else if (std.mem.eql(u8, a, "--m14")) {
             cli.m14 = true;
-        } else if (std.mem.eql(u8, a, "--m14-asset")) {
-            const v = args.next() orelse return error.MissingM14AssetValue;
-            cli.m14_asset = v;
+        } else if (std.mem.eql(u8, a, "--m14-material")) {
+            const v = args.next() orelse return error.MissingM14MaterialValue;
+            cli.m14_material = v;
+        } else if (std.mem.eql(u8, a, "--video")) {
+            const v = args.next() orelse return error.MissingVideoPath;
+            cli.video_path = v;
         }
     }
     return cli;

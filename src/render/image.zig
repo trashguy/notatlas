@@ -26,6 +26,7 @@ const gpu_mod = @import("gpu.zig");
 const buffer_mod = @import("buffer.zig");
 const vma = @import("vma");
 const ktx = @import("ktx");
+const material_mod = @import("material.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -380,4 +381,51 @@ fn createSampler(device: vk.VkDevice) !vk.VkSampler {
         VulkanError.SamplerCreationFailed,
     );
     return sampler;
+}
+
+// -----------------------------------------------------------------------------
+// M14.3 — bundle of GPU textures backing one material (albedo + normal + ORM).
+// `material.zig::Material` is the parsed YAML manifest (paths only); this is
+// the GPU-resident counterpart that owns 3 Texture instances ready to bind
+// into the textured.zig descriptor set.
+
+pub const MaterialTextures = struct {
+    albedo: Texture,
+    normal: Texture,
+    orm: Texture,
+
+    /// Load a material manifest, then create 3 Textures by reading each
+    /// referenced KTX2 via libktx and uploading via VMA. On any error
+    /// already-created textures are torn down before returning.
+    pub fn loadFromManifest(
+        gpa: std.mem.Allocator,
+        gpu: *const gpu_mod.GpuContext,
+        manifest: *const material_mod.Material,
+    ) !MaterialTextures {
+        var albedo = try loadOne(gpa, gpu, manifest.albedo_path);
+        errdefer albedo.deinit();
+        var normal = try loadOne(gpa, gpu, manifest.normal_path);
+        errdefer normal.deinit();
+        var orm = try loadOne(gpa, gpu, manifest.orm_path);
+        errdefer orm.deinit();
+        return .{ .albedo = albedo, .normal = normal, .orm = orm };
+    }
+
+    pub fn deinit(self: *MaterialTextures) void {
+        self.orm.deinit();
+        self.normal.deinit();
+        self.albedo.deinit();
+    }
+};
+
+fn loadOne(
+    gpa: std.mem.Allocator,
+    gpu: *const gpu_mod.GpuContext,
+    rel_path: []const u8,
+) !Texture {
+    const path_z = try gpa.dupeZ(u8, rel_path);
+    defer gpa.free(path_z);
+    var ktex = try ktx.Texture2.fromFile(path_z, .{});
+    defer ktex.deinit();
+    return Texture.init(gpu, ktex);
 }

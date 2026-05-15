@@ -26,6 +26,7 @@ const ocean_params_mod = notatlas.ocean_params;
 
 const fullscreen_vert_spv align(4) = @embedFile("fullscreen_vert_spv").*;
 const water_frag_spv align(4) = @embedFile("water_frag_spv").*;
+const sky_frag_spv align(4) = @embedFile("sky_frag_spv").*;
 
 /// Reserved for future renderer-level config (MSAA samples, ocean tile
 /// strategy, etc). Iteration count moved to `WaveParams` — same value
@@ -36,7 +37,11 @@ pub const Ocean = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
 
+    /// Water surface: strict LESS, writes gl_FragDepth.
     pipeline: pipeline_mod.Pipeline,
+    /// Sky background: no depth test/write. Shares `pipeline`'s layout +
+    /// descriptor set — only differs in frag shader and depth state.
+    sky_pipeline: vk.VkPipeline,
 
     camera_ubo: buffer_mod.Buffer,
     wave_ubo: buffer_mod.Buffer,
@@ -59,9 +64,21 @@ pub const Ocean = struct {
         defer vk.vkDestroyShaderModule(gpu.device, vert_module, null);
         const frag_module = try shader_mod.fromSpv(gpu.device, &water_frag_spv);
         defer vk.vkDestroyShaderModule(gpu.device, frag_module, null);
+        const sky_frag_module = try shader_mod.fromSpv(gpu.device, &sky_frag_spv);
+        defer vk.vkDestroyShaderModule(gpu.device, sky_frag_module, null);
 
-        var pipeline = try pipeline_mod.create(gpu.device, render_pass, vert_module, frag_module);
+        var pipeline = try pipeline_mod.create(gpu.device, render_pass, vert_module, frag_module, .water_strict);
         errdefer pipeline.deinit();
+
+        const sky_pipeline = try pipeline_mod.createHandle(
+            gpu.device,
+            render_pass,
+            pipeline.pipeline_layout,
+            vert_module,
+            sky_frag_module,
+            .sky_disabled,
+        );
+        errdefer vk.vkDestroyPipeline(gpu.device, sky_pipeline, null);
 
         var camera_ubo = try buffer_mod.Buffer.init(
             gpu,
@@ -100,6 +117,7 @@ pub const Ocean = struct {
             .gpa = gpa,
             .device = gpu.device,
             .pipeline = pipeline,
+            .sky_pipeline = sky_pipeline,
             .camera_ubo = camera_ubo,
             .wave_ubo = wave_ubo,
             .ocean_ubo = ocean_ubo,
@@ -118,6 +136,7 @@ pub const Ocean = struct {
         self.ocean_ubo.deinit();
         self.wave_ubo.deinit();
         self.camera_ubo.deinit();
+        vk.vkDestroyPipeline(self.device, self.sky_pipeline, null);
         self.pipeline.deinit();
     }
 
@@ -173,6 +192,7 @@ pub const Ocean = struct {
             self.pipeline.pipeline_layout,
             new_vert,
             new_frag,
+            .water_strict,
         );
 
         // Old pipeline may still be referenced by an in-flight command
@@ -213,6 +233,44 @@ pub const Ocean = struct {
         );
 
         // Fullscreen triangle — three vertices, no buffers.
+        vk.vkCmdDraw(cb, 3, 1, 0, 0);
+    }
+
+
+    /// Sky pass: paints atmosphere + sun (and underwater fog when the
+    /// camera is below the surface) into every pixel, no depth write.
+    /// Must be called BEFORE any rasterized geometry — sky is the
+    /// background layer, everything else draws on top.
+    pub fn recordSky(self: *Ocean, cb: vk.VkCommandBuffer, extent: vk.VkExtent2D) void {
+        vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.sky_pipeline);
+
+        const viewport = vk.VkViewport{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(extent.width),
+            .height = @floatFromInt(extent.height),
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.vkCmdSetViewport(cb, 0, 1, &viewport);
+
+        const scissor = vk.VkRect2D{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = extent,
+        };
+        vk.vkCmdSetScissor(cb, 0, 1, &scissor);
+
+        vk.vkCmdBindDescriptorSets(
+            cb,
+            vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.pipeline.pipeline_layout,
+            0,
+            1,
+            &self.descriptor_set,
+            0,
+            null,
+        );
+
         vk.vkCmdDraw(cb, 3, 1, 0, 0);
     }
 };

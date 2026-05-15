@@ -1,20 +1,19 @@
 #version 450
 
-// notatlas water + sky pass. One fragment shader covers everything:
+// notatlas water surface pass. Surface-only after the sky-pass split
+// (2026-05-14, see issue_waterline_depth_flicker.md). Previously this
+// shader also painted sky + underwater; both moved to sky.frag, which
+// runs first with depth disabled. This file now ONLY shades raymarched
+// water-surface hits and `discard`s no-hit fragments.
 //
-// - For rays pointing at the sky (ray.y >= 0): atmosphere + sun disc.
-// - For rays pointing at the water: ray-march the deterministic wave
-//   heightfield (`getWaves`, ported line-for-line from
-//   `src/wave_query.zig`), reconstruct the hit position, compute a
-//   per-pixel normal via finite differences at higher iteration count,
-//   then shade with Schlick fresnel × atmosphere(reflect) + scatter +
-//   foam + (optionally) underwater fog.
+// Render order: sky → opaque geometry → water → arrows. Water pipeline
+// uses strict LESS (was LESS_OR_EQUAL), safe now that nothing else
+// writes depth=1.0 to fragments we care about.
 //
-// Atmosphere / sun / ACES tonemap functions are adapted from afl_ext's
-// "Ocean" shadertoy (https://www.shadertoy.com/view/MdXyzX, MIT). The
-// wave kernel is the deterministic CPU version from wave_query.zig
-// shipped here verbatim so server-side buoyancy and client-side visuals
-// agree at every (x, z, t).
+// Atmosphere / sun / ACES tonemap functions adapted from afl_ext's
+// "Ocean" shadertoy (https://www.shadertoy.com/view/MdXyzX, MIT). Wave
+// kernel matches the deterministic CPU port in wave_query.zig so
+// server-side buoyancy and client-side visuals agree at every (x, z, t).
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
@@ -40,8 +39,6 @@ layout(set = 0, binding = 2) uniform OceanParams {
 
 const float TAU = 6.28318530717958647692;
 
-// ---------------- atmosphere (afl_ext, MIT) ----------------
-// Sun direction: hardcoded mid-sky, looking roughly south-west.
 const vec3 SUN_DIR = normalize(vec3(-0.0773502691896258, 0.6, 0.5773502691896258));
 
 vec3 extra_cheap_atmosphere(vec3 raydir, vec3 sundir) {
@@ -83,7 +80,6 @@ vec3 aces_tonemap(vec3 color) {
 
 // ---------------- wave kernel (port of wave_query.zig) ----------------
 
-// Sharpened-sine wave + negative derivative for octave drag.
 vec2 wavedx(vec2 pos, vec2 dir, float frequency, float timeshift) {
     float x = dot(dir, pos) * frequency + timeshift;
     float wave = exp(sin(x) - 1.0);
@@ -93,13 +89,13 @@ vec2 wavedx(vec2 pos, vec2 dir, float frequency, float timeshift) {
 
 float getWavesNorm(vec2 pos, uint iterations) {
     if (iterations == 0u) return 0.5;
-    float drag_mult     = waves.a.y;
-    float freq_mult     = waves.b.x;
-    float base_time     = waves.b.y;
-    float time_mult     = waves.b.z;
-    float weight_decay  = waves.b.w;
-    float initial_iter  = waves.c.x;
-    float t             = waves.a.x;
+    float drag_mult    = waves.a.y;
+    float freq_mult    = waves.b.x;
+    float base_time    = waves.b.y;
+    float time_mult    = waves.b.z;
+    float weight_decay = waves.b.w;
+    float initial_iter = waves.c.x;
+    float t            = waves.a.x;
 
     vec2 p = pos;
     float iter = initial_iter;
@@ -124,8 +120,6 @@ float getWavesNorm(vec2 pos, uint iterations) {
     return sumv / sumw;
 }
 
-// Signed surface height in meters around y=0. Mirrors `waveHeight` in
-// wave_query.zig: same centering, same range bias.
 float waveHeight(vec2 world_xz, uint iterations) {
     float scale = waves.a.w;
     float amp = waves.a.z;
@@ -136,29 +130,12 @@ float waveHeight(vec2 world_xz, uint iterations) {
 
 // ---------------- raymarch + normal ----------------
 
-// March from a high water plane down to a low water plane until we hit the
-// surface. Plane bracket = ±amplitude_m so we always cross the heightfield.
-//
-// Two-phase intersect:
-//   1. Sphere-trace-style step: `step = (pos.y - h) / -dir.y`. This is the
-//      ray-distance to where pos.y would equal h if h were locally
-//      constant — the proper first-order convergence target. Multiplied by
-//      a 0.5 conservative factor so we don't overshoot when the surface
-//      curves up between samples. The naive `pos += dir * (pos.y - h)`
-//      version stalls on near-horizon rays (vertical step shrinks with
-//      `dir.y`), producing visible glitching when the camera is near the
-//      water line; dividing by `-dir.y` removes the ray-slope dependence.
-//   2. Once a crossing is bracketed (last `prev` strictly above, current
-//      `pos` at-or-below), 6 bisection steps refine the hit. Final
-//      hit-distance is independent of how many steps the linear phase
-//      took.
+// Two-phase intersect: sphere-trace step until bracket, then 6 bisection
+// halvings. Returns -1.0 on miss (caller `discard`s); positive distance
+// on hit. See `src/wave_query.zig` for the same kernel CPU-side.
 float raymarchWater(vec3 origin, vec3 ray, float amp) {
-    // Intersect against y = +amp (entry) and y = -amp (exit). For rays
-    // pointing down (ray.y < 0) we enter at the high plane.
     float t_high = (amp - origin.y) / ray.y;
     float t_low = (-amp - origin.y) / ray.y;
-    // If we're already below the upper plane (camera inside the water
-    // column), start from the camera; otherwise start at the top plane.
     float t_start = max(0.0, t_high);
     float t_end = max(t_start + 0.001, t_low);
     vec3 start = origin + ray * t_start;
@@ -168,9 +145,6 @@ float raymarchWater(vec3 origin, vec3 ray, float amp) {
     vec3 pos = start;
     vec3 dir = normalize(end - start);
     float total_dist = distance(start, end);
-    // Guard against horizontal rays. Caller's underwater check should
-    // already have funneled rays going up out of this function, but a
-    // tiny epsilon prevents division-by-zero for grazing rays.
     float vy = max(0.0001, -dir.y);
 
     uint iterations = uint(waves.c.y);
@@ -185,12 +159,8 @@ float raymarchWater(vec3 origin, vec3 ray, float amp) {
         pos += dir * ((pos.y - h) / vy) * 0.5;
         if (distance(start, pos) > total_dist) break;
     }
-    if (!hit) return distance(start, origin); // miss; clamp to high plane for stability
+    if (!hit) return -1.0;
 
-    // Bisection refinement on the bracket [prev (above), pos (at-or-below)].
-    // Discriminant is signed vertical mismatch `mid.y - h(mid.xz)`. Six
-    // halvings reduce the residual to ~1.5% of one linear-march step,
-    // enough to make the hit-distance independent of step-count parity.
     for (uint i = 0u; i < 6u; ++i) {
         vec3 mid = 0.5 * (prev + pos);
         float h = waveHeight(mid.xz, iterations);
@@ -203,7 +173,6 @@ vec3 waveNormal(vec2 world_xz, float eps_m, uint iterations) {
     float h_c = waveHeight(world_xz, iterations);
     float h_l = waveHeight(world_xz - vec2(eps_m, 0.0), iterations);
     float h_f = waveHeight(world_xz + vec2(0.0, eps_m), iterations);
-    // Same Jacobian-cross formulation as wave_query.waveNormal.
     float ax = eps_m;
     float ay = h_c - h_l;
     float bz = eps_m;
@@ -211,8 +180,6 @@ vec3 waveNormal(vec2 world_xz, float eps_m, uint iterations) {
     vec3 n = vec3(ay * (-bz) - 0.0, 0.0 - ax * (-bz), ax * by - ay * 0.0);
     return normalize(n);
 }
-
-// ---------------- ray reconstruction ----------------
 
 vec3 viewRayFromUv(vec2 uv) {
     vec2 ndc = uv * 2.0 - 1.0;
@@ -225,65 +192,33 @@ void main() {
     vec3 ray = viewRayFromUv(v_uv);
     vec3 eye = cam.eye.xyz;
 
-    // ---------------- underwater ----------------
-    // Camera below the LOCAL surface (not just below mean sea level): a
-    // wave crest can rise above the camera at altitudes < amplitude_m, so
-    // the test must compare against waveHeight at eye.xz, not zero. Every
-    // ray is in water in that case — short-circuit to fog with a 0.6×→1.4×
-    // brightness gradient along ray.y so the image still has a sense of
-    // "up". (See raymarchWater above for why the surface path is wrong
-    // here even when the camera is only momentarily engulfed.)
+    // Sky-pass owns these branches now. Discard so we never write color
+    // or depth for non-surface pixels.
     uint iter_eye = uint(waves.c.y);
-    float eye_h = waveHeight(eye.xz, iter_eye);
-    if (eye.y < eye_h) {
-        float up = max(0.0, ray.y);
-        vec3 col = ocean.fog_color.rgb * (0.6 + 0.8 * up);
-        o_color = vec4(aces_tonemap(col * 2.0), 1.0);
-        gl_FragDepth = 1.0;
-        return;
-    }
+    if (eye.y < waveHeight(eye.xz, iter_eye)) discard;
+    if (ray.y >= 0.0) discard;
 
-    // ---------------- sky ----------------
-    if (ray.y >= 0.0) {
-        vec3 col = getAtmosphere(ray) + vec3(getSun(ray));
-        o_color = vec4(aces_tonemap(col * 2.0), 1.0);
-        gl_FragDepth = 1.0; // far plane — future ships/structures occlude
-        return;
-    }
-
-    // ---------------- water ----------------
     float amp = waves.a.z;
-
-    // Distance to the surface. raymarchWater returns the distance from the
-    // camera to the hit; reconstruct world position from it.
     float hit_dist = raymarchWater(eye, ray, amp);
+    if (hit_dist < 0.0) discard; // miss — sky-pass already painted this pixel
     vec3 hit = eye + ray * hit_dist;
 
-    // Per-pixel normal at the same iteration count as the raymarch — keeps
-    // the visual surface consistent with the CPU buoyancy heightfield.
     vec3 N = waveNormal(hit.xz, 0.1, uint(waves.c.y));
-    // Distance smoothing: kills high-frequency aliasing on far waves.
     N = normalize(mix(N, vec3(0.0, 1.0, 0.0), 0.8 * min(1.0, sqrt(hit_dist * 0.01) * 1.1)));
 
-    // Schlick fresnel.
     float ndotv = max(0.0, dot(N, -ray));
     float fresnel = 0.04 + 0.96 * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0);
 
-    // Reflect the view ray through the surface; clamp to upper hemisphere.
     vec3 R = reflect(ray, N);
     R.y = abs(R.y);
     vec3 reflection = getAtmosphere(R) + vec3(getSun(R));
 
-    // Subsurface scatter: shallow → deep mix by surface height. Storm range
-    // ≈ ±4m; map to 0..1 with a soft midpoint.
     float depth_t = clamp(hit.y * 0.15 + 0.5, 0.0, 1.0);
     vec3 scatter = mix(ocean.deep_color.rgb, ocean.shallow_color.rgb, depth_t) * 0.25;
 
     vec3 col = mix(scatter, reflection, fresnel);
 
-    // Whitecaps: curvature × hash-noise patches, sky-tinted bright.
     float curvature = clamp(1.0 - N.y, 0.0, 1.0);
-    // Cheap value-noise for breakup.
     vec2 npos = hit.xz * 0.4 + waves.a.x * 0.05;
     vec2 ip = floor(npos);
     vec2 fp = fract(npos);
@@ -303,7 +238,9 @@ void main() {
     vec3 foam_color = getAtmosphere(vec3(0.0, 1.0, 0.0)) * 6.0 + vec3(0.4);
     col = mix(col, foam_color, foam_t);
 
-    // Underwater fog (camera below waterline).
+    // Underwater fog (camera below sea level but above local crest:
+    // brief transition while wading in). The hard underwater case is
+    // handled by sky-pass.
     if (eye.y < 0.0) {
         float fog_density = ocean.foam.z;
         float fog_t = 1.0 - exp(-fog_density * hit_dist);
@@ -312,7 +249,8 @@ void main() {
 
     o_color = vec4(aces_tonemap(col * 2.0), 1.0);
 
-    // Write depth so future ship/structure passes occlude correctly.
+    // Write depth so rasterized geometry (cubes, ships) drawn AFTER
+    // water can z-test against the surface correctly.
     vec4 hit_clip = cam.proj * cam.view * vec4(hit, 1.0);
     gl_FragDepth = hit_clip.z / hit_clip.w;
 }

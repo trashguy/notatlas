@@ -33,7 +33,10 @@ const vec2 ARROW[9] = vec2[](
 );
 
 const float ARROW_SCALE_M = 35.0;  // length at unit length-fraction
-const float ARROW_HEIGHT_M = 10.0; // y above sea level (above storm crests)
+const float ARROW_HEIGHT_M = 60.0; // y above sea level — well above the
+                                   // camera eye line so the field reads
+                                   // as a high-altitude bird's-eye viz,
+                                   // not a stripe pasted onto the horizon
 const float MAX_REF_MAG = 25.0;    // mag at which the length is clamped to 1
 const float MIN_LEN_FRAC = 0.25;   // arrows always render at ≥ this fraction
 

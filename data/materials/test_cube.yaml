@@ -1,0 +1,4 @@
+name: test_cube
+albedo: data/textures/test_cube/albedo.ktx2
+normal: data/textures/test_cube/normal.ktx2
+orm: data/textures/test_cube/orm.ktx2

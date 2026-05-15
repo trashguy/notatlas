@@ -1,15 +1,20 @@
 //! Graphics pipeline + matching pipeline layout + descriptor set layout for
-//! the M2 raymarched water pass.
+//! the M2 raymarched water pass — and, after the 2026-05-14 sky-pass split,
+//! the depth-disabled sky pass too. Both pipelines share the same
+//! descriptor set layout (camera + waves + ocean UBOs) and the same
+//! fullscreen-triangle vertex shader; only the fragment shader and depth
+//! state differ. `DepthMode` selects between them.
 //!
 //! No vertex input — the fullscreen triangle is emitted from
 //! `gl_VertexIndex` in `fullscreen.vert`. All UBO bindings are fragment-
 //! stage; the vertex shader doesn't read uniforms. Viewport and scissor
 //! are dynamic so a window resize doesn't require rebuilding the pipeline.
 //!
-//! The fragment shader writes `gl_FragDepth`, which forces late depth-test
-//! and disables early-Z. We accept the perf hit at M2 — it's free for
-//! future ship/structure passes that need correct occlusion against the
-//! water surface (M5+).
+//! The water fragment shader writes `gl_FragDepth`, which forces late
+//! depth-test and disables early-Z. We accept the perf hit at M2 — it's
+//! free for future ship/structure passes that need correct occlusion
+//! against the water surface (M5+). Sky doesn't write depth and runs with
+//! depth test off entirely.
 
 const std = @import("std");
 const types = @import("vulkan_types.zig");
@@ -30,11 +35,18 @@ pub const Pipeline = struct {
     }
 };
 
+/// Depth state variant. Sky runs first with no test/write; water runs
+/// after geometry with strict LESS (loadbearing — see `issue_waterline
+/// _depth_flicker.md`: LESS_OR_EQUAL produced horizon-line flicker
+/// against cleared sky depth = 1.0 before the sky pass moved out).
+pub const DepthMode = enum { water_strict, sky_disabled };
+
 pub fn create(
     device: vk.VkDevice,
     render_pass: vk.VkRenderPass,
     vert_module: vk.VkShaderModule,
     frag_module: vk.VkShaderModule,
+    depth_mode: DepthMode,
 ) !Pipeline {
     const set_layout = try createSetLayout(device);
     errdefer vk.vkDestroyDescriptorSetLayout(device, set_layout, null);
@@ -55,7 +67,7 @@ pub fn create(
     );
     errdefer vk.vkDestroyPipelineLayout(device, pipeline_layout, null);
 
-    const handle = try createHandle(device, render_pass, pipeline_layout, vert_module, frag_module);
+    const handle = try createHandle(device, render_pass, pipeline_layout, vert_module, frag_module, depth_mode);
 
     return .{
         .descriptor_set_layout = set_layout,
@@ -75,6 +87,7 @@ pub fn createHandle(
     pipeline_layout: vk.VkPipelineLayout,
     vert_module: vk.VkShaderModule,
     frag_module: vk.VkShaderModule,
+    depth_mode: DepthMode,
 ) !vk.VkPipeline {
     const stages = [_]vk.VkPipelineShaderStageCreateInfo{
         .{
@@ -176,17 +189,21 @@ pub fn createHandle(
         .blendConstants = .{ 0, 0, 0, 0 },
     };
 
-    // Frag writes gl_FragDepth so future ship/structure passes can z-test
-    // against the water surface. compareOp = LESS_OR_EQUAL because the sky
-    // path writes gl_FragDepth = 1.0 (far plane) and the depth buffer is
-    // cleared to 1.0 — strict LESS would reject all sky fragments.
+    // water_strict: frag writes gl_FragDepth + strict LESS test, so
+    //   rasterized geometry drawn between sky and water occludes correctly.
+    // sky_disabled: no test, no write — sky paints color into the cleared
+    //   depth buffer, leaves depth at 1.0 for later passes to overwrite.
+    const depth_test: vk.VkBool32 = switch (depth_mode) {
+        .water_strict => vk.VK_TRUE,
+        .sky_disabled => vk.VK_FALSE,
+    };
     const depth_stencil = vk.VkPipelineDepthStencilStateCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .depthTestEnable = vk.VK_TRUE,
-        .depthWriteEnable = vk.VK_TRUE,
-        .depthCompareOp = vk.VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depthTestEnable = depth_test,
+        .depthWriteEnable = depth_test,
+        .depthCompareOp = vk.VK_COMPARE_OP_LESS,
         .depthBoundsTestEnable = vk.VK_FALSE,
         .stencilTestEnable = vk.VK_FALSE,
         .front = std.mem.zeroes(vk.VkStencilOpState),

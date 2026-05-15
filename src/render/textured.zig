@@ -103,7 +103,7 @@ pub const Textured = struct {
         gpu: *const gpu_mod.GpuContext,
         render_pass: vk.VkRenderPass,
         camera_ubo: vk.VkBuffer,
-        texture: *const image_mod.Texture,
+        material: *const image_mod.MaterialTextures,
     ) !Textured {
         const set_layout = try createSetLayoutReflected(gpu.device);
         errdefer vk.vkDestroyDescriptorSetLayout(gpu.device, set_layout, null);
@@ -145,7 +145,7 @@ pub const Textured = struct {
         errdefer vk.vkDestroyDescriptorPool(gpu.device, pool, null);
 
         const set = try allocateDescriptorSet(gpu.device, pool, set_layout);
-        writeDescriptors(gpu.device, set, camera_ubo, texture);
+        writeDescriptors(gpu.device, set, camera_ubo, material);
 
         return .{
             .device = gpu.device,
@@ -470,7 +470,8 @@ fn createPipelineHandle(
 fn createDescriptorPool(device: vk.VkDevice) !vk.VkDescriptorPool {
     const sizes = [_]vk.VkDescriptorPoolSize{
         .{ .type = vk.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 },
-        .{ .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 },
+        // 3 combined image samplers: albedo, normal, ORM (M14.3 PBR).
+        .{ .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 },
     };
     const ci = vk.VkDescriptorPoolCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -512,14 +513,16 @@ fn writeDescriptors(
     device: vk.VkDevice,
     set: vk.VkDescriptorSet,
     camera: vk.VkBuffer,
-    texture: *const image_mod.Texture,
+    material: *const image_mod.MaterialTextures,
 ) void {
     const buf_info = vk.VkDescriptorBufferInfo{
         .buffer = camera,
         .offset = 0,
         .range = vk.VK_WHOLE_SIZE,
     };
-    const img_info = texture.descriptorImageInfo();
+    const albedo_info = material.albedo.descriptorImageInfo();
+    const normal_info = material.normal.descriptorImageInfo();
+    const orm_info = material.orm.descriptorImageInfo();
 
     const writes = [_]vk.VkWriteDescriptorSet{
         .{
@@ -542,7 +545,31 @@ fn writeDescriptors(
             .dstArrayElement = 0,
             .descriptorCount = 1,
             .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &img_info,
+            .pImageInfo = &albedo_info,
+            .pBufferInfo = null,
+            .pTexelBufferView = null,
+        },
+        .{
+            .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = null,
+            .dstSet = set,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &normal_info,
+            .pBufferInfo = null,
+            .pTexelBufferView = null,
+        },
+        .{
+            .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = null,
+            .dstSet = set,
+            .dstBinding = 3,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &orm_info,
             .pBufferInfo = null,
             .pTexelBufferView = null,
         },

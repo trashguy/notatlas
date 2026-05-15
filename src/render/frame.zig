@@ -12,6 +12,7 @@ const std = @import("std");
 const types = @import("vulkan_types.zig");
 const gpu_mod = @import("gpu.zig");
 const swapchain_mod = @import("swapchain.zig");
+const video_mod = @import("video.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -152,8 +153,17 @@ pub const Frame = struct {
         record_ctx: ?*anyopaque,
         pre_pass: ?PrePassFn,
         pre_pass_ctx: ?*anyopaque,
+        video: ?*video_mod.Video,
     ) !DrawResult {
         _ = vk.vkWaitForFences(self.device, 1, &self.in_flight, vk.VK_TRUE, std.math.maxInt(u64));
+
+        // Previous frame's GPU copy is now observably complete; pipe its
+        // bytes to the encoder before we record the next frame. Failures
+        // are logged but non-fatal — diagnosis capture shouldn't crash
+        // the sandbox.
+        if (video) |v| v.flushPendingFrame() catch |err| {
+            std.log.warn("video flush failed: {s}", .{@errorName(err)});
+        };
 
         var image_index: u32 = 0;
         const acquire_res = vk.vkAcquireNextImageKHR(
@@ -182,6 +192,8 @@ pub const Frame = struct {
             record_ctx,
             pre_pass,
             pre_pass_ctx,
+            video,
+            swapchain.images[image_index],
         );
 
         const render_finished = self.render_finished_per_image[image_index];
@@ -544,6 +556,8 @@ fn recordPass(
     ctx: ?*anyopaque,
     pre_pass_fn: ?PrePassFn,
     pre_pass_ctx: ?*anyopaque,
+    video: ?*video_mod.Video,
+    swapchain_image: vk.VkImage,
 ) !void {
     try types.check(vk.vkResetCommandBuffer(cb, 0), VulkanError.CommandBufferBeginFailed);
 
@@ -575,6 +589,12 @@ fn recordPass(
     vk.vkCmdBeginRenderPass(cb, &rp_begin, vk.VK_SUBPASS_CONTENTS_INLINE);
     if (record_fn) |f| f(ctx.?, cb, extent);
     vk.vkCmdEndRenderPass(cb);
+
+    // Post-pass: video readback. Image is in PRESENT_SRC_KHR after the
+    // render-pass finalLayout; recordCopy round-trips it through
+    // TRANSFER_SRC_OPTIMAL and back, so present sees the layout it
+    // expects.
+    if (video) |v| v.recordCopy(cb, swapchain_image);
 
     try types.check(vk.vkEndCommandBuffer(cb), VulkanError.CommandBufferEndFailed);
 }
