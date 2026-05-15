@@ -50,6 +50,8 @@ echo ">>> running sandbox (log: $LOG)"
   --anchorage-invalidate-after 3 \
   --force-far \
   --soak "$SOAK" \
+  --cam-orbit-rate 0.3 \
+  --wave-config data/waves/calm.yaml \
   > "$LOG" 2>&1 || {
     echo "!!! sandbox exited non-zero — see $LOG"
     exit 1

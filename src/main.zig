@@ -12,7 +12,7 @@ const render = @import("render/render.zig");
 const physics = @import("physics");
 const zglfw = @import("zglfw");
 
-const wave_config_path = "data/waves/storm.yaml";
+const wave_config_path_default = "data/waves/storm.yaml";
 const ocean_config_path = "data/ocean.yaml";
 const hull_config_path = "data/ships/box.yaml";
 const wind_config_path = "data/wind.yaml";
@@ -267,20 +267,20 @@ pub fn main() !void {
         scene.textured_model = m14_model.data;
     }
 
-    const wave_params = try loadWaves(gpa, wave_config_path);
+    const wave_params = try loadWaves(gpa, cli.wave_config);
     ocean.setWaveParams(wave_params);
 
     const ocean_params = try loadOcean(gpa, ocean_config_path);
     ocean.setOceanParams(ocean_params);
 
     var watcher = try render.file_watch.Watcher.init(.{
-        .wave_basename = std.fs.path.basename(wave_config_path),
+        .wave_basename = std.fs.path.basename(cli.wave_config),
         .hull_basename = std.fs.path.basename(hull_config_path),
     });
     defer watcher.deinit();
     std.log.info("hot-reload watching {s}, {s}, {s}, {s}, assets/shaders/*", .{
         ocean_config_path,
-        wave_config_path,
+        cli.wave_config,
         hull_config_path,
         wind_config_path,
     });
@@ -834,7 +834,7 @@ pub fn main() !void {
                 .piece_id = cli.piece_types,
                 .asset = cli.m13_asset,
             } else null;
-            handleReload(gpa, &ocean, &instanced, &merged_renderer, &arrows, &hull, &buoy, &wind_params, &palette, gpu.device, m13_cfg, frame.render_pass, events);
+            handleReload(gpa, &ocean, &instanced, &merged_renderer, &arrows, &hull, &buoy, &wind_params, &palette, gpu.device, m13_cfg, frame.render_pass, events, cli.wave_config);
         }
 
         const frame_ns = timer.lap();
@@ -937,18 +937,26 @@ pub fn main() !void {
         // (0.5 × 1.7 × 0.5 m) lives in the pax local model alongside the
         // local yaw. Feet sit on local y = +half_extents.y; the cube mesh is
         // ±0.5 in object space, so we lift its center by half the height
-        // (1.7/2 = 0.85) to put the feet on the deck.
+        // (1.7/2 = 0.85) to put the feet on the deck. The +deck_clearance
+        // nudge keeps the pax bottom face from coplanar-z-fighting with the
+        // deck top (visible as flicker on the red/blue/green pax boxes).
         const ship_pose_only = notatlas.math.Mat4.trs(
             render_pos,
             render_rot,
             notatlas.math.Vec3.init(1, 1, 1),
         );
         const pax_half_height: f32 = 0.85;
+        // 5cm clearance: 1cm worked at perpendicular angles but at the
+        // shallow grazing angles the orbit camera produces, the pax-bottom
+        // ↔ deck-top offset projects toward zero screen-space depth and
+        // z-fighting briefly returns. 5cm is well within the 24-bit depth
+        // buffer's resolvable range at gameplay distances.
+        const deck_clearance: f32 = 0.05;
         for (0..npc_pax_count) |i| {
             const p = npc_pax[i];
             const local_offset = notatlas.math.Vec3.init(
                 p.pos.x,
-                p.pos.y + pax_half_height,
+                p.pos.y + pax_half_height + deck_clearance,
                 p.pos.z,
             );
             const local_model = notatlas.math.Mat4.trs(
@@ -990,6 +998,7 @@ pub fn main() !void {
             );
         }
         last_cursor = cursor;
+
         if (cursor_captured and window.handle.getKey(.escape) == .press) {
             zglfw.setInputMode(window.handle, .cursor, .normal) catch {};
             cursor_captured = false;
@@ -1007,11 +1016,38 @@ pub fn main() !void {
         // ship pose source. Standing still + watching the deck rock is the
         // M5.3 headline gate.
         const ship_pose: notatlas.player.Pose = .{ .pos = render_pos, .rot = render_rot };
-        const world_eye = player.worldEye(ship_pose);
-        const world_fwd = player.worldForward(ship_pose);
+        const player_eye = player.worldEye(ship_pose);
+        const player_fwd = player.worldForward(ship_pose);
+
+        // Visual-gate spectator camera: when --cam-orbit-rate is set on a
+        // soak run, replace the player view with a smooth boat-centered
+        // orbit. Keeps the test subject in frame regardless of physics
+        // chaos and decouples gate output from where the player happens to
+        // be standing. `world_eye` is still the *player's* eye for pax
+        // soak telemetry; only the render `camera` is overridden.
+        const orbit_active = cli.soak_seconds > 0 and cli.cam_orbit_rate != 0;
+        const orbit_radius: f32 = 30.0;
+        const orbit_height: f32 = 12.0;
+        const orbit_angle: f32 = t * cli.cam_orbit_rate;
+        const orbit_eye = notatlas.math.Vec3.init(
+            render_pos.x + @cos(orbit_angle) * orbit_radius,
+            render_pos.y + orbit_height,
+            render_pos.z + @sin(orbit_angle) * orbit_radius,
+        );
+
+        const cam_eye = if (orbit_active) orbit_eye else player_eye;
+        const cam_target = if (orbit_active)
+            render_pos
+        else
+            notatlas.math.Vec3.add(player_eye, player_fwd);
+
+        const world_eye = player_eye;
+        const world_fwd = player_fwd;
+        _ = world_fwd; // retained for future telemetry uses
+
         const camera: render.Camera = .{
-            .eye = world_eye,
-            .target = notatlas.math.Vec3.add(world_eye, world_fwd),
+            .eye = cam_eye,
+            .target = cam_target,
             .fov_y = player.fov_y,
             .aspect = @as(f32, @floatFromInt(size[0])) / @as(f32, @floatFromInt(size[1])),
         };
@@ -1319,6 +1355,7 @@ fn handleReload(
     m13_cfg: ?M13ReloadCfg,
     render_pass: render.types.vk.VkRenderPass,
     events: render.file_watch.Events,
+    wave_config_path: []const u8,
 ) void {
     var timer = std.time.Timer.start() catch return;
 
@@ -1656,6 +1693,19 @@ const Cli = struct {
     /// stepping) that single-frame RenderDoc captures can't show.
     /// `null` disables; pass `--video clip.mp4` to enable.
     video_path: ?[]const u8 = null,
+    /// Slow auto-yaw of the player view during a soak run. Drives
+    /// `player.yaw -= rate * dt` each frame so the visual gates exercise
+    /// every camera direction (catches view-relative bugs like fog
+    /// pulsing, depth-bias asymmetry, parallax glitches). 0 = disabled.
+    /// Only takes effect when `soak_seconds > 0` so interactive runs are
+    /// untouched. Visual gates default this to ~0.3 rad/s in their smoke
+    /// scripts (one full circle every ~21s).
+    cam_orbit_rate: f32 = 0,
+    /// Wave-kernel preset path. Defaults to storm.yaml (8 m amplitude,
+    /// the engine's stress condition). Visual smoke gates pass calm.yaml
+    /// or choppy.yaml so the boat physics doesn't thrash under storm
+    /// conditions and the rendered scene is stable enough to A/B.
+    wave_config: []const u8 = wave_config_path_default,
 };
 
 fn parseCli(gpa: std.mem.Allocator) !Cli {
@@ -1671,6 +1721,12 @@ fn parseCli(gpa: std.mem.Allocator) !Cli {
         } else if (std.mem.eql(u8, a, "--soak")) {
             const v = args.next() orelse return error.MissingSoakValue;
             cli.soak_seconds = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--cam-orbit-rate")) {
+            const v = args.next() orelse return error.MissingCamOrbitRateValue;
+            cli.cam_orbit_rate = try std.fmt.parseFloat(f32, v);
+        } else if (std.mem.eql(u8, a, "--wave-config")) {
+            const v = args.next() orelse return error.MissingWaveConfigValue;
+            cli.wave_config = try gpa.dupe(u8, v);
         } else if (std.mem.eql(u8, a, "--instance-grid")) {
             const v = args.next() orelse return error.MissingInstanceGridValue;
             cli.instance_grid = try std.fmt.parseInt(u32, v, 10);

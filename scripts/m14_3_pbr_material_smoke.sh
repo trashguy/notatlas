@@ -44,6 +44,8 @@ rm -f "$LOG"
   --m14 \
   --m14-material "$MATERIAL" \
   --soak "$SOAK" \
+  --cam-orbit-rate 0.3 \
+  --wave-config data/waves/calm.yaml \
   > "$LOG" 2>&1
 
 echo ">>> M14 log lines:"

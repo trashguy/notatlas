@@ -48,6 +48,8 @@ echo ">>> running sandbox (log: $LOG)"
   --m12-chars 200 \
   --m1_6-emitters 100 \
   --soak "$SOAK" \
+  --cam-orbit-rate 0.3 \
+  --wave-config data/waves/calm.yaml \
   > "$LOG" 2>&1 || {
     echo "!!! sandbox exited non-zero — see $LOG"
     exit 1

@@ -40,6 +40,8 @@ echo ">>> running sandbox (log: $LOG)"
   --instance-grid "$GRID" \
   --piece-types "$PIECE_TYPES" \
   --soak "$SOAK" \
+  --cam-orbit-rate 0.3 \
+  --wave-config data/waves/calm.yaml \
   > "$LOG" 2>&1 || {
     echo "!!! sandbox exited non-zero — see $LOG"
     exit 1

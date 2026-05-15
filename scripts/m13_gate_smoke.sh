@@ -39,6 +39,8 @@ rm -f "$LOG"
   --m13 \
   --m13-asset "$ASSET" \
   --soak "$SOAK" \
+  --cam-orbit-rate 0.3 \
+  --wave-config data/waves/calm.yaml \
   > "$LOG" 2>&1 &
 SANDBOX_PID=$!
 
