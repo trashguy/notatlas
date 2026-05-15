@@ -112,6 +112,7 @@ pub const InstancedError = error{
 pub const Instanced = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
 
     palette: *const palette_mod.MeshPalette,
 
@@ -203,6 +204,7 @@ pub const Instanced = struct {
 
         const pipeline = try createPipelineHandle(
             gpu.device,
+            gpu.pipeline_cache,
             render_pass,
             pipeline_layout,
             vert_module,
@@ -219,7 +221,7 @@ pub const Instanced = struct {
         const cull_module = try shader_mod.fromSpv(gpu.device, &instanced_cull_comp_spv);
         defer vk.vkDestroyShaderModule(gpu.device, cull_module, null);
 
-        const cull_pipeline = try createCullPipeline(gpu.device, cull_pipeline_layout, cull_module);
+        const cull_pipeline = try createCullPipeline(gpu.device, gpu.pipeline_cache, cull_pipeline_layout, cull_module);
         errdefer vk.vkDestroyPipeline(gpu.device, cull_pipeline, null);
 
         var instance_buffer = try buffer_mod.Buffer.init(
@@ -282,6 +284,7 @@ pub const Instanced = struct {
         return .{
             .gpa = gpa,
             .device = gpu.device,
+            .pipeline_cache = gpu.pipeline_cache,
             .palette = palette,
             .descriptor_set_layout = set_layout,
             .pipeline_layout = pipeline_layout,
@@ -652,6 +655,7 @@ pub const Instanced = struct {
 
         const new_handle = try createPipelineHandle(
             self.device,
+            self.pipeline_cache,
             render_pass,
             self.pipeline_layout,
             new_vert,
@@ -730,6 +734,7 @@ fn createCullPipelineLayout(
 
 fn createCullPipeline(
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
     layout: vk.VkPipelineLayout,
     module: vk.VkShaderModule,
 ) !vk.VkPipeline {
@@ -753,7 +758,7 @@ fn createCullPipeline(
     };
     var handle: vk.VkPipeline = undefined;
     try types.check(
-        vk.vkCreateComputePipelines(device, null, 1, &ci, null, &handle),
+        vk.vkCreateComputePipelines(device, pipeline_cache, 1, &ci, null, &handle),
         VulkanError.PipelineCreationFailed,
     );
     return handle;
@@ -836,6 +841,7 @@ fn createPipelineLayout(
 
 fn createPipelineHandle(
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
     render_pass: vk.VkRenderPass,
     pipeline_layout: vk.VkPipelineLayout,
     vert_module: vk.VkShaderModule,
@@ -1003,7 +1009,7 @@ fn createPipelineHandle(
 
     var handle: vk.VkPipeline = undefined;
     try types.check(
-        vk.vkCreateGraphicsPipelines(device, null, 1, &ci, null, &handle),
+        vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &ci, null, &handle),
         VulkanError.PipelineCreationFailed,
     );
     return handle;

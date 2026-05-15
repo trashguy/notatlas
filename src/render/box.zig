@@ -98,6 +98,7 @@ pub const cube_indices: [36]u16 = blk: {
 
 pub const Box = struct {
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
 
     descriptor_set_layout: vk.VkDescriptorSetLayout,
     pipeline_layout: vk.VkPipelineLayout,
@@ -131,7 +132,7 @@ pub const Box = struct {
         const frag_module = try shader_mod.fromSpv(gpu.device, &box_frag_spv);
         defer vk.vkDestroyShaderModule(gpu.device, frag_module, null);
 
-        const pipeline = try createPipelineHandle(gpu.device, render_pass, pipeline_layout, vert_module, frag_module);
+        const pipeline = try createPipelineHandle(gpu.device, gpu.pipeline_cache, render_pass, pipeline_layout, vert_module, frag_module);
         errdefer vk.vkDestroyPipeline(gpu.device, pipeline, null);
 
         var vbo = try buffer_mod.Buffer.init(
@@ -158,6 +159,7 @@ pub const Box = struct {
 
         return .{
             .device = gpu.device,
+            .pipeline_cache = gpu.pipeline_cache,
             .descriptor_set_layout = set_layout,
             .pipeline_layout = pipeline_layout,
             .pipeline = pipeline,
@@ -205,6 +207,7 @@ pub const Box = struct {
 
         const new_handle = try createPipelineHandle(
             self.device,
+            self.pipeline_cache,
             render_pass,
             self.pipeline_layout,
             new_vert,
@@ -379,6 +382,7 @@ fn createPipelineLayout(
 
 fn createPipelineHandle(
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
     render_pass: vk.VkRenderPass,
     pipeline_layout: vk.VkPipelineLayout,
     vert_module: vk.VkShaderModule,
@@ -547,7 +551,7 @@ fn createPipelineHandle(
 
     var handle: vk.VkPipeline = undefined;
     try types.check(
-        vk.vkCreateGraphicsPipelines(device, null, 1, &ci, null, &handle),
+        vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &ci, null, &handle),
         VulkanError.PipelineCreationFailed,
     );
     return handle;

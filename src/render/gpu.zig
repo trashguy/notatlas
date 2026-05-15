@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const types = @import("vulkan_types.zig");
 const window_mod = @import("window.zig");
 const vma = @import("vma");
+const pipeline_cache_mod = @import("pipeline_cache.zig");
 
 const vk = types.vk;
 const VulkanError = types.VulkanError;
@@ -35,6 +36,14 @@ pub const GpuContext = struct {
     /// Created after the device is up; destroyed before the device.
     /// One per GpuContext (one per VkDevice).
     allocator: vma.Allocator,
+    /// Persistent pipeline cache. Loaded from `~/.cache/notatlas/pipeline_cache.bin`
+    /// on init (with vendor/device/UUID validation), saved back on deinit.
+    /// Passed as the second arg to every `vkCreate(Graphics|Compute)Pipelines`
+    /// call site so VkPipeline objects warm-start across runs.
+    pipeline_cache: vk.VkPipelineCache,
+    /// Held so save() on shutdown can free its scratch buffer with the same
+    /// allocator pipeline_cache_mod.init() used.
+    cache_gpa: std.mem.Allocator,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -67,12 +76,15 @@ pub const GpuContext = struct {
         const device_result = try createLogicalDevice(physical_device, families);
         errdefer vk.vkDestroyDevice(device_result.device, null);
 
-        const allocator = try vma.Allocator.init(.{
+        var allocator = try vma.Allocator.init(.{
             .instance = @ptrCast(instance),
             .physical_device = @ptrCast(physical_device),
             .device = @ptrCast(device_result.device),
             .api_version = vk.VK_API_VERSION_1_3,
         });
+        errdefer allocator.deinit();
+
+        const pipeline_cache = try pipeline_cache_mod.init(gpa, device_result.device, physical_device);
 
         return .{
             .instance = instance,
@@ -85,11 +97,17 @@ pub const GpuContext = struct {
             .families = families,
             .validation_active = validation_active,
             .allocator = allocator,
+            .pipeline_cache = pipeline_cache,
+            .cache_gpa = gpa,
         };
     }
 
     pub fn deinit(self: *GpuContext) void {
         _ = vk.vkDeviceWaitIdle(self.device);
+        // Persist before destroying — the device must still be alive to call
+        // vkGetPipelineCacheData, but it's the last thing we touch besides VMA.
+        pipeline_cache_mod.save(self.cache_gpa, self.device, self.pipeline_cache);
+        pipeline_cache_mod.deinit(self.device, self.pipeline_cache);
         // VMA owns all buffer + image memory; destroy before the device.
         self.allocator.deinit();
         vk.vkDestroyDevice(self.device, null);

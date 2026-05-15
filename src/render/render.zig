@@ -9,6 +9,7 @@ pub const buffer = @import("buffer.zig");
 pub const camera = @import("camera.zig");
 pub const shader = @import("shader.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const pipeline_cache = @import("pipeline_cache.zig");
 pub const ocean = @import("ocean.zig");
 pub const box = @import("box.zig");
 pub const textured = @import("textured.zig");

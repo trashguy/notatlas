@@ -36,6 +36,7 @@ pub const Config = struct {};
 pub const Ocean = struct {
     gpa: std.mem.Allocator,
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
 
     /// Water surface: strict LESS, writes gl_FragDepth.
     pipeline: pipeline_mod.Pipeline,
@@ -67,11 +68,12 @@ pub const Ocean = struct {
         const sky_frag_module = try shader_mod.fromSpv(gpu.device, &sky_frag_spv);
         defer vk.vkDestroyShaderModule(gpu.device, sky_frag_module, null);
 
-        var pipeline = try pipeline_mod.create(gpu.device, render_pass, vert_module, frag_module, .water_strict);
+        var pipeline = try pipeline_mod.create(gpu.device, gpu.pipeline_cache, render_pass, vert_module, frag_module, .water_strict);
         errdefer pipeline.deinit();
 
         const sky_pipeline = try pipeline_mod.createHandle(
             gpu.device,
+            gpu.pipeline_cache,
             render_pass,
             pipeline.pipeline_layout,
             vert_module,
@@ -116,6 +118,7 @@ pub const Ocean = struct {
         var ocean: Ocean = .{
             .gpa = gpa,
             .device = gpu.device,
+            .pipeline_cache = gpu.pipeline_cache,
             .pipeline = pipeline,
             .sky_pipeline = sky_pipeline,
             .camera_ubo = camera_ubo,
@@ -188,6 +191,7 @@ pub const Ocean = struct {
 
         const new_handle = try pipeline_mod.createHandle(
             self.device,
+            self.pipeline_cache,
             render_pass,
             self.pipeline.pipeline_layout,
             new_vert,

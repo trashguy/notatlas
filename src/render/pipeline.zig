@@ -43,6 +43,7 @@ pub const DepthMode = enum { water_strict, sky_disabled };
 
 pub fn create(
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
     render_pass: vk.VkRenderPass,
     vert_module: vk.VkShaderModule,
     frag_module: vk.VkShaderModule,
@@ -67,7 +68,7 @@ pub fn create(
     );
     errdefer vk.vkDestroyPipelineLayout(device, pipeline_layout, null);
 
-    const handle = try createHandle(device, render_pass, pipeline_layout, vert_module, frag_module, depth_mode);
+    const handle = try createHandle(device, pipeline_cache, render_pass, pipeline_layout, vert_module, frag_module, depth_mode);
 
     return .{
         .descriptor_set_layout = set_layout,
@@ -83,6 +84,7 @@ pub fn create(
 /// already wrote into).
 pub fn createHandle(
     device: vk.VkDevice,
+    pipeline_cache: vk.VkPipelineCache,
     render_pass: vk.VkRenderPass,
     pipeline_layout: vk.VkPipelineLayout,
     vert_module: vk.VkShaderModule,
@@ -248,7 +250,7 @@ pub fn createHandle(
 
     var handle: vk.VkPipeline = undefined;
     try types.check(
-        vk.vkCreateGraphicsPipelines(device, null, 1, &ci, null, &handle),
+        vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &ci, null, &handle),
         VulkanError.PipelineCreationFailed,
     );
     return handle;
